@@ -1,23 +1,25 @@
-NoWaC (Norwegian Web as Corpus)
-Øvrelid, L., & Johansson, R. (2012). NoWaC: A Large-Scale Web Corpus for Norwegian. In Proceedings of the Language Resources and Evaluation Conference (LREC 2012), pp. 2983–2990. European Language Resources Association (ELRA).
+Aqui estão alguns prompts que você pode usar no Google Scholar para encontrar artigos sobre **corpus linguísticos** e **qualidade de corpora**:
 
-esTenTen (Spanish Web Corpus)
-Jakubíček, M., Kilgarriff, A., Kovář, V., Rychlý, P., & Suchomel, V. (2013). The TenTen Corpus Family. In Proceedings of the 7th International Conference on Corpus Linguistics (CILC 2013), pp. 125–136.
+### **Corpus de Línguas Específicas**
+1. `"Portuguese corpus" OR "Corpus of Portuguese"`
+2. `"Corpus linguistics" AND "Portuguese"`
+3. `"Annotated corpus" AND "Portuguese language"`
+4. `"Spoken corpus" AND "Portuguese"`
+5. `"Historical corpus" AND "Portuguese"`
+6. `"Parallel corpus" AND ("Portuguese" OR "multilingual")`
 
-C4 (Colossal Clean Crawled Corpus)
-Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., & Liu, P. J. (2020). Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer. Journal of Machine Learning Research, 21(140), 1-67. http://jmlr.org/papers/v21/20-074.html
+### **Qualidade e Construção de Corpora**
+7. `"Corpora quality evaluation"`
+8. `"Corpus reliability" OR `"Corpus validation"`
+9. `"Corpus construction" AND ("methodology" OR "best practices")`
+10. `"Corpus annotation quality"`
+11. `"Errors in corpora" OR "Corpus noise"`
 
-TenTen (Web as Corpus TenTen)
-Jakubíček, M., Kilgarriff, A., Kovář, V., Rychlý, P., & Suchomel, V. (2013). The TenTen Corpus Family. In Proceedings of the 7th International Conference on Corpus Linguistics (CILC 2013), pp. 125–136.
+### **Técnicas e Aplicações**
+12. `"Corpus linguistics" AND ("computational linguistics" OR "natural language processing")`
+13. `"Corpus-based language studies"`
+14. `"Text mining" AND "corpus analysis"`
+15. `"Machine learning" AND "corpus linguistics"`
+16. `"Corpus and lexicography"`
 
-OSCARS (Open Super-large Crawled Aggregated coRpusS)
-Ortiz Suárez, P. J., Sagot, B., & Romary, L. (2019). Asynchronous Pipeline for Processing Huge Corpora on Medium Infrastructure. In Proceedings of the Workshop on Challenges in the Management of Large Corpora (CMLC-7), pp. 9–16. https://doi.org/10.14618/ids-pub-9021
-
-brWaC (Brazilian Web as Corpus)
-Idiart, M., Villavicencio, A., & Fonseca, E. R. (2019). brWaC: A Wacky Corpus for Brazilian Portuguese. In Proceedings of the 13th Linguistic Annotation Workshop, pp. 10–18. Association for Computational Linguistics. https://doi.org/10.18653/v1/W19-4002
-
-ukWaC (UK Web as Corpus)
-Ferraresi, A., Zanchetta, E., Baroni, M., & Bernardini, S. (2008). Introducing and Evaluating ukWaC, a Very Large Web-Derived Corpus of English. In Proceedings of the 4th Web as Corpus Workshop (WAC-4), pp. 47–54. Association for Computational Linguistics.
-
-Corpus Carolina
-Roesler, J., Witt, A., & Kupietz, M. (2021). Corpus Carolina: A Balanced Reference Corpus for Contemporary German. In Proceedings of the 13th Language Resources and Evaluation Conference (LREC 2021), pp. 1234–1241. European Language Resources Association (ELRA).
+Se quiser algo mais específico, posso ajustar os prompts! 🚀
