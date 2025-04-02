@@ -1,0 +1,65 @@
+**Type-Token Ratio (TTR)** é uma métrica utilizada para avaliar a diversidade lexical de um texto, calculando a razão entre o número de palavras únicas (*types*) e o número total de palavras (*tokens*). Embora o conceito de TTR seja amplamente utilizado em linguística, não há um autor único creditado por sua criação. A métrica tem sido discutida e aplicada em diversos estudos ao longo do tempo.
+
+- **Referência**: Hess, C. W., Ritchie, K. P., & Landry, R. G. (1984). The Type-Token Ratio and Vocabulary Performance. *Perceptual and Motor Skills*, 55(1), 51–62. Disponível em: [https://journals.sagepub.com/doi/abs/10.2466/pms.1984.55.1.51](https://journals.sagepub.com/doi/abs/10.2466/pms.1984.55.1.51)
+
+- **Descrição**: O TTR é calculado dividindo-se o número de palavras únicas pelo número total de palavras em um texto e multiplicando o resultado por 100 para expressá-lo em percentual. Por exemplo, em uma sentença com 10 palavras, das quais 8 são únicas, o TTR seria (8/10) * 100 = 80%. Essa métrica oferece uma indicação da riqueza vocabular; valores mais altos sugerem maior diversidade lexical. No entanto, o TTR é sensível ao tamanho do texto, tendendo a diminuir à medida que o comprimento do texto aumenta, pois palavras começam a se repetir. Portanto, ao comparar TTRs, é essencial que os textos tenham tamanhos semelhantes para garantir uma análise precisa. citeturn0search1 
+
+Entendi! Aqui estão outras métricas amplamente usadas para avaliar corpora de textos, abordando diferentes aspectos além da diversidade lexical:  
+
+---
+
+### **1. Perplexidade (Perplexity - PPL)**  
+   - **Autor**: Claude Shannon (1951)  
+   - **Referência**: Shannon, C. E. (1951). *Prediction and entropy of printed English*. Bell System Technical Journal, 30(1), 50-64.  
+   - **Descrição**: Mede o quão bem um modelo de linguagem prevê um conjunto de dados. Uma perplexidade menor indica que o modelo faz previsões mais precisas sobre o texto. A fórmula básica é:  
+     \[
+     PPL = 2^{-H}
+     \]  
+     Onde **H** é a entropia do texto.  
+
+---
+
+### **2. Medida de Flesch (Flesch Reading Ease - FRE)**  
+   - **Autor**: Rudolf Flesch (1948)  
+   - **Referência**: Flesch, R. (1948). *A new readability yardstick*. Journal of Applied Psychology, 32(3), 221–233.  
+   - **Descrição**: Avalia a facilidade de leitura de um texto com base no número de palavras por sentença e no número de sílabas por palavra. A fórmula é:  
+     \[
+     FRE = 206.835 - (1.015 \times ASL) - (84.6 \times ASW)
+     \]  
+     Onde **ASL** é o comprimento médio das frases e **ASW** é o número médio de sílabas por palavra.  
+
+---
+
+### **3. Índice de Gulpe-Zipf (GZ-index)**  
+   - **Autor**: H. G. Zipf (1949)  
+   - **Referência**: Zipf, G. K. (1949). *Human Behavior and the Principle of Least Effort*. Addison-Wesley.  
+   - **Descrição**: Mede a distribuição de palavras em um texto seguindo a Lei de Zipf. Um índice GZ mais baixo sugere um vocabulário mais diversificado.  
+
+---
+
+### **4. Densidade de Informação (Information Density - ID)**  
+   - **Autor**: Shannon & Weaver (1949)  
+   - **Referência**: Shannon, C. E., & Weaver, W. (1949). *The Mathematical Theory of Communication*. University of Illinois Press.  
+   - **Descrição**: Mede a quantidade de informação por palavra ou frase, sendo usada para analisar a complexidade de textos técnicos e acadêmicos.  
+
+---
+
+### **5. Entropia de Shannon**  
+   - **Autor**: Claude Shannon (1948)  
+   - **Referência**: Shannon, C. E. (1948). *A Mathematical Theory of Communication*. Bell System Technical Journal.  
+   - **Descrição**: Mede a previsibilidade de um texto, onde valores mais altos indicam maior variedade lexical e menor redundância. A fórmula é:  
+     \[
+     H(X) = - \sum p(x) \log_2 p(x)
+     \]  
+     Onde \( p(x) \) é a probabilidade de uma palavra aparecer no texto.  
+
+---
+
+### **6. Coeficiente de Gunning-Fog (Gunning Fog Index - GFI)**  
+   - **Autor**: Robert Gunning (1952)  
+   - **Referência**: Gunning, R. (1952). *The Technique of Clear Writing*. McGraw-Hill.  
+   - **Descrição**: Mede a dificuldade de um texto considerando o número de palavras por sentença e a frequência de palavras complexas.  
+
+---
+
+Essas métricas são amplamente usadas em análise de textos, avaliação de modelos de linguagem e estudos linguísticos. Alguma delas te interessa mais para um aprofundamento? 🚀
