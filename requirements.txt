@@ -1,0 +1,21 @@
+
+torch==2.3.0
+
+datasets==2.19.0
+transformers==4.40.1
+accelerate==0.29.3
+
+tokenizers==0.19.1
+
+huggingface-hub==0.23.0
+
+safetensors==0.4.3
+
+numpy>=1.23.0
+
+# Útil para manipulação de dados, frequentemente usado com a biblioteca datasets
+# Embora não diretamente importado no script, é uma dependência comum e útil
+# pandas==2.2.2
+
+# Para barras de progresso (geralmente puxada automaticamente por datasets/transformers)
+# tqdm>=4.66.0
