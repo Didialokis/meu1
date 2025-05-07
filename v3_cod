@@ -1,0 +1,433 @@
+# --- Bloco 1: Imports Essenciais ---
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import datasets
+from tokenizers import ByteLevelBPETokenizer
+from tokenizers.processors import BertProcessing
+from tqdm.auto import tqdm # Para barras de progresso
+import random
+from pathlib import Path # Para operações de caminho, mesmo com caminhos simplificados
+
+# --- Bloco 2: Constantes e Configurações Iniciais ---
+# AJUSTE ESTES VALORES CONFORME NECESSÁRIO E CONFORME SUA CAPACIDADE DE HARDWARE
+MAX_LEN = 128
+AROEIRA_SUBSET_SIZE = 10000 # Quantos exemplos do Aroeira usar. None para tentar dataset completo.
+VOCAB_SIZE = 30000
+MIN_FREQUENCY_TOKENIZER = 5
+
+# Configurações de Treinamento
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+EPOCHS = 3 # Reduzido para exemplo mais rápido
+BATCH_SIZE = 16 # Ajuste conforme a VRAM da sua GPU
+LEARNING_RATE = 1e-4
+OPTIMIZER_BETAS = (0.9, 0.999)
+OPTIMIZER_EPS = 1e-6
+WEIGHT_DECAY = 0.01
+
+# Nomes de arquivos (no diretório atual)
+TOKENIZER_VOCAB_FILENAME = "aroeira_tokenizer-vocab.json"
+TOKENIZER_MERGES_FILENAME = "aroeira_tokenizer-merges.txt"
+MODEL_SAVE_FILENAME = "aroeira_bert_mlm_model.pth"
+TEMP_TOKENIZER_TRAIN_FILE = Path("temp_aroeira_for_tokenizer.txt") # Único arquivo temporário
+
+print(f"Dispositivo: {DEVICE}")
+print(f"Subconjunto Aroeira: {AROEIRA_SUBSET_SIZE if AROEIRA_SUBSET_SIZE is not None else 'Completo (pode exigir muita RAM)'}")
+print(f"Max Seq Length: {MAX_LEN}, Batch Size: {BATCH_SIZE}")
+
+# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira ---
+print("\n--- Bloco 3: Carregando e Pré-processando Corpus ---")
+all_aroeira_sentences = []
+aroeira_examples_collected = [] # Lista para exemplos brutos coletados
+
+try:
+    print("Carregando dataset Aroeira (modo streaming)...")
+    # O dataset Aroeira pode precisar de trust_remote_code=True
+    streamed_aroeira_dataset = datasets.load_dataset(
+        "Itau-Unibanco/aroeira",
+        split="train",
+        streaming=True,
+        trust_remote_code=True
+    )
+    text_column_name = "text" # Nome da coluna de texto no dataset Aroeira
+
+    if AROEIRA_SUBSET_SIZE is not None:
+        print(f"Coletando {AROEIRA_SUBSET_SIZE} exemplos do stream...")
+        try:
+            for _ in range(AROEIRA_SUBSET_SIZE):
+                aroeira_examples_collected.append(next(streamed_aroeira_dataset))
+        except StopIteration:
+            print(f"Alerta: Stream esgotado. Coletados {len(aroeira_examples_collected)}/{AROEIRA_SUBSET_SIZE} exemplos.")
+        
+        if not aroeira_examples_collected:
+             raise ValueError("Nenhum exemplo bruto foi coletado do stream. Verifique AROEIRA_SUBSET_SIZE.")
+
+        print(f"Extraindo sentenças dos {len(aroeira_examples_collected)} exemplos coletados...")
+        for example in tqdm(aroeira_examples_collected, desc="Extraindo sentenças"):
+            sentence = example[text_column_name]
+            if isinstance(sentence, str) and sentence.strip():
+                all_aroeira_sentences.append(sentence.strip())
+    else:
+        # Processa o stream inteiro se AROEIRA_SUBSET_SIZE for None
+        # CUIDADO: all_aroeira_sentences pode ficar muito grande!
+        print("Processando todos os exemplos do stream Aroeira (pode consumir muita RAM)...")
+        for example in tqdm(streamed_aroeira_dataset, desc="Extraindo sentenças (stream completo)"):
+            sentence = example[text_column_name]
+            if isinstance(sentence, str) and sentence.strip():
+                all_aroeira_sentences.append(sentence.strip())
+
+    print(f"Total de sentenças extraídas: {len(all_aroeira_sentences)}")
+    if not all_aroeira_sentences:
+        raise ValueError("Nenhuma sentença foi extraída. Verifique o dataset e AROEIRA_SUBSET_SIZE.")
+
+    # Salvar sentenças em um único arquivo temporário para o tokenizador
+    print(f"Salvando sentenças em arquivo temporário: {TEMP_TOKENIZER_TRAIN_FILE}")
+    if TEMP_TOKENIZER_TRAIN_FILE.exists(): # Limpar arquivo antigo, se existir
+        TEMP_TOKENIZER_TRAIN_FILE.unlink()
+    
+    with open(TEMP_TOKENIZER_TRAIN_FILE, "w", encoding="utf-8") as fp:
+        for sentence in all_aroeira_sentences:
+            fp.write(sentence + "\n")
+    tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)] # Lista com um único arquivo
+    print(f"Sentenças salvas. Arquivo para tokenizador: {tokenizer_train_files_list}")
+
+except Exception as e:
+    print(f"Erro no Bloco 3: {e}")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# --- Bloco 4: Treinando o Tokenizador ByteLevelBPE ---
+print("\n--- Bloco 4: Treinando Tokenizador ---")
+# Verifica se os arquivos do tokenizador já existem
+if not Path(TOKENIZER_VOCAB_FILENAME).exists() or not Path(TOKENIZER_MERGES_FILENAME).exists():
+    if not tokenizer_train_files_list or not Path(tokenizer_train_files_list[0]).exists():
+        raise ValueError("Arquivo de treino para tokenizador não encontrado ou vazio. Verifique Bloco 3.")
+
+    print(f"Treinando tokenizador com dados de: {tokenizer_train_files_list}")
+    
+    # Extrai o prefixo do nome do arquivo de vocabulário para usar no save_model
+    # Ex: "aroeira_tokenizer-vocab.json" -> "aroeira_tokenizer"
+    tokenizer_save_prefix = TOKENIZER_VOCAB_FILENAME.replace("-vocab.json", "")
+
+    custom_tokenizer = ByteLevelBPETokenizer()
+    custom_tokenizer.train(
+        files=tokenizer_train_files_list, # Lista de arquivos (neste caso, um só)
+        vocab_size=VOCAB_SIZE,
+        min_frequency=MIN_FREQUENCY_TOKENIZER,
+        special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"] # Tokens especiais tipo BERT
+    )
+    # Salva vocab.json e merges.txt no diretório atual com o prefixo especificado
+    custom_tokenizer.save_model(".", prefix=tokenizer_save_prefix) 
+    print(f"Tokenizador treinado e salvo como {TOKENIZER_VOCAB_FILENAME} e {TOKENIZER_MERGES_FILENAME}")
+else:
+    print(f"Tokenizador já existe ({TOKENIZER_VOCAB_FILENAME}, {TOKENIZER_MERGES_FILENAME}). Carregando...")
+
+# Carrega o tokenizador (seja o recém-treinado ou um existente)
+tokenizer = ByteLevelBPETokenizer(
+    vocab=TOKENIZER_VOCAB_FILENAME,
+    merges=TOKENIZER_MERGES_FILENAME,
+)
+# Configura o pós-processador para adicionar tokens CLS (<s>) e SEP (</s>)
+tokenizer._tokenizer.post_processor = BertProcessing(
+    ("</s>", tokenizer.token_to_id("</s>")), # [SEP]
+    ("<s>", tokenizer.token_to_id("<s>")),   # [CLS]
+)
+tokenizer.enable_truncation(max_length=MAX_LEN)
+tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<pad>"), pad_token="<pad>", length=MAX_LEN)
+print(f"Vocabulário do Tokenizador: {tokenizer.get_vocab_size()}")
+
+# --- Bloco 5: Definição do BERTDataset (MLM-only) ---
+print("\n--- Bloco 5: Definindo BERTDataset ---")
+class BERTDataset(Dataset):
+    def __init__(self, sentences, tokenizer, seq_len): # seq_len será MAX_LEN
+        self.sentences = sentences
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len # Já é o MAX_LEN global
+        self.vocab_size = tokenizer.get_vocab_size()
+        self.mask_token_id = tokenizer.token_to_id("<mask>")
+        self.cls_token_id = tokenizer.token_to_id("<s>")
+        self.sep_token_id = tokenizer.token_to_id("</s>")
+        self.pad_token_id = tokenizer.token_to_id("<pad>")
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def random_word_masking(self, token_ids_original):
+        token_ids = list(token_ids_original) # Cópia para modificar
+        output_label = [] 
+
+        for i, token_id in enumerate(token_ids):
+            prob = random.random()
+            # Não mascarar tokens especiais (CLS, SEP, PAD)
+            if token_id in [self.cls_token_id, self.sep_token_id, self.pad_token_id]:
+                output_label.append(self.pad_token_id) # Label é pad para não prever
+                continue
+
+            if prob < 0.15: # 15% de chance de mascarar o token
+                prob_action = random.random() # Probabilidade para decidir a ação de mascaramento
+
+                if prob_action < 0.8:  # 80% de chance de substituir por [MASK]
+                    token_ids[i] = self.mask_token_id
+                elif prob_action < 0.9:  # 10% de chance de substituir por palavra aleatória
+                    token_ids[i] = random.randrange(self.vocab_size)
+                # else: 10% de chance de manter o token original (já está em token_ids[i])
+                
+                output_label.append(token_ids_original[i]) # Label é sempre o token original
+            else: # Token não mascarado
+                output_label.append(self.pad_token_id) # Label é pad
+
+        return torch.tensor(token_ids), torch.tensor(output_label)
+
+    def __getitem__(self, idx):
+        sentence = self.sentences[idx]
+        # Tokenizer já aplica CLS, SEP, padding e truncation
+        encoding = self.tokenizer.encode(sentence)
+        bert_input_ids_original = encoding.ids
+
+        # Aplicar mascaramento para MLM
+        masked_input_ids, mlm_labels = self.random_word_masking(bert_input_ids_original)
+        
+        attention_mask = torch.tensor(encoding.attention_mask, dtype=torch.long)
+        # Segment IDs (todos zeros para MLM com sentenças únicas)
+        segment_ids = torch.zeros_like(masked_input_ids, dtype=torch.long)
+
+        return {
+            "input_ids": masked_input_ids,
+            "attention_mask": attention_mask,
+            "segment_ids": segment_ids, # Necessário para BERTEmbedding
+            "mlm_labels": mlm_labels,
+        }
+
+# --- Bloco 6: Definição do Modelo BERTLM (MLM-only) ---
+print("\n--- Bloco 6: Definindo Modelo BERTLM ---")
+class BERTLM(nn.Module):
+    # Passa MAX_LEN explicitamente para o embedding
+    def __init__(self, vocab_size, hidden_size=768, num_layers=6, num_attention_heads=8, 
+                 intermediate_size=3072, dropout_prob=0.1, max_len_config=MAX_LEN, pad_token_id_for_model=0):
+        super().__init__()
+        # Passa pad_token_id para o embedding
+        self.embedding = BERTEmbedding(vocab_size, hidden_size, max_len_config, dropout_prob, pad_token_id_for_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, 
+            nhead=num_attention_heads,
+            dim_feedforward=intermediate_size, 
+            dropout=dropout_prob,
+            activation='gelu', 
+            batch_first=True # Entrada (batch, seq, feature)
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.mlm_head = nn.Linear(hidden_size, vocab_size) # Camada para prever tokens mascarados
+
+    def forward(self, input_ids, attention_mask, segment_ids): # segment_ids é usado pelo embedding
+        x = self.embedding(input_ids, segment_ids)
+        
+        # nn.TransformerEncoder espera src_key_padding_mask (True onde ignorar)
+        # Nossa attention_mask é 0 para padding, 1 para tokens reais. Inverter.
+        padding_mask = (attention_mask == 0)
+        
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        mlm_logits = self.mlm_head(x)
+        return mlm_logits
+
+# --- Bloco 7: Definição do BERTEmbedding ---
+print("\n--- Bloco 7: Definindo BERTEmbedding ---")
+class BERTEmbedding(nn.Module):
+    def __init__(self, vocab_size, hidden_size, max_len, dropout_prob, pad_token_id_for_embedding):
+        super().__init__()
+        self.token_embeddings = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id_for_embedding)
+        self.segment_embeddings = nn.Embedding(2, hidden_size) # Para segmentos 0 e 1
+        self.position_embeddings = nn.Embedding(max_len, hidden_size) # Embeddings posicionais
+        
+        self.layer_norm = nn.LayerNorm(hidden_size, eps=1e-12)
+        self.dropout = nn.Dropout(dropout_prob)
+        
+        # Cria position_ids uma vez e registra como buffer
+        self.register_buffer("position_ids", torch.arange(max_len).expand((1, -1)))
+
+    def forward(self, input_ids, segment_ids):
+        seq_length = input_ids.size(1)
+        
+        token_embeds = self.token_embeddings(input_ids)
+        segment_embeds = self.segment_embeddings(segment_ids) # Usa os segment_ids fornecidos
+        
+        # Garante que position_ids seja cortado para o tamanho da sequência atual
+        pos_ids = self.position_ids[:, :seq_length]
+        position_embeds = self.position_embeddings(pos_ids)
+        
+        embeddings = token_embeds + position_embeds + segment_embeds
+        embeddings = self.layer_norm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
+
+# --- Bloco 8: Definição do BERT Masked Language Model Trainer (BERTTrainer) ---
+print("\n--- Bloco 8: Definindo BERTTrainer ---")
+class BERTTrainer:
+    def __init__(self, model, tokenizer_for_trainer, train_dataloader, val_dataloader, # val_dataloader pode ser None
+                 lr, betas, eps, weight_decay, device, model_save_fn, log_freq=10):
+        self.model = model.to(device)
+        self.tokenizer = tokenizer_for_trainer # Usado para ignore_index no CrossEntropyLoss
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.device = device
+        self.log_freq = log_freq # Frequência de log do loss
+        self.model_save_path = model_save_fn # Nome do arquivo para salvar o modelo
+        
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        # Ignora o padding no cálculo do loss para MLM
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.tokenizer.token_to_id("<pad>")) 
+        self.best_val_loss = float('inf') # Para salvar o melhor modelo
+
+    def train_epoch(self, epoch_num):
+        self.model.train() # Coloca o modelo em modo de treinamento
+        total_loss = 0
+        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch_num+1} [Train]")
+
+        for i, batch in enumerate(progress_bar):
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            segment_ids = batch["segment_ids"].to(self.device) # Passado para o modelo
+            mlm_labels = batch["mlm_labels"].to(self.device)
+
+            self.optimizer.zero_grad() # Limpa gradientes anteriores
+            mlm_logits = self.model(input_ids, attention_mask, segment_ids)
+            
+            # Calcula o loss para MLM
+            # Redimensiona logits: (batch_size * seq_len, vocab_size)
+            # Redimensiona labels: (batch_size * seq_len)
+            loss = self.criterion(mlm_logits.view(-1, self.tokenizer.get_vocab_size()), mlm_labels.view(-1))
+            
+            loss.backward() # Backpropagation
+            self.optimizer.step() # Atualiza pesos
+
+            total_loss += loss.item()
+            if (i + 1) % self.log_freq == 0: # Log do loss parcial
+                progress_bar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}"})
+        
+        avg_train_loss = total_loss / len(self.train_dataloader)
+        print(f"Epoch {epoch_num+1} - Train Loss: {avg_train_loss:.4f}")
+        return avg_train_loss
+
+    def validate_epoch(self, epoch_num):
+        if not self.val_dataloader: # Pula validação se não houver val_dataloader
+            return None 
+        
+        self.model.eval() # Coloca o modelo em modo de avaliação
+        total_loss = 0
+        progress_bar = tqdm(self.val_dataloader, desc=f"Epoch {epoch_num+1} [Val]")
+        
+        with torch.no_grad(): # Desabilita cálculo de gradiente para validação
+            for batch in progress_bar:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                segment_ids = batch["segment_ids"].to(self.device) # Passado para o modelo
+                mlm_labels = batch["mlm_labels"].to(self.device)
+
+                mlm_logits = self.model(input_ids, attention_mask, segment_ids)
+                loss = self.criterion(mlm_logits.view(-1, self.tokenizer.get_vocab_size()), mlm_labels.view(-1))
+                total_loss += loss.item()
+        
+        avg_val_loss = total_loss / len(self.val_dataloader)
+        print(f"Epoch {epoch_num+1} - Val Loss: {avg_val_loss:.4f}")
+
+        # Salva o modelo se o loss de validação for o melhor até agora
+        if avg_val_loss < self.best_val_loss:
+            self.best_val_loss = avg_val_loss
+            print(f"Nova melhor Val Loss: {self.best_val_loss:.4f}. Salvando modelo em {self.model_save_path}")
+            torch.save(self.model.state_dict(), self.model_save_path)
+        return avg_val_loss
+
+    def train(self, num_epochs):
+        print(f"Iniciando treinamento por {num_epochs} épocas...")
+        for epoch in range(num_epochs):
+            self.train_epoch(epoch)
+            self.validate_epoch(epoch) # Executa validação (se val_dataloader existir)
+            print("-" * 30)
+        print(f"Treinamento concluído. Melhor Val Loss: {self.best_val_loss if self.val_dataloader else 'N/A (sem validação)'}")
+
+# --- Bloco 9: Instanciando Componentes ---
+print("\n--- Bloco 9: Instanciando Componentes ---")
+if not all_aroeira_sentences: # Checagem de segurança
+    raise SystemExit("Lista 'all_aroeira_sentences' está vazia. Verifique Bloco 3 e AROEIRA_SUBSET_SIZE.")
+
+# Split simples para treino/validação (pode ser melhorado com sklearn, por exemplo)
+val_split_ratio = 0.1 # 10% para validação
+num_val_samples = int(len(all_aroeira_sentences) * val_split_ratio)
+if num_val_samples < 1 and len(all_aroeira_sentences) > 1 : num_val_samples = 1 # Pelo menos 1 se houver mais de 1 sentença
+
+# Garante que haja dados de treino
+if len(all_aroeira_sentences) - num_val_samples <=0 and len(all_aroeira_sentences) > 0 :
+    print("WARN: Dataset pequeno, usando tudo para treino e sem validação.")
+    train_sentences = all_aroeira_sentences
+    val_sentences = []
+    num_val_samples = 0
+else:
+    train_sentences = all_aroeira_sentences[num_val_samples:]
+    val_sentences = all_aroeira_sentences[:num_val_samples]
+
+
+print(f"Dataset de Treino: {len(train_sentences)} sentenças")
+print(f"Dataset de Validação: {len(val_sentences)} sentenças")
+
+train_dataset = BERTDataset(train_sentences, tokenizer, seq_len=MAX_LEN)
+# Config num_workers=0 para estabilidade, especialmente em setups com pouca memória ou Windows.
+# pin_memory=True pode ajudar com CUDA se houver memória RAM suficiente.
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=(DEVICE=='cuda'))
+
+val_loader = None # Inicializa como None
+if val_sentences: # Cria DataLoader de validação apenas se houver sentenças de validação
+    val_dataset = BERTDataset(val_sentences, tokenizer, seq_len=MAX_LEN)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=(DEVICE=='cuda'))
+else:
+    print("Nenhum dataset de validação será usado.")
+
+# Parâmetros do Modelo (menores para exemplo e rodar mais rápido/com menos VRAM)
+# BERT-base usa: hidden_size=768, num_layers=12, num_attention_heads=12
+# Para este exemplo, usaremos valores menores:
+model_hidden_size = 256        # Tamanho da camada oculta
+model_num_layers = 3           # Número de camadas do Transformer (reduzido para exemplo)
+model_num_attention_heads = 4  # Número de cabeças de atenção
+model_intermediate_size = model_hidden_size * 4 # Tamanho da camada feed-forward
+
+bert_mlm_model = BERTLM(
+    vocab_size=tokenizer.get_vocab_size(),
+    hidden_size=model_hidden_size,
+    num_layers=model_num_layers,
+    num_attention_heads=model_num_attention_heads,
+    intermediate_size=model_intermediate_size,
+    max_len_config=MAX_LEN, # Passa MAX_LEN para BERTLM -> BERTEmbedding
+    pad_token_id_for_model=tokenizer.token_to_id("<pad>") # Passa pad_token_id para embedding
+)
+print(f"Modelo BERTLM instanciado: {model_num_layers} camadas, Hidden {model_hidden_size}, Heads {model_num_attention_heads}")
+
+# Instanciar o Trainer
+trainer = BERTTrainer(
+    model=bert_mlm_model, 
+    tokenizer_for_trainer=tokenizer, # Passa o tokenizador para o trainer
+    train_dataloader=train_loader, 
+    val_dataloader=val_loader, # Pode ser None
+    lr=LEARNING_RATE, 
+    betas=OPTIMIZER_BETAS, 
+    eps=OPTIMIZER_EPS, 
+    weight_decay=WEIGHT_DECAY,
+    device=DEVICE, 
+    model_save_fn=MODEL_SAVE_FILENAME # Nome do arquivo para salvar
+)
+
+# --- Bloco 10: Loop de Treinamento ---
+print("\n--- Bloco 10: Treinamento ---")
+try:
+    trainer.train(epochs=EPOCHS)
+    print(f"Treinamento finalizado. Melhor modelo (se validado) salvo em {MODEL_SAVE_FILENAME}.")
+except Exception as e:
+    print(f"Erro durante o treinamento: {e}")
+    import traceback
+    traceback.print_exc()
+    # Dicas se der erro de memória (CUDA out of memory):
+    # 1. Reduza BATCH_SIZE (Bloco 2)
+    # 2. Reduza MAX_LEN (Bloco 2)
+    # 3. Use um modelo menor (parâmetros em Bloco 9: model_hidden_size, model_num_layers)
+    # 4. Reinicie o runtime e tente novamente.
+
+print("\n--- Script Simplificado Finalizado ---")
