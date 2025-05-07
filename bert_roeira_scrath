@@ -1,0 +1,609 @@
+# --- Bloco 1: Imports Essenciais ---
+import os
+from pathlib import Path
+import torch
+import re # Embora não explicitamente usado no código adaptado, estava no original
+import random
+import transformers, datasets # Adicionado para load_dataset
+from tokenizers import BertWordPieceTokenizer
+from transformers import BertTokenizer # Usado para carregar o tokenizador treinado
+import tqdm # Mantido do original
+from torch.utils.data import Dataset, DataLoader
+import itertools
+import math
+import torch.nn.functional as F
+import numpy as np
+from torch.optim import Adam
+
+# --- Bloco 2: Constantes e Configurações Iniciais ---
+MAX_LEN = 64  # Comprimento máximo da sequência (pode ser ajustado)
+AROEIRA_SUBSET_SIZE = 50000 # Usar um subconjunto para desenvolvimento/teste mais rápido
+VOCAB_SIZE = 30000 # Tamanho do vocabulário para o novo tokenizador
+MIN_FREQUENCY_TOKENIZER = 5 # Frequência mínima para o tokenizador
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira ---
+print(f"Dispositivo a ser usado: {DEVICE}")
+print("Carregando o dataset Aroeira...")
+try:
+    full_aroeira_dataset = datasets.load_dataset("Itau-Unibanco/aroeira", split="train")
+except Exception as e:
+    print(f"Erro ao carregar dataset Aroeira: {e}")
+    print("Verifique sua conexão com a internet ou o nome do dataset.")
+    exit()
+
+# Selecionar a coluna de texto correta (geralmente 'sentence' ou 'text')
+text_column_name = "sentence"
+if text_column_name not in full_aroeira_dataset.features:
+    if "text" in full_aroeira_dataset.features:
+        text_column_name = "text"
+    else:
+        print(f"Erro: Coluna '{text_column_name}' ou 'text' não encontrada no dataset Aroeira.")
+        print(f"Colunas disponíveis: {list(full_aroeira_dataset.features.keys())}")
+        exit()
+print(f"Usando coluna '{text_column_name}' do dataset Aroeira.")
+
+# Pegar um subconjunto para processamento mais rápido e extrair as sentenças
+if AROEIRA_SUBSET_SIZE is not None and AROEIRA_SUBSET_SIZE < len(full_aroeira_dataset):
+    print(f"Selecionando um subconjunto de {AROEIRA_SUBSET_SIZE} exemplos do Aroeira.")
+    aroeira_subset = full_aroeira_dataset.select(range(AROEIRA_SUBSET_SIZE))
+else:
+    aroeira_subset = full_aroeira_dataset
+
+all_aroeira_sentences = [example[text_column_name] for example in tqdm.tqdm(aroeira_subset, desc="Extraindo sentenças")]
+print(f"Total de sentenças extraídas do Aroeira para processamento: {len(all_aroeira_sentences)}")
+print(f"Exemplo de sentença: '{all_aroeira_sentences[0][:100]}...'")
+
+
+# --- Bloco 4: Treinando um Novo Tokenizador WordPiece com Aroeira ---
+
+# Diretórios para os dados do tokenizador e o modelo do tokenizador salvo
+TOKENIZER_DATA_DIR = './data_aroeira_tokenizer'
+TOKENIZER_MODEL_DIR = './bert_aroeira_custom_tokenizer' # Nome do diretório para salvar o modelo
+
+os.makedirs(TOKENIZER_DATA_DIR, exist_ok=True)
+os.makedirs(TOKENIZER_MODEL_DIR, exist_ok=True)
+
+# Salvar dados como arquivos .txt para o treinamento do tokenizador
+print("Salvando sentenças do Aroeira em arquivos .txt para treinar o tokenizador...")
+text_data_for_tokenizer = []
+file_count = 0
+# O tutorial usa [x[0] for x in pairs], aqui usamos all_aroeira_sentences diretamente
+for sentence in tqdm.tqdm(all_aroeira_sentences, desc="Preparando arquivos para tokenizador"):
+    text_data_for_tokenizer.append(sentence.strip()) # Adicionar .strip() é uma boa prática
+
+    if len(text_data_for_tokenizer) == 10000: # Salva a cada 10000 sentenças
+        with open(os.path.join(TOKENIZER_DATA_DIR, f'text_{file_count}.txt'), 'w', encoding='utf-8') as fp:
+            fp.write('\n'.join(text_data_for_tokenizer))
+        text_data_for_tokenizer = []
+        file_count += 1
+# Salvar qualquer resto
+if text_data_for_tokenizer:
+    with open(os.path.join(TOKENIZER_DATA_DIR, f'text_{file_count}.txt'), 'w', encoding='utf-8') as fp:
+        fp.write('\n'.join(text_data_for_tokenizer))
+
+tokenizer_file_paths = [str(x) for x in Path(TOKENIZER_DATA_DIR).glob('**/*.txt')]
+print(f"Arquivos de texto para o tokenizador: {len(tokenizer_file_paths)}")
+
+# Treinando o próprio tokenizador
+print("Treinando o tokenizador WordPiece...")
+custom_tokenizer = BertWordPieceTokenizer(
+    clean_text=True,
+    handle_chinese_chars=False, # Aroeira é português
+    strip_accents=False,        # Manter acentos para português (False = não remove)
+    lowercase=True              # Converter para minúsculas
+)
+
+custom_tokenizer.train(
+    files=tokenizer_file_paths,
+    vocab_size=VOCAB_SIZE,
+    min_frequency=MIN_FREQUENCY_TOKENIZER,
+    limit_alphabet=1000,
+    wordpieces_prefix='##',
+    special_tokens=['[PAD]', '[CLS]', '[SEP]', '[MASK]', '[UNK]']
+)
+
+# Salvar o modelo do tokenizador (vocabulário e configurações)
+# O tutorial salva com um nome ('bert-it'), vamos seguir um padrão similar
+tokenizer_save_prefix = 'bert-aroeira'
+custom_tokenizer.save_model(TOKENIZER_MODEL_DIR, tokenizer_save_prefix)
+print(f"Tokenizador treinado e salvo em {TOKENIZER_MODEL_DIR} com prefixo '{tokenizer_save_prefix}'")
+
+# Carregar o tokenizador treinado usando BertTokenizer da Hugging Face para consistência
+vocab_file_path = os.path.join(TOKENIZER_MODEL_DIR, f'{tokenizer_save_prefix}-vocab.txt')
+tokenizer = BertTokenizer.from_pretrained(vocab_file_path, local_files_only=True)
+print("Tokenizador carregado para uso.")
+print(f"Tamanho do vocabulário do tokenizador: {tokenizer.vocab_size}")
+
+
+# --- Bloco 5: Classe BERTDataset Adaptada para Aroeira ---
+class BERTDataset(Dataset):
+    def __init__(self, corpus_sentences, tokenizer, seq_len=MAX_LEN):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.corpus_lines = len(corpus_sentences)
+        self.lines = corpus_sentences # Lista de sentenças individuais do Aroeira
+
+    def __len__(self):
+        return self.corpus_lines
+
+    def __getitem__(self, item):
+        # Passo 1: obter par de sentenças (aleatório ou consecutivo) e label is_next
+        t1_str, t2_str, is_next_label = self.get_sent(item)
+
+        # Passo 2: aplicar mascaramento/palavras aleatórias (MLM)
+        # A função random_word do tutorial espera strings, então passamos t1_str, t2_str
+        t1_random_token_ids, t1_label_ids = self.random_word(t1_str)
+        t2_random_token_ids, t2_label_ids = self.random_word(t2_str)
+        
+        # Passo 3: Adicionar [CLS] e [SEP] aos tokens e [PAD] aos labels
+        # Os IDs já são resultado de token_id = self.tokenizer(token)['input_ids'][1:-1]
+        # ou seja, já são listas de IDs, não precisa tokenizar de novo aqui.
+        t1 = [self.tokenizer.cls_token_id] + t1_random_token_ids + [self.tokenizer.sep_token_id]
+        t2 = t2_random_token_ids + [self.tokenizer.sep_token_id]
+        
+        t1_label = [self.tokenizer.pad_token_id] + t1_label_ids + [self.tokenizer.pad_token_id]
+        t2_label = t2_label_ids + [self.tokenizer.pad_token_id]
+
+        # Passo 4: Combinar sentenças e aplicar padding
+        segment_label = ([1 for _ in range(len(t1))] + [2 for _ in range(len(t2))])
+        bert_input = t1 + t2
+        bert_label = t1_label + t2_label
+
+        # Truncar se exceder seq_len ANTES do padding
+        bert_input = bert_input[:self.seq_len]
+        bert_label = bert_label[:self.seq_len]
+        segment_label = segment_label[:self.seq_len]
+
+        # Padding
+        padding_len = self.seq_len - len(bert_input)
+        bert_input.extend([self.tokenizer.pad_token_id] * padding_len)
+        bert_label.extend([self.tokenizer.pad_token_id] * padding_len)
+        segment_label.extend([0] * padding_len) # 0 para padding no segment_label
+
+        output = {"bert_input": bert_input,
+                  "bert_label": bert_label,
+                  "segment_label": segment_label,
+                  "is_next": is_next_label}
+
+        return {key: torch.tensor(value) for key, value in output.items()}
+
+    def random_word(self, sentence_str): # Recebe a string da sentença
+        tokens_original_str = sentence_str.strip().split() # Divide a string em palavras
+        output_label_ids = []
+        output_token_ids = []
+
+        for word_str in tokens_original_str: # Itera sobre as palavras (strings)
+            if not word_str: continue # Pula strings vazias
+
+            prob = random.random()
+            # Tokeniza a palavra individualmente para obter seus IDs (sem CLS/SEP extras aqui)
+            # A tokenização de uma palavra pode resultar em múltiplos sub-tokens.
+            # ['input_ids'][1:-1] remove CLS e SEP que o tokenizer adiciona por padrão.
+            word_token_ids = self.tokenizer.encode(word_str, add_special_tokens=True)[1:-1]
+
+
+            if not word_token_ids: # Se a palavra for OOV e resultar em nada (ex: só espaços e é limpa)
+                continue
+
+            if prob < 0.15: # 15% dos tokens (palavras originais) são considerados para mascaramento
+                prob /= 0.15 # Normaliza a probabilidade
+
+                if prob < 0.8:  # 80% de chance de trocar por [MASK]
+                    masked_ids = [self.tokenizer.mask_token_id] * len(word_token_ids)
+                    output_token_ids.extend(masked_ids)
+                elif prob < 0.9:  # 10% de chance de trocar por palavra aleatória do vocabulário
+                    random_ids = [random.randrange(self.tokenizer.vocab_size) for _ in word_token_ids]
+                    output_token_ids.extend(random_ids)
+                else:  # 10% de chance de manter a palavra original
+                    output_token_ids.extend(word_token_ids)
+                
+                output_label_ids.extend(word_token_ids) # Guarda o label original
+            else: # 85% dos tokens não são mascarados
+                output_token_ids.extend(word_token_ids)
+                # Labels para tokens não mascarados são PAD_ID (ou 0, se ignore_index=0 na loss)
+                output_label_ids.extend([self.tokenizer.pad_token_id] * len(word_token_ids))
+        
+        # Não precisa do itertools.chain complexo se já estamos estendendo listas de IDs.
+        assert len(output_token_ids) == len(output_label_ids)
+        return output_token_ids, output_label_ids
+
+
+    def get_sent(self, index):
+        '''Retorna um par de sentenças (strings) e o label is_next'''
+        # Para NSP, 50% de chance de ser um par consecutivo, 50% de ser um par aleatório
+        if random.random() > 0.5: # Par positivo (consecutivo)
+            t1, t2 = self.get_consecutive_sentences(index)
+            is_next_label = 1
+        else: # Par negativo (aleatório)
+            t1 = self.lines[index] # Pega a sentença atual
+            t2 = self.get_random_sentence(exclude_index=index) # Pega uma sentença aleatória diferente
+            is_next_label = 0
+        
+        # Limitar o número de palavras ANTES de tokenizar, como no tutorial
+        # Isso é uma simplificação, pois o MAX_LEN real é em tokens, não palavras.
+        # Mas para seguir o tutorial:
+        t1 = ' '.join(t1.strip().split()[:MAX_LEN//2]) # Aprox. metade do MAX_LEN para cada sentença
+        t2 = ' '.join(t2.strip().split()[:MAX_LEN//2])
+
+        return t1, t2, is_next_label
+
+    def get_consecutive_sentences(self, item_index):
+        '''Retorna duas sentenças consecutivas (strings) do corpus'''
+        t1 = self.lines[item_index]
+        # Garante que não estouramos o índice e pega uma sentença diferente se for a última
+        next_item_index = item_index + 1 if item_index + 1 < len(self.lines) else item_index -1 
+        if next_item_index < 0: next_item_index = 0 # caso de len(self.lines) == 1
+
+        t2 = self.lines[next_item_index]
+        return t1, t2
+
+    def get_random_sentence(self, exclude_index=None):
+        '''Retorna uma única sentença aleatória (string) do corpus'''
+        rand_index = random.randrange(len(self.lines))
+        if exclude_index is not None:
+            while rand_index == exclude_index and len(self.lines) > 1: # Evita pegar a mesma sentença se possível
+                rand_index = random.randrange(len(self.lines))
+        return self.lines[rand_index]
+
+print("Definição da classe BERTDataset concluída.")
+
+# Teste rápido do BERTDataset
+try:
+    print("Testando o BERTDataset...")
+    # Usar uma pequena parte das sentenças para teste do dataset, se não o all_aroeira_sentences
+    test_sentences_for_dataset = all_aroeira_sentences[:100] if len(all_aroeira_sentences) > 100 else all_aroeira_sentences
+    
+    if not test_sentences_for_dataset:
+        print("AVISO: Nenhuma sentença disponível para testar o BERTDataset.")
+    else:
+        train_data_aroeira = BERTDataset(test_sentences_for_dataset, tokenizer=tokenizer, seq_len=MAX_LEN)
+        if len(train_data_aroeira) > 0:
+            train_loader_aroeira = DataLoader(train_data_aroeira, batch_size=2, shuffle=True) # Batch size pequeno
+            sample_data = next(iter(train_loader_aroeira))
+            print("Amostra de dados do DataLoader:")
+            for key, value in sample_data.items():
+                print(f"{key}: {value.shape}, {value.dtype}")
+            # print(train_data_aroeira[random.randrange(len(train_data_aroeira))]) # Imprime um item individual
+        else:
+            print("AVISO: BERTDataset criado, mas está vazio. Verifique 'test_sentences_for_dataset'.")
+
+except Exception as e:
+    print(f"Erro ao testar BERTDataset ou DataLoader: {e}")
+    import traceback
+    traceback.print_exc()
+
+
+# --- Bloco 6: Definição da Arquitetura BERT (Embedding, Attention, Encoder, BERT, Heads) ---
+# Estas classes são copiadas diretamente do tutorial, pois são implementações padrão.
+
+class PositionalEmbedding(torch.nn.Module):
+    def __init__(self, d_model, max_len=MAX_LEN): # Ajustado para usar MAX_LEN global
+        super().__init__()
+        pe = torch.zeros(max_len, d_model).float()
+        pe.require_grad = False
+        for pos in range(max_len):
+            for i in range(0, d_model, 2):
+                pe[pos, i] = math.sin(pos / (10000 ** ((2 * i)/d_model)))
+                pe[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1))/d_model)))
+        self.pe = pe.unsqueeze(0)
+    def forward(self, x): # x aqui é a sequência de entrada, mas só usamos seu shape para o slice
+        return self.pe[:, :x.size(1)] # Retorna pos_emb para o tamanho da sequência de entrada
+
+class BERTEmbedding(torch.nn.Module):
+    def __init__(self, vocab_size, embed_size, seq_len=MAX_LEN, dropout=0.1): # Ajustado
+        super().__init__()
+        self.embed_size = embed_size
+        self.token = torch.nn.Embedding(vocab_size, embed_size, padding_idx=0)
+        self.segment = torch.nn.Embedding(3, embed_size, padding_idx=0) # 0: PAD, 1: SentA, 2: SentB
+        self.position = PositionalEmbedding(d_model=embed_size, max_len=seq_len)
+        self.dropout = torch.nn.Dropout(p=dropout)
+    def forward(self, sequence, segment_label):
+        x = self.token(sequence) + self.position(sequence) + self.segment(segment_label)
+        return self.dropout(x)
+
+class MultiHeadedAttention(torch.nn.Module):
+    def __init__(self, heads, d_model, dropout=0.1):
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % heads == 0
+        self.d_k = d_model // heads
+        self.heads = heads
+        self.dropout = torch.nn.Dropout(dropout)
+        self.query = torch.nn.Linear(d_model, d_model)
+        self.key = torch.nn.Linear(d_model, d_model)
+        self.value = torch.nn.Linear(d_model, d_model)
+        self.output_linear = torch.nn.Linear(d_model, d_model)
+    def forward(self, query, key, value, mask):
+        query = self.query(query)
+        key = self.key(key)
+        value = self.value(value)
+        query = query.view(query.shape[0], -1, self.heads, self.d_k).permute(0, 2, 1, 3)
+        key = key.view(key.shape[0], -1, self.heads, self.d_k).permute(0, 2, 1, 3)
+        value = value.view(value.shape[0], -1, self.heads, self.d_k).permute(0, 2, 1, 3)
+        scores = torch.matmul(query, key.permute(0, 1, 3, 2)) / math.sqrt(query.size(-1))
+        scores = scores.masked_fill(mask == 0, -1e9)
+        weights = F.softmax(scores, dim=-1)
+        weights = self.dropout(weights)
+        context = torch.matmul(weights, value)
+        context = context.permute(0, 2, 1, 3).contiguous().view(context.shape[0], -1, self.heads * self.d_k)
+        return self.output_linear(context)
+
+class FeedForward(torch.nn.Module):
+    def __init__(self, d_model, middle_dim_ratio=4, dropout=0.1): # middle_dim como ratio
+        super(FeedForward, self).__init__()
+        middle_dim = d_model * middle_dim_ratio
+        self.fc1 = torch.nn.Linear(d_model, middle_dim)
+        self.fc2 = torch.nn.Linear(middle_dim, d_model)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.activation = torch.nn.GELU()
+    def forward(self, x):
+        out = self.activation(self.fc1(x))
+        out = self.fc2(self.dropout(out))
+        return out
+
+class EncoderLayer(torch.nn.Module):
+    def __init__(self, d_model=768, heads=12, feed_forward_hidden_ratio=4, dropout=0.1):
+        super(EncoderLayer, self).__init__()
+        self.layernorm = torch.nn.LayerNorm(d_model)
+        self.self_multihead = MultiHeadedAttention(heads, d_model, dropout=dropout)
+        self.feed_forward = FeedForward(d_model, middle_dim_ratio=feed_forward_hidden_ratio, dropout=dropout)
+        self.dropout = torch.nn.Dropout(dropout)
+    def forward(self, embeddings, mask):
+        # Sublayer 1: Multi-Head Attention + Add & Norm
+        attended = self.self_multihead(embeddings, embeddings, embeddings, mask)
+        interacted = self.layernorm(embeddings + self.dropout(attended))
+        # Sublayer 2: Feed Forward + Add & Norm
+        fed_forward = self.feed_forward(interacted)
+        encoded = self.layernorm(interacted + self.dropout(fed_forward))
+        return encoded
+
+class BERT(torch.nn.Module):
+    def __init__(self, vocab_size, d_model=768, n_layers=12, heads=12, dropout=0.1, seq_len=MAX_LEN):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.heads = heads
+        self.embedding = BERTEmbedding(vocab_size=vocab_size, embed_size=d_model, seq_len=seq_len, dropout=dropout)
+        self.encoder_blocks = torch.nn.ModuleList(
+            [EncoderLayer(d_model, heads, feed_forward_hidden_ratio=4, dropout=dropout) for _ in range(n_layers)])
+    def forward(self, x, segment_info):
+        # x: (batch_size, seq_len)
+        # segment_info: (batch_size, seq_len)
+        # Create attention mask for padding tokens (0 no BERT significa PAD ID do tokenizador)
+        # mask: (batch_size, 1, seq_len, seq_len) - para multi-head attention
+        # (x > 0) significa que não é PAD ID
+        mask = (x != tokenizer.pad_token_id).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
+        
+        x = self.embedding(x, segment_info) # (batch_size, seq_len, d_model)
+        for encoder in self.encoder_blocks:
+            x = encoder.forward(x, mask)
+        return x # (batch_size, seq_len, d_model)
+
+class NextSentencePrediction(torch.nn.Module):
+    def __init__(self, hidden_size): # hidden_size é d_model
+        super().__init__()
+        self.linear = torch.nn.Linear(hidden_size, 2) # 2 classes: is_next, is_not_next
+        self.softmax = torch.nn.LogSoftmax(dim=-1) # Tutorial usa LogSoftmax
+    def forward(self, x):
+        # Usa apenas o output do token [CLS] para predição de NSP
+        # x shape: (batch_size, seq_len, hidden_size)
+        # x[:, 0] shape: (batch_size, hidden_size) - output do [CLS]
+        return self.softmax(self.linear(x[:, 0]))
+
+class MaskedLanguageModel(torch.nn.Module):
+    def __init__(self, hidden_size, vocab_size): # hidden_size é d_model
+        super().__init__()
+        self.linear = torch.nn.Linear(hidden_size, vocab_size)
+        self.softmax = torch.nn.LogSoftmax(dim=-1) # Tutorial usa LogSoftmax
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, hidden_size)
+        # Output shape: (batch_size, seq_len, vocab_size)
+        return self.softmax(self.linear(x))
+
+class BERTLM(torch.nn.Module):
+    def __init__(self, bert_model: BERT, vocab_size: int):
+        super().__init__()
+        self.bert = bert_model
+        self.next_sentence = NextSentencePrediction(self.bert.d_model)
+        self.mask_lm = MaskedLanguageModel(self.bert.d_model, vocab_size)
+    def forward(self, x, segment_label):
+        # x: (batch_size, seq_len) - input_ids
+        # segment_label: (batch_size, seq_len)
+        bert_output = self.bert(x, segment_label) # (batch_size, seq_len, d_model)
+        nsp_output = self.next_sentence(bert_output) # (batch_size, 2)
+        mlm_output = self.mask_lm(bert_output) # (batch_size, seq_len, vocab_size)
+        return nsp_output, mlm_output
+
+print("Definições da arquitetura BERT concluídas.")
+
+# --- Bloco 7: Optimizer com Learning Rate Scheduling ---
+class ScheduledOptim():
+    def __init__(self, optimizer, d_model, n_warmup_steps):
+        self._optimizer = optimizer
+        self.n_warmup_steps = n_warmup_steps
+        self.n_current_steps = 0
+        self.init_lr = np.power(d_model, -0.5)
+    def step_and_update_lr(self):
+        self._update_learning_rate()
+        self._optimizer.step()
+    def zero_grad(self):
+        self._optimizer.zero_grad()
+    def _get_lr_scale(self):
+        # Condição para n_current_steps == 0 para evitar divisão por zero ou power(0, -0.5)
+        if self.n_current_steps == 0:
+            return 0.0 # Ou um valor muito pequeno, ou tratar n_warmup_steps = 0 de forma especial
+        
+        # Se n_warmup_steps for 0, não há aquecimento, usar apenas a parte decrescente.
+        if self.n_warmup_steps == 0:
+            return np.power(self.n_current_steps, -0.5)
+            
+        return np.minimum(
+            np.power(self.n_current_steps, -0.5),
+            np.power(self.n_warmup_steps, -1.5) * self.n_current_steps)
+    def _update_learning_rate(self):
+        self.n_current_steps += 1
+        lr = self.init_lr * self._get_lr_scale()
+        for param_group in self._optimizer.param_groups:
+            param_group['lr'] = lr
+
+print("Definição do otimizador agendado concluída.")
+
+# --- Bloco 8: Classe BERTTrainer ---
+class BERTTrainer:
+    def __init__(
+        self, model, train_dataloader, test_dataloader=None,
+        lr=1e-4, weight_decay=0.01, betas=(0.9, 0.999),
+        warmup_steps=10000, log_freq=10, device=DEVICE
+    ):
+        self.device = device
+        self.model = model.to(self.device) # Mover modelo para o dispositivo
+        self.train_data = train_dataloader
+        self.test_data = test_dataloader
+
+        self.optim = Adam(self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+        self.optim_schedule = ScheduledOptim(
+            self.optim, self.model.bert.d_model, n_warmup_steps=warmup_steps
+        )
+        # ignore_index=0 assume que PAD_TOKEN_ID é 0, o que é comum
+        self.criterion_mlm = torch.nn.NLLLoss(ignore_index=tokenizer.pad_token_id)
+        self.criterion_nsp = torch.nn.NLLLoss() # NSP não tem padding nos labels
+        self.log_freq = log_freq
+        print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
+
+    def train(self, epoch):
+        self.iteration(epoch, self.train_data, train_mode=True)
+
+    def test(self, epoch):
+        if self.test_data is None:
+            print("Nenhum DataLoader de teste fornecido.")
+            return
+        self.iteration(epoch, self.test_data, train_mode=False)
+
+    def iteration(self, epoch, data_loader, train_mode=True):
+        avg_loss = 0.0
+        total_nsp_correct = 0
+        total_nsp_element = 0
+        
+        mode_str = "TRAIN" if train_mode else "TEST"
+        if train_mode:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        data_iter = tqdm.tqdm(
+            enumerate(data_loader),
+            desc=f"EP_{mode_str}:{epoch:02d}",
+            total=len(data_loader),
+            bar_format="{l_bar}{r_bar}"
+        )
+
+        for i, data in data_iter:
+            data = {key: value.to(self.device) for key, value in data.items()}
+
+            next_sent_output, mask_lm_output = self.model.forward(data["bert_input"], data["segment_label"])
+            
+            # Loss NSP: next_sent_output (batch, 2), data["is_next"] (batch)
+            loss_nsp = self.criterion_nsp(next_sent_output, data["is_next"])
+            
+            # Loss MLM: mask_lm_output (batch, seq_len, vocab_size)
+            # data["bert_label"] (batch, seq_len)
+            # Precisamos permutar mask_lm_output para (batch, vocab_size, seq_len) para NLLLoss
+            loss_mlm = self.criterion_mlm(mask_lm_output.transpose(1, 2), data["bert_label"])
+            
+            loss = loss_nsp + loss_mlm
+
+            if train_mode:
+                self.optim_schedule.zero_grad()
+                loss.backward()
+                self.optim_schedule.step_and_update_lr()
+
+            # Accuracy para NSP
+            nsp_correct = next_sent_output.argmax(dim=-1).eq(data["is_next"]).sum().item()
+            total_nsp_correct += nsp_correct
+            total_nsp_element += data["is_next"].nelement() # batch_size
+
+            avg_loss += loss.item()
+
+            post_fix = {
+                "epoch": epoch, "iter": i,
+                "avg_loss": avg_loss / (i + 1),
+                "avg_nsp_acc": total_nsp_correct / total_nsp_element * 100 if total_nsp_element > 0 else 0,
+                "loss": loss.item(),
+                "lr": self.optim_schedule.init_lr * self.optim_schedule._get_lr_scale() if train_mode else 0
+            }
+            if i % self.log_freq == 0:
+                data_iter.write(str(post_fix))
+        
+        final_avg_loss = avg_loss / len(data_iter)
+        final_nsp_acc = total_nsp_correct * 100.0 / total_nsp_element if total_nsp_element > 0 else 0
+        print(f"EP{epoch:02d} {mode_str}: avg_loss={final_avg_loss:.4f}, total_nsp_acc={final_nsp_acc:.2f}%")
+
+print("Definição da classe BERTTrainer concluída.")
+
+
+# --- Bloco 9: Execução do Treinamento (Teste) ---
+print("Configurando para execução do treinamento de teste...")
+
+# Recriar DataLoader com todas as sentenças (ou o subconjunto definido)
+# Assegure-se que 'all_aroeira_sentences' e 'tokenizer' estão definidos e carregados
+if not all_aroeira_sentences or tokenizer is None:
+    print("ERRO: 'all_aroeira_sentences' ou 'tokenizer' não estão prontos. Verifique os blocos anteriores.")
+    exit()
+    
+print(f"Usando {len(all_aroeira_sentences)} sentenças para o dataset de treino.")
+final_train_dataset = BERTDataset(all_aroeira_sentences, tokenizer, seq_len=MAX_LEN)
+
+if len(final_train_dataset) == 0:
+    print("ERRO: O Dataset de treino final está vazio. Verifique o processamento dos dados.")
+    exit()
+
+final_train_loader = DataLoader(final_train_dataset, batch_size=16, shuffle=True, pin_memory=True, num_workers=2 if DEVICE=='cuda' else 0) # Ajuste batch_size conforme memória
+
+# Configurações do modelo BERT (menor para teste rápido)
+BERT_D_MODEL = 256  # Dimensão do embedding (menor que 768 para teste)
+BERT_N_LAYERS = 2   # Número de camadas do encoder (poucas para teste)
+BERT_HEADS = 4      # Número de cabeças de atenção (menor que 12 para teste)
+BERT_DROPOUT = 0.1
+
+print(f"Instanciando modelo BERT com vocab_size={tokenizer.vocab_size}, d_model={BERT_D_MODEL}, n_layers={BERT_N_LAYERS}, heads={BERT_HEADS}")
+bert_model_custom = BERT(
+    vocab_size=tokenizer.vocab_size, # Usar o tamanho do vocabulário do tokenizador treinado
+    d_model=BERT_D_MODEL,
+    n_layers=BERT_N_LAYERS,
+    heads=BERT_HEADS,
+    dropout=BERT_DROPOUT,
+    seq_len=MAX_LEN
+)
+
+bert_lm_custom = BERTLM(bert_model_custom, tokenizer.vocab_size)
+
+# Warmup steps pode ser uma % do total de steps esperados ou um valor fixo.
+# Ex: Se 1 epoch com 50k sentenças, batch 16 => ~3125 steps. 10% warmup = ~300 steps.
+# O tutorial usa 10000, que é alto para um dataset pequeno/teste. Vamos reduzir.
+WARMUP_STEPS_TRAIN = 300 
+LEARNING_RATE_TRAIN = 1e-4 # Taxa de aprendizado
+EPOCHS_TRAIN = 5 # Número de épocas para o teste
+
+print("Instanciando BERTTrainer...")
+bert_trainer_custom = BERTTrainer(
+    bert_lm_custom,
+    final_train_loader,
+    test_dataloader=None, # Sem dados de teste por enquanto
+    lr=LEARNING_RATE_TRAIN,
+    warmup_steps=WARMUP_STEPS_TRAIN,
+    device=DEVICE,
+    log_freq=50 # Log a cada 50 iterações
+)
+
+print(f"Iniciando treinamento de teste por {EPOCHS_TRAIN} épocas...")
+for epoch_num in range(EPOCHS_TRAIN):
+    bert_trainer_custom.train(epoch_num)
+
+print("--- Treinamento de teste concluído ---")
+
+# Opcional: Salvar o modelo treinado
+# MODEL_SAVE_PATH = "./bert_aroeira_pretrained_custom_v1"
+# os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+# torch.save(bert_lm_custom.state_dict(), os.path.join(MODEL_SAVE_PATH, "bert_lm_custom_aroeira.pth"))
+# tokenizer.save_pretrained(MODEL_SAVE_PATH) # Salva o tokenizador junto
+# print(f"Modelo e tokenizador salvos em {MODEL_SAVE_PATH}")
