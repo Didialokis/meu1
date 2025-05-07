@@ -53,9 +53,14 @@ try:
 
     if AROEIRA_SUBSET_SIZE is not None:
         print(f"Coletando {AROEIRA_SUBSET_SIZE} exemplos do stream...")
+        
+        # <<< CORREÇÃO: Obter o iterador a partir do IterableDataset >>>
+        stream_iterator = iter(streamed_aroeira_dataset)
+        
         try:
             for _ in range(AROEIRA_SUBSET_SIZE):
-                aroeira_examples_collected.append(next(streamed_aroeira_dataset))
+                # <<< CORREÇÃO: Usar next() no iterador >>>
+                aroeira_examples_collected.append(next(stream_iterator))
         except StopIteration:
             print(f"Alerta: Stream esgotado. Coletados {len(aroeira_examples_collected)}/{AROEIRA_SUBSET_SIZE} exemplos.")
         
@@ -70,6 +75,7 @@ try:
     else:
         # Processa o stream inteiro se AROEIRA_SUBSET_SIZE for None
         # CUIDADO: all_aroeira_sentences pode ficar muito grande!
+        # Um loop 'for' implicitamente chama iter() no dataset, então não precisa de alteração aqui.
         print("Processando todos os exemplos do stream Aroeira (pode consumir muita RAM)...")
         for example in tqdm(streamed_aroeira_dataset, desc="Extraindo sentenças (stream completo)"):
             sentence = example[text_column_name]
