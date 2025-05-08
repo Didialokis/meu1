@@ -1,0 +1,70 @@
+# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira (Streaming) ---
+print("\n--- Bloco 3: Carregando e Pré-processando Corpus ---")
+all_aroeira_sentences = []
+aroeira_examples_collected = [] # Lista para exemplos brutos coletados
+
+try:
+    print("Carregando dataset Aroeira (modo streaming)...")
+    # O dataset Aroeira pode precisar de trust_remote_code=True
+    streamed_aroeira_dataset = datasets.load_dataset(
+        "Itau-Unibanco/aroeira",
+        split="train",
+        streaming=True,
+        trust_remote_code=True
+    )
+    text_column_name = "text" # Nome da coluna de texto no dataset Aroeira
+
+    if AROEIRA_SUBSET_SIZE is not None:
+        print(f"Coletando {AROEIRA_SUBSET_SIZE} exemplos do stream...")
+        stream_iterator = iter(streamed_aroeira_dataset)
+        try:
+            for _ in range(AROEIRA_SUBSET_SIZE):
+                aroeira_examples_collected.append(next(stream_iterator))
+        except StopIteration:
+            print(f"Alerta: Stream esgotado antes de coletar os {AROEIRA_SUBSET_SIZE} exemplos solicitados. "
+                  f"Foram coletados {len(aroeira_examples_collected)} exemplos.")
+
+        if not aroeira_examples_collected:
+             raise ValueError("Nenhum exemplo bruto foi coletado do stream. Verifique AROEIRA_SUBSET_SIZE.")
+
+        # ==========>>> PRINT ADICIONADO AQUI <<<==========
+        print(f"DEBUG: Tamanho da lista 'aroeira_examples_collected' ANTES do loop de extração de sentenças: {len(aroeira_examples_collected)}")
+        # ====================================================
+
+        print(f"Extraindo sentenças dos {len(aroeira_examples_collected)} exemplos coletados...")
+        # ATENÇÃO tqdm: Se ocorrer erro "'module' object is not callable" aqui,
+        # verifique se 'tqdm' foi sobrescrito ou reinicie o kernel do notebook.
+        for example in tqdm(aroeira_examples_collected, desc="Extraindo sentenças"):
+            # Usar .get() para mais segurança caso a coluna não exista em algum exemplo raro
+            sentence = example.get(text_column_name)
+            if isinstance(sentence, str) and sentence.strip():
+                all_aroeira_sentences.append(sentence.strip())
+    else:
+        # Processa o stream inteiro se AROEIRA_SUBSET_SIZE for None
+        print("AROEIRA_SUBSET_SIZE é None. Processando todos os exemplos do stream Aroeira (pode consumir muita RAM para a lista final)...")
+        # ATENÇÃO tqdm: Mesmo alerta acima se o erro ocorrer aqui.
+        for example in tqdm(streamed_aroeira_dataset, desc="Extraindo sentenças (stream completo)"):
+            sentence = example.get(text_column_name)
+            if isinstance(sentence, str) and sentence.strip():
+                all_aroeira_sentences.append(sentence.strip())
+
+    print(f"Total de sentenças extraídas: {len(all_aroeira_sentences)}")
+    if not all_aroeira_sentences:
+        raise ValueError("Nenhuma sentença foi extraída. Verifique o dataset e AROEIRA_SUBSET_SIZE.")
+
+    # Salvar sentenças em um único arquivo temporário para o tokenizador
+    print(f"Salvando sentenças em arquivo temporário: {TEMP_TOKENIZER_TRAIN_FILE}")
+    if TEMP_TOKENIZER_TRAIN_FILE.exists(): # Limpar arquivo antigo, se existir
+        TEMP_TOKENIZER_TRAIN_FILE.unlink()
+
+    with open(TEMP_TOKENIZER_TRAIN_FILE, "w", encoding="utf-8") as fp:
+        for sentence in all_aroeira_sentences:
+            fp.write(sentence + "\n")
+    tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)] # Lista com um único arquivo
+    print(f"Sentenças salvas. Arquivo para tokenizador: {tokenizer_train_files_list[0]}")
+
+except Exception as e:
+    print(f"Erro no Bloco 3: {e}")
+    import traceback
+    traceback.print_exc()
+    raise
