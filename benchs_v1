@@ -1506,3 +1506,197 @@ except Exception as e:
     traceback.print_exc()
 
 # ... (Bloco 11 para HAREM continua como antes) ...
+////////////////////////////////////////////////////
+
+# --- Bloco 10: Fine-tuning e Avaliação no ASSIN (NLI/RTE) ---
+print("\n--- Bloco 10: Fine-tuning e Avaliação ASSIN (NLI/RTE) ---")
+
+# Constantes para Fine-tuning (ajuste se necessário, ou use as globais do Bloco 2)
+ASSIN_NLI_MODEL_SAVE_FILENAME = "aroeira_assin_nli_model.pth"
+ASSIN_SUBSET_SIZE_TRAIN = 500 # Usar subset pequeno do treino para demonstração
+ASSIN_SUBSET_SIZE_VAL = 100  # Usar subset pequeno da validação para demonstração
+# FINETUNE_EPOCHS, FINETUNE_BATCH_SIZE, FINETUNE_LR são usados do Bloco 2
+
+# 10.1. Modelo para Classificação de Pares de Sentenças (NLI)
+class BERTForSequencePairClassification(nn.Module):
+    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_classes):
+        super().__init__()
+        self.bert_base = bert_base
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size, num_classes) # hidden_size deve ser o de bert_base
+    def forward(self, input_ids, attention_mask, segment_ids):
+        sequence_output = self.bert_base(input_ids, attention_mask, segment_ids)
+        cls_output = sequence_output[:, 0, :] # Output do token [CLS] (<s>)
+        return self.classifier(self.dropout(cls_output))
+
+# 10.2. Dataset para ASSIN NLI
+class ASSINNLIDataset(Dataset):
+    def __init__(self, hf_dataset_split, tokenizer, max_len): # hf_dataset_split é um datasets.Dataset
+        self.tokenizer, self.max_len = tokenizer, max_len
+        self.premises, self.hypotheses, self.labels = [], [], []
+        self.label_map = {"ENTAILMENT": 0, "NONE": 1, "PARAPHRASE": 2} # Mapeamento para 3 classes
+        self.num_classes = 3 # Definindo o número de classes
+        
+        processed_count = 0
+        skipped_count = 0
+        
+        print(f"DEBUG ASSINNLIDataset: Iniciando processamento de {len(hf_dataset_split)} exemplos brutos de entrada.")
+        feature_ej = None
+        if hasattr(hf_dataset_split, 'features') and 'entailment_judgment' in hf_dataset_split.features:
+            feature_ej = hf_dataset_split.features['entailment_judgment']
+        else:
+            print("AVISO DEBUG: Não foi possível obter 'entailment_judgment' de hf_dataset_split.features.")
+
+        for i, example in enumerate(tqdm(hf_dataset_split, desc="Processando exemplos ASSIN NLI (Dataset Class)", file=sys.stdout)):
+            premise = example.get("premise")
+            hypothesis = example.get("hypothesis")
+            judgment_val = example.get("entailment_judgment")
+            
+            judgment_str_for_map = None
+
+            if isinstance(judgment_val, str):
+                judgment_str_for_map = judgment_val
+            elif isinstance(judgment_val, int) and feature_ej:
+                try:
+                    judgment_str_for_map = feature_ej.int2str(judgment_val)
+                except Exception: judgment_str_for_map = None 
+            
+            condition_premise_ok = isinstance(premise, str) and premise.strip()
+            condition_hypothesis_ok = isinstance(hypothesis, str) and hypothesis.strip()
+            condition_judgment_str_ok = judgment_str_for_map is not None
+            condition_judgment_in_map = judgment_str_for_map in self.label_map if condition_judgment_str_ok else False
+            condition_met = (condition_premise_ok and condition_hypothesis_ok and 
+                             condition_judgment_str_ok and condition_judgment_in_map)
+
+            if condition_met:
+                self.premises.append(premise.strip())
+                self.hypotheses.append(hypothesis.strip())
+                self.labels.append(self.label_map[judgment_str_for_map])
+                processed_count += 1
+            else:
+                skipped_count += 1
+                # Descomente a linha abaixo para depuração intensa de exemplos ignorados
+                # if skipped_count < 10 or i % (len(hf_dataset_split)//10 + 1) == 0 :
+                #     print(f"DEBUG ASSINNLIDataset: Exemplo {i} IGNORADO. Val: {judgment_val}({type(judgment_val)}), Str: {judgment_str_for_map}")
+        
+        print(f"DEBUG ASSINNLIDataset: Processamento concluído. {processed_count} exemplos adicionados, {skipped_count} ignorados.")
+        if processed_count == 0 and len(hf_dataset_split) > 0:
+             print(f"AVISO SÉRIO EM ASSINNLIDataset: Nenhum exemplo do dataset de entrada ({len(hf_dataset_split)} exs) foi processado.")
+
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        encoding = self.tokenizer.encode(self.premises[idx], self.hypotheses[idx])
+        input_ids_list = encoding.ids
+        segment_ids_list = [0] * len(input_ids_list)
+        try:
+            sep_id = self.tokenizer.token_to_id("</s>")
+            first_sep_index = -1
+            for i in range(1, len(input_ids_list)):
+                if input_ids_list[i] == sep_id: first_sep_index = i; break
+            if first_sep_index != -1:
+                for i in range(first_sep_index + 1, len(input_ids_list)):
+                    if input_ids_list[i] != self.tokenizer.token_to_id("<pad>"): segment_ids_list[i] = 1
+                    else: break 
+        except ValueError: pass
+        return {"input_ids": torch.tensor(input_ids_list), 
+                "attention_mask": torch.tensor(encoding.attention_mask, dtype=torch.long),
+                "segment_ids": torch.tensor(segment_ids_list, dtype=torch.long),
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long)}
+
+# Início da lógica de carregamento e fine-tuning
+try:
+    print("Carregando dataset ASSIN (config 'ptbr')...")
+    assin_ptbr_full = datasets.load_dataset("assin", name="ptbr", trust_remote_code=True)
+    
+    raw_train_data_assin = assin_ptbr_full["train"]
+    raw_val_data_assin = assin_ptbr_full["validation"]
+
+    def has_entailment_judgment(example):
+        return example.get('entailment_judgment') is not None
+
+    assin_nli_train_full_hf = raw_train_data_assin.filter(has_entailment_judgment)
+    assin_nli_val_full_hf = raw_val_data_assin.filter(has_entailment_judgment)
+    print(f"Tamanho de treino ASSIN após filtro 'has_entailment_judgment': {len(assin_nli_train_full_hf)}")
+    print(f"Tamanho de validação ASSIN após filtro 'has_entailment_judgment': {len(assin_nli_val_full_hf)}")
+
+    if len(assin_nli_train_full_hf) > 0:
+        assin_nli_train_hf_subset = assin_nli_train_full_hf.select(
+            range(min(ASSIN_SUBSET_SIZE_TRAIN, len(assin_nli_train_full_hf)))
+        )
+    else: assin_nli_train_hf_subset = assin_nli_train_full_hf
+    
+    if len(assin_nli_val_full_hf) > 0:
+        assin_nli_val_hf_subset = assin_nli_val_full_hf.select(
+            range(min(ASSIN_SUBSET_SIZE_VAL, len(assin_nli_val_full_hf)))
+        )
+    else: assin_nli_val_hf_subset = assin_nli_val_full_hf
+        
+    print(f"Dataset ASSIN NLI para fine-tuning (treino subset): {len(assin_nli_train_hf_subset)} exemplos.")
+    print(f"Dataset ASSIN NLI para fine-tuning (validação subset): {len(assin_nli_val_hf_subset)} exemplos.")
+    
+    if len(assin_nli_train_hf_subset) == 0:
+        print("Nenhum dado de treino para ASSIN NLI. Pulando fine-tuning e avaliação para este benchmark.")
+    else:
+        ft_assin_nli_train_dataset = ASSINNLIDataset(assin_nli_train_hf_subset, tokenizer, max_len=MAX_LEN)
+        if len(ft_assin_nli_train_dataset) == 0 :
+            raise ValueError("ft_assin_nli_train_dataset está vazio APÓS instanciação. Verifique a lógica em ASSINNLIDataset.")
+        ft_assin_nli_train_loader = DataLoader(ft_assin_nli_train_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
+        
+        ft_assin_nli_val_loader = None
+        if len(assin_nli_val_hf_subset) > 0:
+            ft_assin_nli_val_dataset = ASSINNLIDataset(assin_nli_val_hf_subset, tokenizer, max_len=MAX_LEN)
+            if len(ft_assin_nli_val_dataset) > 0:
+                ft_assin_nli_val_loader = DataLoader(ft_assin_nli_val_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=False, num_workers=0)
+            else: print("AVISO: ft_assin_nli_val_dataset ficou vazio após instanciação.")
+        else: print("Nenhum dado de validação para ASSIN NLI após subsetting.")
+
+        # Carregar backbone pré-treinado e criar modelo NLI
+        bert_base_for_nli = BERTBaseModel(
+            vocab_size=tokenizer.get_vocab_size(),
+            hidden_size=MODEL_HIDDEN_SIZE,
+            num_layers=MODEL_NUM_LAYERS,
+            num_heads=MODEL_NUM_ATTENTION_HEADS, # <<< CORREÇÃO APLICADA AQUI
+            intermediate_size=MODEL_INTERMEDIATE_SIZE,
+            max_len_config=MAX_LEN,
+            pad_token_id=PAD_TOKEN_ID
+        )
+
+        if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
+            print(f"Carregando state_dict do BERTLM de '{PRETRAINED_BERTLM_SAVE_FILENAME}'...")
+            bertlm_state_dict = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
+            bert_base_state_dict = {
+                k.replace("bert_base.", ""): v 
+                for k, v in bertlm_state_dict.items() 
+                if k.startswith("bert_base.")
+            }
+            if bert_base_state_dict:
+                bert_base_for_nli.load_state_dict(bert_base_state_dict)
+                print("Pesos do backbone BERT carregados para fine-tuning NLI.")
+            else:
+                print("AVISO (NLI): Nenhum peso para 'bert_base.' encontrado no arquivo salvo do pré-treino.")
+        else:
+            print(f"AVISO (NLI): Modelo pré-treinado '{PRETRAINED_BERTLM_SAVE_FILENAME}' não encontrado. Usando backbone com pesos aleatórios.")
+
+        assin_nli_model = BERTForSequencePairClassification(
+            bert_base_for_nli, 
+            MODEL_HIDDEN_SIZE, 
+            num_classes=ft_assin_nli_train_dataset.num_classes # Usa num_classes do dataset
+        ).to(DEVICE)
+        
+        optimizer_nli = torch.optim.AdamW(assin_nli_model.parameters(), lr=FINETUNE_LR)
+        criterion_nli = nn.CrossEntropyLoss()
+
+        # Usa as constantes globais FINETUNE_EPOCHS e FINETUNE_LR (definidas no Bloco 2)
+        trainer_nli = GenericTrainer(
+            model=assin_nli_model, train_dataloader=ft_assin_nli_train_loader, val_dataloader=ft_assin_nli_val_loader,
+            optimizer=optimizer_nli, criterion=criterion_nli, device=DEVICE,
+            model_save_path=ASSIN_NLI_MODEL_SAVE_FILENAME, task_type="nli" 
+        )
+        trainer_nli.train(num_epochs=FINETUNE_EPOCHS)
+
+except Exception as e: 
+    print(f"Erro no Bloco 10 (ASSIN NLI): {e}")
+    import traceback
+    traceback.print_exc()
+
+# ... (Bloco 11 para HAREM continua como antes) ...
