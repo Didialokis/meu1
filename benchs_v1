@@ -1279,3 +1279,20 @@ except Exception as e:
     traceback.print_exc()
 
 # ... (Bloco 11 para HAREM continua como antes, mas também precisará de atenção se a estrutura dos dados mudar) ...
+
+
+///////////////////////////////////////////////////////]
+
+# No Bloco 10, após carregar assin_ptbr_full
+print("Carregando dataset ASSIN (config 'ptbr')...")
+assin_ptbr_full = datasets.load_dataset("assin", name="ptbr", trust_remote_code=True)
+print("Splits disponíveis na config 'ptbr':", list(assin_ptbr_full.keys()))
+
+raw_train_data_assin = assin_ptbr_full["train"]
+raw_val_data_assin = assin_ptbr_full["validation"]
+
+print(f"DEBUG: Tamanho inicial de raw_train_data_assin: {len(raw_train_data_assin)}")
+print(f"DEBUG: Tamanho inicial de raw_val_data_assin: {len(raw_val_data_assin)}")
+
+if len(raw_train_data_assin) > 0:
+    print(f"DEBUG: Primeiro exemplo de raw_train_data_assin ANTES do filtro: {raw_train_data_assin[0]}")
