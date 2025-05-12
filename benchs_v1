@@ -617,3 +617,126 @@ class BERTMLMDataset(Dataset):
             "segment_ids": segment_ids,
             "labels": mlm_labels, # <<< CHAVE CORRIGIDA AQUI
         }
+
+///////////////////
+
+# --- Bloco 10: Fine-tuning e Avaliação no ASSIN 2 (NLI/RTE) ---
+print("\n--- Bloco 10: Fine-tuning e Avaliação ASSIN 2 (NLI/RTE) ---")
+
+# Constantes para Fine-tuning (mantidas)
+ASSIN2_NLI_MODEL_SAVE_FILENAME = "aroeira_assin2_nli_model.pth"
+ASSIN2_SUBSET_SIZE_TRAIN = 500 # Usar subset pequeno do treino para demonstração
+ASSIN2_SUBSET_SIZE_VAL = 100  # Usar subset pequeno da validação para demonstração
+FINETUNE_EPOCHS_NLI = 2 # Mesmo que FINETUNE_EPOCHS global, mas pode ser específico
+FINETUNE_BATCH_SIZE_NLI = 8 # Mesmo que FINETUNE_BATCH_SIZE global
+FINETUNE_LR_NLI = 3e-5 # Mesmo que FINETUNE_LR global
+
+# 10.1. Modelo para Classificação de Pares de Sentenças (NLI)
+# (Definição da classe BERTForSequencePairClassification mantida como antes)
+class BERTForSequencePairClassification(nn.Module):
+    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_classes):
+        super().__init__(); self.bert_base = bert_base
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size, num_classes)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        sequence_output = self.bert_base(input_ids, attention_mask, segment_ids)
+        cls_output = sequence_output[:, 0, :]
+        return self.classifier(self.dropout(cls_output))
+
+# 10.2. Dataset para ASSIN 2 NLI
+# (Definição da classe ASSIN2NLIDataset mantida como antes)
+class ASSIN2NLIDataset(Dataset):
+    def __init__(self, hf_dataset_split, tokenizer, max_len):
+        self.tokenizer, self.max_len = tokenizer, max_len
+        self.premises, self.hypotheses, self.labels = [], [], []
+        label_map = {"Entailment": 0, "Contradiction": 1, "None": 2}
+        for example in hf_dataset_split: # hf_dataset_split agora é um datasets.Dataset
+            self.premises.append(example["premise"])
+            self.hypotheses.append(example["hypothesis"])
+            self.labels.append(label_map[example["entailment_judgment"]])
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        encoding = self.tokenizer.encode(self.premises[idx], self.hypotheses[idx])
+        input_ids_list = encoding.ids
+        segment_ids_list = [0] * len(input_ids_list)
+        try:
+            sep_id = self.tokenizer.token_to_id("</s>")
+            sep_idx = input_ids_list.index(sep_id, 1)
+            for i in range(sep_idx + 1, len(input_ids_list)):
+                if input_ids_list[i] != self.tokenizer.token_to_id("<pad>"):
+                    segment_ids_list[i] = 1
+        except ValueError: pass
+        return {"input_ids": torch.tensor(input_ids_list), 
+                "attention_mask": torch.tensor(encoding.attention_mask, dtype=torch.long),
+                "segment_ids": torch.tensor(segment_ids_list, dtype=torch.long),
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long)}
+
+# Início da lógica de carregamento e fine-tuning
+try:
+    print("Carregando dataset ASSIN (config 'ptbr')...")
+    # Carrega toda a configuração 'ptbr' que inclui ASSIN1, ASSIN2, RTE, STS
+    assin_ptbr_full = datasets.load_dataset("assin", name="ptbr", trust_remote_code=True)
+
+    # Agora, selecione os splits específicos para ASSIN 2 RTE dentro da configuração 'ptbr'
+    # Os nomes dos splits no Hub são como "train_assin2_rte", "validation_assin2_rte", "test_assin2_rte"
+    print("Selecionando splits para ASSIN 2 RTE (ptbr)...")
+    assin2_nli_train_full_hf = assin_ptbr_full["train_assin2_rte"]
+    assin2_nli_val_full_hf = assin_ptbr_full["validation_assin2_rte"]
+    # Se precisar do conjunto de teste para avaliação final:
+    # assin2_nli_test_full_hf = assin_ptbr_full["test_assin2_rte"]
+
+    # Aplicar subsetting para demonstração
+    assin2_nli_train_hf = assin2_nli_train_full_hf.select(range(min(ASSIN2_SUBSET_SIZE_TRAIN, len(assin2_nli_train_full_hf))))
+    assin2_nli_val_hf = assin2_nli_val_full_hf.select(range(min(ASSIN2_SUBSET_SIZE_VAL, len(assin2_nli_val_full_hf))))
+
+    print(f"Dataset ASSIN 2 NLI para treino: {len(assin2_nli_train_hf)} exemplos.")
+    print(f"Dataset ASSIN 2 NLI para validação: {len(assin2_nli_val_hf)} exemplos.")
+    
+    ft_assin2_nli_train_dataset = ASSIN2NLIDataset(assin2_nli_train_hf, tokenizer, max_len=MAX_LEN)
+    ft_assin2_nli_train_loader = DataLoader(ft_assin2_nli_train_dataset, batch_size=FINETUNE_BATCH_SIZE_NLI, shuffle=True, num_workers=0)
+    
+    ft_assin2_nli_val_loader = None
+    if len(assin2_nli_val_hf) > 0:
+        ft_assin2_nli_val_dataset = ASSIN2NLIDataset(assin2_nli_val_hf, tokenizer, max_len=MAX_LEN)
+        ft_assin2_nli_val_loader = DataLoader(ft_assin2_nli_val_dataset, batch_size=FINETUNE_BATCH_SIZE_NLI, shuffle=False, num_workers=0)
+
+    # Carregar backbone pré-treinado e criar modelo NLI
+    bert_base_for_nli = BERTBaseModel(
+        vocab_size=tokenizer.get_vocab_size(), hidden_size=MODEL_HIDDEN_SIZE, num_layers=MODEL_NUM_LAYERS,
+        num_attention_heads=MODEL_NUM_ATTENTION_HEADS, intermediate_size=MODEL_INTERMEDIATE_SIZE,
+        max_len_config=MAX_LEN, pad_token_id=PAD_TOKEN_ID) # Reusa PAD_TOKEN_ID global
+
+    if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
+        print(f"Carregando state_dict do BERTLM de '{PRETRAINED_BERTLM_SAVE_FILENAME}'...")
+        bertlm_state_dict = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
+        bert_base_state_dict = {
+            k.replace("bert_base.", ""): v 
+            for k, v in bertlm_state_dict.items() 
+            if k.startswith("bert_base.")
+        }
+        if bert_base_state_dict:
+            bert_base_for_nli.load_state_dict(bert_base_state_dict)
+            print("Pesos do backbone BERT carregados para fine-tuning NLI.")
+        else:
+            print("AVISO (NLI): Nenhum peso para 'bert_base.' encontrado no arquivo salvo do pré-treino.")
+    else:
+        print(f"AVISO (NLI): Modelo pré-treinado '{PRETRAINED_BERTLM_SAVE_FILENAME}' não encontrado. Usando backbone com pesos aleatórios.")
+
+    assin2_nli_model = BERTForSequencePairClassification(bert_base_for_nli, MODEL_HIDDEN_SIZE, num_classes=3).to(DEVICE) # 3 classes para NLI
+    optimizer_nli = torch.optim.AdamW(assin2_nli_model.parameters(), lr=FINETUNE_LR_NLI)
+    criterion_nli = nn.CrossEntropyLoss()
+
+    trainer_nli = GenericTrainer(
+        model=assin2_nli_model, train_dataloader=ft_assin2_nli_train_loader, val_dataloader=ft_assin2_nli_val_loader,
+        optimizer=optimizer_nli, criterion=criterion_nli, device=DEVICE,
+        model_save_path=ASSIN2_NLI_MODEL_SAVE_FILENAME, task_type="nli" 
+        # vocab_size não é necessário para GenericTrainer quando task_type é "nli"
+    )
+    trainer_nli.train(num_epochs=FINETUNE_EPOCHS_NLI)
+
+except Exception as e: 
+    print(f"Erro no Bloco 10 (ASSIN 2 NLI): {e}")
+    import traceback
+    traceback.print_exc()
+    # Se o erro for de dataset não encontrado ou split, pode ser necessário
+    # instalar o 'gdown' se o dataset depender dele, ou verificar nomes exatos no Hugging Face Hub.
