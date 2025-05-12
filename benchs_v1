@@ -557,3 +557,63 @@ class BERTLM(nn.Module): # (mantido como antes)
         self.mlm_head = nn.Linear(hidden_size, vocab_size)
     def forward(self, input_ids, attention_mask, segment_ids):
         return self.mlm_head(self.bert_base(input_ids, attention_mask, segment_ids))
+
+/////////////
+
+# --- Bloco 5: Definição do BERTMLMDataset ---
+print("\n--- Bloco 5: Definindo o Dataset para MLM ---")
+class BERTMLMDataset(Dataset):
+    def __init__(self, sentences, tokenizer, max_len):
+        self.sentences = sentences
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.vocab_size = tokenizer.get_vocab_size()
+        self.mask_token_id = tokenizer.token_to_id("<mask>")
+        self.cls_token_id = tokenizer.token_to_id("<s>")
+        self.sep_token_id = tokenizer.token_to_id("</s>")
+        self.pad_token_id = PAD_TOKEN_ID # Usando o ID global
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def _mask_tokens(self, token_ids_original):
+        inputs = list(token_ids_original) # Cópia
+        labels = list(token_ids_original) # Cópia para labels
+
+        for i, token_id in enumerate(inputs):
+            # Não mascarar tokens especiais
+            if token_id in [self.cls_token_id, self.sep_token_id, self.pad_token_id]:
+                labels[i] = self.pad_token_id # Ignorar no loss
+                continue
+
+            prob = random.random()
+            if prob < 0.15: # 15% de chance de mascarar
+                action_prob = random.random() # Probabilidade para decidir a ação de mascaramento
+
+                if action_prob < 0.8: # 80% -> [MASK]
+                    inputs[i] = self.mask_token_id
+                elif action_prob < 0.9: # 10% -> Palavra Aleatória
+                    inputs[i] = random.randrange(self.vocab_size)
+                # else: 10% -> Manter Original (inputs[i] já é o original)
+                # labels[i] já é o token original, então não precisa mudar
+            else: # Não mascara este token
+                labels[i] = self.pad_token_id # Ignorar no loss
+        return torch.tensor(inputs), torch.tensor(labels)
+
+    def __getitem__(self, idx):
+        sentence = self.sentences[idx]
+        encoding = self.tokenizer.encode(sentence) # Já aplica CLS, SEP, padding, truncation
+
+        input_ids_original = encoding.ids
+        masked_input_ids, mlm_labels = self._mask_tokens(input_ids_original)
+        
+        attention_mask = torch.tensor(encoding.attention_mask, dtype=torch.long)
+        # Segment IDs (todos zeros para MLM com sentenças únicas)
+        segment_ids = torch.zeros_like(masked_input_ids, dtype=torch.long)
+
+        return {
+            "input_ids": masked_input_ids,
+            "attention_mask": attention_mask,
+            "segment_ids": segment_ids,
+            "labels": mlm_labels, # <<< CHAVE CORRIGIDA AQUI
+        }
