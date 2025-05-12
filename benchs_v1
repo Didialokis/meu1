@@ -507,3 +507,53 @@ try:
 except Exception as e: print(f"Erro no Bloco 11 (HAREM NER): {e}"); import traceback; traceback.print_exc()
 
 print("\n--- Script Completo com Fine-tuning e Avaliação (ASSIN2 NLI, HAREM NER) Finalizado ---")
+
+
+
+//////////////
+
+
+
+# --- Bloco 6: Definição do Modelo BERT (Backbone e Modelo MLM) ---
+print("\n--- Bloco 6: Definindo o Modelo BERT ---")
+# BERTEmbedding (mantido como antes)
+class BERTEmbedding(nn.Module):
+    def __init__(self, vocab_size, hidden_size, max_len, dropout_prob, pad_token_id):
+        super().__init__(); self.tok_emb = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
+        self.seg_emb = nn.Embedding(2, hidden_size); self.pos_emb = nn.Embedding(max_len, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-12); self.drop = nn.Dropout(dropout_prob)
+        self.register_buffer("pos_ids", torch.arange(max_len).expand((1, -1)))
+    def forward(self, input_ids, segment_ids):
+        seq_len = input_ids.size(1)
+        tok_e, seg_e = self.tok_emb(input_ids), self.seg_emb(segment_ids)
+        pos_e = self.pos_emb(self.pos_ids[:, :seq_len])
+        return self.drop(self.norm(tok_e + pos_e + seg_e))
+
+class BERTBaseModel(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers, num_heads,
+                 intermediate_size, # <<< NOME DO PARÂMETRO CORRIGIDO AQUI
+                 max_len_config, pad_token_id, dropout_prob=0.1):
+        super().__init__()
+        self.emb = BERTEmbedding(vocab_size, hidden_size, max_len_config, dropout_prob, pad_token_id)
+        # nn.TransformerEncoderLayer espera d_model, nhead, dim_feedforward
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=intermediate_size, # <<< PASSANDO PARA O ARGUMENTO CORRETO
+            dropout=dropout_prob,
+            activation='gelu',
+            batch_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+    def forward(self, input_ids, attention_mask, segment_ids):
+        x = self.emb(input_ids, segment_ids)
+        padding_mask = (attention_mask == 0) # True onde deve ser ignorado
+        return self.enc(x, src_key_padding_mask=padding_mask)
+
+class BERTLM(nn.Module): # (mantido como antes)
+    def __init__(self, bert_base: BERTBaseModel, vocab_size, hidden_size):
+        super().__init__(); self.bert_base = bert_base
+        self.mlm_head = nn.Linear(hidden_size, vocab_size)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        return self.mlm_head(self.bert_base(input_ids, attention_mask, segment_ids))
