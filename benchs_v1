@@ -1,0 +1,509 @@
+# --- Bloco 1: Imports Essenciais ---
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import datasets
+from tokenizers import ByteLevelBPETokenizer
+from tokenizers.processors import BertProcessing
+from tqdm.auto import tqdm # Para barras de progresso
+import random
+from pathlib import Path
+import sys
+from sklearn.metrics import accuracy_score, f1_score, classification_report # Para NLI
+from seqeval.metrics import classification_report as seqeval_classification_report # Para NER
+from seqeval.scheme import IOB2 # Para NER
+
+print(f"Versão do PyTorch: {torch.__version__}")
+print(f"Versão do Datasets: {datasets.__version__}")
+print(f"Versão do Tokenizers: {tokenizers.__version__}")
+print(f"Versão do Seqeval: (instale com !pip install seqeval)")
+
+
+# --- Bloco 2: Constantes e Configurações Iniciais ---
+MAX_LEN = 128
+AROEIRA_SUBSET_SIZE = 5000 # Reduzido para exemplo completo mais rápido
+VOCAB_SIZE = 30000
+MIN_FREQUENCY_TOKENIZER = 2 # Reduzido para datasets menores
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+EPOCHS_PRETRAIN = 1 # Reduzido para exemplo
+BATCH_SIZE_PRETRAIN = 8 # Reduzido
+
+MODEL_HIDDEN_SIZE = 256
+MODEL_NUM_LAYERS = 2
+MODEL_NUM_ATTENTION_HEADS = 4
+MODEL_INTERMEDIATE_SIZE = MODEL_HIDDEN_SIZE * 4
+
+TOKENIZER_VOCAB_FILENAME = "aroeira_mlm_tokenizer-vocab.json"
+TOKENIZER_MERGES_FILENAME = "aroeira_mlm_tokenizer-merges.txt"
+PRETRAINED_BERTLM_SAVE_FILENAME = "aroeira_bertlm_pretrained.pth"
+TEMP_TOKENIZER_TRAIN_FILE = Path("temp_aroeira_for_tokenizer.txt")
+
+# Constantes para Fine-tuning
+FINETUNE_EPOCHS = 2 # Poucas épocas para demonstração
+FINETUNE_BATCH_SIZE = 8 # Batch size menor para fine-tuning
+FINETUNE_LR = 3e-5
+
+print(f"Dispositivo: {DEVICE}")
+print(f"Subconjunto Aroeira para Pré-Treino: {AROEIRA_SUBSET_SIZE if AROEIRA_SUBSET_SIZE is not None else 'Completo'}")
+
+# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira (Streaming) ---
+print("\n--- Bloco 3: Carregando e Pré-processando Dados do Aroeira ---")
+all_aroeira_sentences = []
+try:
+    streamed_aroeira_dataset = datasets.load_dataset("Itau-Unibanco/aroeira",split="train",streaming=True,trust_remote_code=True)
+    text_column_name = "text"
+    if AROEIRA_SUBSET_SIZE is not None:
+        stream_iterator = iter(streamed_aroeira_dataset)
+        temp_collected_examples = []
+        for _ in range(AROEIRA_SUBSET_SIZE): temp_collected_examples.append(next(stream_iterator))
+        for example in tqdm(temp_collected_examples, desc="Extraindo sentenças Aroeira", file=sys.stdout, total=len(temp_collected_examples)):
+            sentence = example.get(text_column_name); all_aroeira_sentences.append(sentence.strip()) if isinstance(sentence, str) and sentence.strip() else None
+    else:
+        for example in tqdm(streamed_aroeira_dataset, desc="Extraindo sentenças Aroeira (stream completo)", file=sys.stdout):
+            sentence = example.get(text_column_name); all_aroeira_sentences.append(sentence.strip()) if isinstance(sentence, str) and sentence.strip() else None
+    if not all_aroeira_sentences: raise ValueError("Nenhuma sentença Aroeira extraída.")
+    print(f"Total de sentenças Aroeira extraídas: {len(all_aroeira_sentences)}")
+    if TEMP_TOKENIZER_TRAIN_FILE.exists(): TEMP_TOKENIZER_TRAIN_FILE.unlink()
+    with open(TEMP_TOKENIZER_TRAIN_FILE, "w", encoding="utf-8") as fp:
+        for sentence in all_aroeira_sentences: fp.write(sentence + "\n")
+    tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)]
+except Exception as e: print(f"Erro Bloco 3: {e}"); raise
+
+# --- Bloco 4: Treinando o Tokenizador ByteLevelBPE ---
+print("\n--- Bloco 4: Treinando o Tokenizador ---")
+if not Path(TOKENIZER_VOCAB_FILENAME).exists() or not Path(TOKENIZER_MERGES_FILENAME).exists():
+    tokenizer_save_prefix = TOKENIZER_VOCAB_FILENAME.replace("-vocab.json", "")
+    custom_tokenizer = ByteLevelBPETokenizer()
+    custom_tokenizer.train(files=tokenizer_train_files_list, vocab_size=VOCAB_SIZE, min_frequency=MIN_FREQUENCY_TOKENIZER, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
+    custom_tokenizer.save_model(".", prefix=tokenizer_save_prefix)
+else: print(f"Tokenizador já existe. Carregando...")
+tokenizer = ByteLevelBPETokenizer(vocab=TOKENIZER_VOCAB_FILENAME, merges=TOKENIZER_MERGES_FILENAME)
+tokenizer._tokenizer.post_processor = BertProcessing(("</s>", tokenizer.token_to_id("</s>")), ("<s>", tokenizer.token_to_id("<s>")))
+tokenizer.enable_truncation(max_length=MAX_LEN); tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<pad>"), pad_token="<pad>", length=MAX_LEN)
+PAD_TOKEN_ID = tokenizer.token_to_id("<pad>")
+print(f"Vocabulário do Tokenizador: {tokenizer.get_vocab_size()}")
+
+# --- Bloco 5: Definição do BERTMLMDataset ---
+print("\n--- Bloco 5: Definindo o Dataset para MLM ---")
+class BERTMLMDataset(Dataset):
+    def __init__(self, sentences, tokenizer, max_len):
+        self.sentences, self.tokenizer, self.max_len = sentences, tokenizer, max_len
+        self.vocab_size, self.mask_id, self.cls_id, self.sep_id, self.pad_id = tokenizer.get_vocab_size(), tokenizer.token_to_id("<mask>"), tokenizer.token_to_id("<s>"), tokenizer.token_to_id("</s>"), PAD_TOKEN_ID
+    def __len__(self): return len(self.sentences)
+    def _mask_tokens(self, ids_orig):
+        ids, lbls = list(ids_orig), list(ids_orig)
+        for i, token_id in enumerate(ids):
+            if token_id in [self.cls_id, self.sep_id, self.pad_id]: lbls[i] = self.pad_id; continue
+            if random.random() < 0.15:
+                act_prob = random.random()
+                if act_prob < 0.8: ids[i] = self.mask_id
+                elif act_prob < 0.9: ids[i] = random.randrange(self.vocab_size)
+            else: lbls[i] = self.pad_id
+        return torch.tensor(ids), torch.tensor(lbls)
+    def __getitem__(self, idx):
+        enc = self.tokenizer.encode(self.sentences[idx])
+        masked_ids, lbls = self._mask_tokens(enc.ids)
+        return {"input_ids": masked_ids, "attention_mask": torch.tensor(enc.attention_mask, dtype=torch.long), 
+                "segment_ids": torch.zeros_like(masked_ids, dtype=torch.long), "mlm_labels": lbls}
+
+# --- Bloco 6: Definição do Modelo BERT (Backbone e Modelo MLM) ---
+print("\n--- Bloco 6: Definindo o Modelo BERT ---")
+class BERTEmbedding(nn.Module):
+    def __init__(self, vocab_size, hidden_size, max_len, dropout_prob, pad_token_id):
+        super().__init__(); self.tok_emb = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
+        self.seg_emb = nn.Embedding(2, hidden_size); self.pos_emb = nn.Embedding(max_len, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-12); self.drop = nn.Dropout(dropout_prob)
+        self.register_buffer("pos_ids", torch.arange(max_len).expand((1, -1)))
+    def forward(self, input_ids, segment_ids):
+        seq_len = input_ids.size(1)
+        tok_e, seg_e = self.tok_emb(input_ids), self.seg_emb(segment_ids)
+        pos_e = self.pos_emb(self.pos_ids[:, :seq_len])
+        return self.drop(self.norm(tok_e + pos_e + seg_e))
+
+class BERTBaseModel(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers, num_heads, int_size, max_len, pad_id, drop_prob=0.1):
+        super().__init__()
+        self.emb = BERTEmbedding(vocab_size, hidden_size, max_len, drop_prob, pad_id)
+        enc_layer = nn.TransformerEncoderLayer(hidden_size, num_heads, int_size, drop_prob, 'gelu', True)
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        x = self.emb(input_ids, segment_ids)
+        return self.enc(x, src_key_padding_mask=(attention_mask == 0))
+
+class BERTLM(nn.Module):
+    def __init__(self, bert_base: BERTBaseModel, vocab_size, hidden_size):
+        super().__init__(); self.bert_base = bert_base
+        self.mlm_head = nn.Linear(hidden_size, vocab_size)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        return self.mlm_head(self.bert_base(input_ids, attention_mask, segment_ids))
+
+# --- Bloco 7: Trainer Simplificado (Para Pré-Treino MLM e adaptável para Fine-tuning) ---
+print("\n--- Bloco 7: Definindo o Trainer ---")
+class GenericTrainer: # Renomeado para ser mais genérico
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer, criterion, device, 
+                 model_save_path, task_type="mlm", vocab_size=None, id2label=None):
+        self.model, self.train_dl, self.val_dl = model.to(device), train_dataloader, val_dataloader
+        self.opt, self.crit, self.dev = optimizer, criterion, device
+        self.save_path, self.best_val_metric = model_save_path, float('inf') if task_type != "ner_f1" else float('-inf')
+        self.task_type, self.vocab_size, self.id2label = task_type, vocab_size, id2label
+        if task_type == "ner_f1" and id2label is None: raise ValueError("id2label é necessário para ner_f1")
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl: return None, {}
+        total_loss, all_preds_epoch, all_labels_epoch = 0, [], []
+        desc = f"Epoch {epoch_num+1} [{'Train' if is_training else 'Val'}]"
+        progress_bar = tqdm(dl, total=len(dl), desc=desc, file=sys.stdout)
+
+        for batch in progress_bar:
+            input_ids = batch["input_ids"].to(self.dev); attention_mask = batch["attention_mask"].to(self.dev)
+            segment_ids = batch.get("segment_ids", torch.zeros_like(input_ids)).to(self.dev) # Default para NER
+            labels = batch["labels"].to(self.dev) # Nome genérico para labels
+
+            if is_training: self.opt.zero_grad()
+            with torch.set_grad_enabled(is_training):
+                logits = self.model(input_ids, attention_mask, segment_ids)
+                if self.task_type == "mlm" or self.task_type == "ner":
+                    loss = self.crit(logits.view(-1, logits.size(-1)), labels.view(-1))
+                elif self.task_type == "nli": # Classificação de sequência
+                    loss = self.crit(logits, labels)
+            if is_training: loss.backward(); self.opt.step()
+            total_loss += loss.item()
+            progress_bar.set_postfix({"loss": f"{total_loss / (progress_bar.n + 1):.4f}"})
+
+            if not is_training: # Coleta predições e labels para métricas de validação
+                if self.task_type == "nli":
+                    all_preds_epoch.extend(torch.argmax(logits, dim=-1).cpu().numpy())
+                    all_labels_epoch.extend(labels.cpu().numpy())
+                elif self.task_type == "ner":
+                    preds_ner = torch.argmax(logits, dim=-1).cpu().numpy()
+                    labels_ner = labels.cpu().numpy()
+                    # Converter IDs para labels de string, ignorando padding/special tokens para seqeval
+                    for p_seq, l_seq, mask_seq in zip(preds_ner, labels_ner, attention_mask.cpu().numpy()):
+                        all_preds_epoch.append([self.id2label[p] for p, l, m in zip(p_seq, l_seq, mask_seq) if m == 1 and l != self.crit.ignore_index])
+                        all_labels_epoch.append([self.id2label[l] for l, m in zip(l_seq, mask_seq) if m == 1 and l != self.crit.ignore_index])
+        
+        avg_loss = total_loss / len(dl)
+        metrics = {"loss": avg_loss}
+        if not is_training:
+            if self.task_type == "nli":
+                metrics["accuracy"] = accuracy_score(all_labels_epoch, all_preds_epoch)
+                metrics["f1_weighted"] = f1_score(all_labels_epoch, all_preds_epoch, average='weighted', zero_division=0)
+            elif self.task_type == "ner" and all_labels_epoch: # Garante que há o que avaliar
+                 # Remove listas vazias que podem surgir se uma sentença inteira for padding
+                all_preds_epoch_filt = [p for p in all_preds_epoch if p]
+                all_labels_epoch_filt = [l for l in all_labels_epoch if l]
+                if all_preds_epoch_filt and all_labels_epoch_filt : # Só calcula se houver o que calcular
+                    report = seqeval_classification_report(all_labels_epoch_filt, all_preds_epoch_filt, output_dict=True, zero_division=0, mode='strict', scheme=IOB2)
+                    metrics["ner_f1_micro"] = report['micro avg']['f1-score'] # Usar micro para NER é comum
+
+        print_metrics = f"{desc} - Avg Loss: {avg_loss:.4f}"
+        for k, v in metrics.items():
+            if k != "loss": print_metrics += f", {k}: {v:.4f}"
+        print(print_metrics)
+        return avg_loss, metrics
+
+    def train(self, num_epochs):
+        action_metric = "ner_f1_micro" if self.task_type == "ner" else "loss" # O que otimizar
+        print(f"Iniciando treinamento ({self.task_type}) por {num_epochs} épocas. Otimizando para {action_metric}.")
+        for epoch in range(num_epochs):
+            self._run_epoch(epoch, is_training=True)
+            val_loss, val_metrics = self._run_epoch(epoch, is_training=False)
+            
+            current_metric_val = val_metrics.get(action_metric) if val_metrics else None
+            if current_metric_val is not None:
+                improved = (current_metric_val < self.best_val_metric) if action_metric == "loss" else \
+                           (current_metric_val > self.best_val_metric)
+                if improved:
+                    self.best_val_metric = current_metric_val
+                    print(f"Nova melhor métrica de validação ({action_metric}): {self.best_val_metric:.4f}. Salvando modelo em {self.save_path}")
+                    torch.save(self.model.state_dict(), self.save_path)
+            elif epoch == num_epochs - 1: # Sem validação, salva na última época
+                print(f"Treinamento ({self.task_type}) sem validação ou métrica alvo. Salvando modelo da última época em {self.save_path}")
+                torch.save(self.model.state_dict(), self.save_path)
+            print("-" * 30)
+        print(f"Treinamento ({self.task_type}) concluído. Melhor métrica ({action_metric}): {self.best_val_metric:.4f}")
+
+# --- Bloco 8: Preparando e Executando o Pré-Treinamento MLM ---
+print("\n--- Bloco 8: Pré-Treinamento MLM ---")
+# ... (código para criar train_loader_mlm, val_loader_mlm, bert_base_model, bertlm_model_for_pretrain, optimizer_mlm, criterion_mlm - mantido igual ao anterior)
+val_split_ratio = 0.1; num_val_samples = int(len(all_aroeira_sentences) * val_split_ratio)
+if num_val_samples < 1 and len(all_aroeira_sentences) > 1: num_val_samples = 1
+train_sentences_mlm = all_aroeira_sentences[num_val_samples:]; val_sentences_mlm = all_aroeira_sentences[:num_val_samples]
+if not train_sentences_mlm: train_sentences_mlm = all_aroeira_sentences; val_sentences_mlm = []
+train_dataset_mlm = BERTMLMDataset(train_sentences_mlm, tokenizer, max_len=MAX_LEN)
+train_loader_mlm = DataLoader(train_dataset_mlm, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, num_workers=0)
+val_loader_mlm = None
+if val_sentences_mlm:
+    val_dataset_mlm = BERTMLMDataset(val_sentences_mlm, tokenizer, max_len=MAX_LEN)
+    val_loader_mlm = DataLoader(val_dataset_mlm, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
+
+bert_base_model_pt = BERTBaseModel(
+    vocab_size=tokenizer.get_vocab_size(), hidden_size=MODEL_HIDDEN_SIZE, num_layers=MODEL_NUM_LAYERS, 
+    num_attention_heads=MODEL_NUM_ATTENTION_HEADS, intermediate_size=MODEL_INTERMEDIATE_SIZE, 
+    max_len_config=MAX_LEN, pad_token_id=PAD_TOKEN_ID
+)
+bertlm_model_for_pretrain = BERTLM(bert_base_model_pt, tokenizer.get_vocab_size(), MODEL_HIDDEN_SIZE)
+optimizer_mlm = torch.optim.AdamW(bertlm_model_for_pretrain.parameters(), lr=LEARNING_RATE_PRETRAIN)
+criterion_mlm = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+
+trainer_mlm = GenericTrainer(
+    model=bertlm_model_for_pretrain, train_dataloader=train_loader_mlm, val_dataloader=val_loader_mlm,
+    optimizer=optimizer_mlm, criterion=criterion_mlm, device=DEVICE,
+    model_save_path=PRETRAINED_BERTLM_SAVE_FILENAME, task_type="mlm", vocab_size=tokenizer.get_vocab_size()
+)
+try:
+    trainer_mlm.train(num_epochs=EPOCHS_PRETRAIN)
+except Exception as e: print(f"Erro pré-treinamento MLM: {e}"); raise
+
+
+# --- Bloco 10: Fine-tuning e Avaliação no ASSIN 2 (NLI/RTE) ---
+print("\n--- Bloco 10: Fine-tuning e Avaliação ASSIN 2 (NLI/RTE) ---")
+ASSIN2_NLI_MODEL_SAVE_FILENAME = "aroeira_assin2_nli_model.pth"
+ASSIN2_SUBSET_SIZE = 500 # Usar subset pequeno para demonstração
+
+# 10.1. Modelo para Classificação de Pares de Sentenças (NLI)
+class BERTForSequencePairClassification(nn.Module):
+    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_classes):
+        super().__init__(); self.bert_base = bert_base
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size, num_classes)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        sequence_output = self.bert_base(input_ids, attention_mask, segment_ids)
+        cls_output = sequence_output[:, 0, :] # Output do token [CLS] (<s>)
+        return self.classifier(self.dropout(cls_output))
+
+# 10.2. Dataset para ASSIN 2 NLI
+class ASSIN2NLIDataset(Dataset):
+    def __init__(self, hf_dataset_split, tokenizer, max_len):
+        self.tokenizer, self.max_len = tokenizer, max_len
+        self.premises, self.hypotheses, self.labels = [], [], []
+        label_map = {"Entailment": 0, "Contradiction": 1, "None": 2} # Mapeamento para ASSIN2 RTE
+        for example in hf_dataset_split:
+            self.premises.append(example["premise"])
+            self.hypotheses.append(example["hypothesis"])
+            self.labels.append(label_map[example["entailment_judgment"]])
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        encoding = self.tokenizer.encode(self.premises[idx], self.hypotheses[idx]) # Tokeniza par
+        # Segment IDs precisam ser criados manualmente para pares
+        # 0 para premissa (incluindo <s> inicial e </s> da premissa)
+        # 1 para hipótese (incluindo </s> da hipótese)
+        sep_id = self.tokenizer.token_to_id("</s>")
+        input_ids_list = encoding.ids
+        segment_ids_list = [0] * len(input_ids_list)
+        try:
+            # Encontra o primeiro SEP (após premissa)
+            sep_idx = input_ids_list.index(sep_id, 1) # Procura SEP a partir do segundo token
+            for i in range(sep_idx + 1, len(input_ids_list)):
+                if input_ids_list[i] != self.tokenizer.token_to_id("<pad>"): # Não marca PAD como segmento 1
+                    segment_ids_list[i] = 1
+        except ValueError: # Caso raro de não encontrar SEP se truncado antes, ou só 1 sentença
+            pass
+
+        return {"input_ids": torch.tensor(input_ids_list), 
+                "attention_mask": torch.tensor(encoding.attention_mask, dtype=torch.long),
+                "segment_ids": torch.tensor(segment_ids_list, dtype=torch.long),
+                "labels": torch.tensor(self.labels[idx], dtype=torch.long)}
+
+try:
+    print("Carregando ASSIN 2 (RTE)...") # RTE é NLI
+    assin2_nli_raw = datasets.load_dataset("assin", "assin2-rte", trust_remote_code=True) # Confiar no código remoto se necessário
+    
+    # Usar subsets pequenos para demonstração
+    assin2_nli_train_hf = datasets.Dataset.from_dict(assin2_nli_raw['train'][:ASSIN2_SUBSET_SIZE])
+    assin2_nli_val_hf = datasets.Dataset.from_dict(assin2_nli_raw['validation'][:max(10, int(ASSIN2_SUBSET_SIZE*0.2))]) # Pelo menos 10 para val
+
+    ft_assin2_nli_train_dataset = ASSIN2NLIDataset(assin2_nli_train_hf, tokenizer, max_len=MAX_LEN)
+    ft_assin2_nli_train_loader = DataLoader(ft_assin2_nli_train_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
+    ft_assin2_nli_val_loader = DataLoader(ASSIN2NLIDataset(assin2_nli_val_hf, tokenizer, max_len=MAX_LEN), batch_size=FINETUNE_BATCH_SIZE, shuffle=False, num_workers=0)
+
+    # Carregar backbone pré-treinado e criar modelo NLI
+    bert_base_for_nli = BERTBaseModel(
+        vocab_size=tokenizer.get_vocab_size(), hidden_size=MODEL_HIDDEN_SIZE, num_layers=MODEL_NUM_LAYERS,
+        num_attention_heads=MODEL_NUM_ATTENTION_HEADS, intermediate_size=MODEL_INTERMEDIATE_SIZE,
+        max_len_config=MAX_LEN, pad_token_id=PAD_TOKEN_ID)
+    if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
+        bertlm_state_dict = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
+        bert_base_state_dict = {k.replace("bert_base.", ""): v for k, v in bertlm_state_dict.items() if k.startswith("bert_base.")}
+        if bert_base_state_dict: bert_base_for_nli.load_state_dict(bert_base_state_dict)
+        else: print("AVISO (NLI): Pesos do backbone não encontrados no arquivo salvo.")
+    else: print(f"AVISO (NLI): {PRETRAINED_BERTLM_SAVE_FILENAME} não encontrado. Usando backbone aleatório.")
+
+    assin2_nli_model = BERTForSequencePairClassification(bert_base_for_nli, MODEL_HIDDEN_SIZE, num_classes=3).to(DEVICE) # 3 classes para NLI
+    optimizer_nli = torch.optim.AdamW(assin2_nli_model.parameters(), lr=FINETUNE_LR)
+    criterion_nli = nn.CrossEntropyLoss()
+
+    trainer_nli = GenericTrainer(
+        model=assin2_nli_model, train_dataloader=ft_assin2_nli_train_loader, val_dataloader=ft_assin2_nli_val_loader,
+        optimizer=optimizer_nli, criterion=criterion_nli, device=DEVICE,
+        model_save_path=ASSIN2_NLI_MODEL_SAVE_FILENAME, task_type="nli"
+    )
+    trainer_nli.train(num_epochs=FINETUNE_EPOCHS)
+except Exception as e: print(f"Erro no Bloco 10 (ASSIN 2 NLI): {e}"); import traceback; traceback.print_exc()
+
+
+# --- Bloco 11: Fine-tuning e Avaliação no HAREM (NER) ---
+print("\n--- Bloco 11: Fine-tuning e Avaliação HAREM (NER) ---")
+HAREM_MODEL_SAVE_FILENAME = "aroeira_harem_ner_model.pth"
+HAREM_SUBSET_SIZE = 200 # Mini HAREM 'selective' já é pequeno
+
+# 11.1. Modelo para Classificação de Tokens (NER)
+class BERTForTokenClassification(nn.Module):
+    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_labels):
+        super().__init__(); self.bert_base = bert_base
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size, num_labels)
+    def forward(self, input_ids, attention_mask, segment_ids):
+        sequence_output = self.bert_base(input_ids, attention_mask, segment_ids)
+        return self.classifier(self.dropout(sequence_output)) # Aplica classificador em cada token
+
+# 11.2. Dataset para HAREM NER (Complexo devido ao alinhamento de labels)
+# Função para alinhar labels com sub-tokens
+def align_labels_with_tokens(labels, word_ids, pad_token_label_id=-100):
+    new_labels = []
+    current_word = None
+    for word_id in word_ids:
+        if word_id is None: # Token especial (CLS, SEP, PAD do tokenizer)
+            new_labels.append(pad_token_label_id)
+        elif word_id != current_word: # Começo de uma nova palavra
+            current_word = word_id
+            new_labels.append(labels[word_id])
+        else: # Sub-token da mesma palavra
+            # Opção 1: Atribuir o mesmo label (se não for IOB, pode ser ok)
+            # Opção 2: Atribuir um label especial como pad_token_label_id para sub-tokens
+            # Para IOB/BIOES, o primeiro sub-token recebe B-TAG, os outros I-TAG.
+            # Aqui, para simplificar o exemplo de alinhamento, vamos usar pad_token_label_id para sub-tokens
+            # (ou seja, só o primeiro sub-token da palavra original terá o label)
+            label = labels[word_id]
+            if isinstance(label, int) and label_map_harem_inv.get(label,"").startswith("B-"):
+                 # Se o label original era B-, os subsequentes são I-
+                 # Isso requer que os labels já estejam como IDs.
+                 # Por simplicidade, vamos atribuir -100. Uma implementação completa de NER faria B-/I-
+                 new_labels.append(pad_token_label_id)
+            else:
+                 new_labels.append(pad_token_label_id) # Simplificado: só o primeiro subtoken tem label
+    return new_labels
+
+
+class HAREMNERDataset(Dataset):
+    def __init__(self, hf_dataset_split, tokenizer, label_map, max_len, pad_token_label_id=-100):
+        self.tokenizer, self.label_map, self.max_len, self.pad_token_label_id = tokenizer, label_map, max_len, pad_token_label_id
+        self.all_tokens, self.all_labels_as_ids = [], []
+
+        for example in hf_dataset_split:
+            tokens = example["tokens"] # Lista de palavras
+            ner_tags_str = example["ner_tags"] # Lista de labels (strings) como "PESSOA", "LOCAL"
+            
+            # Tokenizar e alinhar labels
+            # Isso é complexo: tokenizer.encode() em toda a frase e depois alinhar.
+            # Ou tokenizar palavra por palavra e juntar.
+            # Para este exemplo, vamos tokenizar a frase inteira.
+            # O tokenizer adiciona CLS/SEP
+            # A função word_ids() do encoding ajuda a mapear sub-tokens para palavras originais.
+
+            # Juntar tokens para formar a frase para o tokenizer
+            text_for_tokenizer = " ".join(tokens)
+            encoding = self.tokenizer.encode(text_for_tokenizer)
+            
+            word_ids = encoding.word_ids # Mapeia cada sub-token para o índice da palavra original
+            
+            current_labels_ids = [self.label_map[tag] for tag in ner_tags_str]
+            
+            # Alinhar labels com os sub-tokens
+            aligned_label_ids = []
+            previous_word_idx = None
+            for word_idx in word_ids:
+                if word_idx is None: # Token especial (CLS, SEP)
+                    aligned_label_ids.append(self.pad_token_label_id)
+                elif word_idx != previous_word_idx: # Primeiro sub-token de uma palavra
+                    aligned_label_ids.append(current_labels_ids[word_idx])
+                else: # Sub-token subsequente da mesma palavra (ignorar no loss)
+                    aligned_label_ids.append(self.pad_token_label_id)
+                previous_word_idx = word_idx
+            
+            # Garantir que os labels alinhados tenham o mesmo tamanho que input_ids (após padding/truncation)
+            # O encoding já está no MAX_LEN com padding
+            if len(aligned_label_ids) > self.max_len:
+                aligned_label_ids = aligned_label_ids[:self.max_len]
+            elif len(aligned_label_ids) < self.max_len:
+                aligned_label_ids.extend([self.pad_token_label_id] * (self.max_len - len(aligned_label_ids)))
+
+            self.all_tokens.append(encoding) # Salva o objeto Encoding completo
+            self.all_labels_as_ids.append(aligned_label_ids)
+
+    def __len__(self): return len(self.all_tokens)
+    def __getitem__(self, idx):
+        encoding = self.all_tokens[idx]
+        labels = self.all_labels_as_ids[idx]
+        return {"input_ids": torch.tensor(encoding.ids),
+                "attention_mask": torch.tensor(encoding.attention_mask, dtype=torch.long),
+                "segment_ids": torch.zeros(len(encoding.ids), dtype=torch.long), # Default para NER
+                "labels": torch.tensor(labels, dtype=torch.long)}
+
+try:
+    print("Carregando HAREM ('selective' config)...")
+    # 'selective' é menor e mais focado, 'total' é maior
+    # Para HAREM, precisamos de um tagset consistente.
+    # O dataset do Hub já fornece `ner_tags` como IDs numéricos e `ner_features.feature.names`
+    harem_raw = datasets.load_dataset("harem", "selective", trust_remote_code=True) 
+    
+    # Criar mapeamento de labels para HAREM
+    # A feature ner_tags já é uma ClassLabel, podemos pegar os nomes dela.
+    harem_ner_feature = harem_raw["train"].features["ner_tags"].feature
+    label_map_harem = {name: i for i, name in enumerate(harem_ner_feature.names)}
+    id2label_harem = {i: name for i, name in enumerate(harem_ner_feature.names)}
+    NUM_NER_TAGS = len(label_map_harem)
+    PAD_TOKEN_LABEL_ID_NER = -100 # ID padrão para ignorar no loss de token classification
+
+    print(f"Mapeamento de Labels HAREM (primeiros 5): {list(label_map_harem.items())[:5]}")
+    print(f"Total de tags NER HAREM: {NUM_NER_TAGS}")
+
+    # Usar subsets MUITO pequenos para demonstração devido à complexidade do processamento
+    harem_train_hf = harem_raw["train"].select(range(min(HAREM_SUBSET_SIZE, len(harem_raw["train"]))))
+    # HAREM 'selective' não tem split de validação, então vamos criar um a partir do treino
+    if len(harem_train_hf) > 10: # Precisa de dados suficientes para split
+        train_val_split_harem = harem_train_hf.train_test_split(test_size=0.2, shuffle=True, seed=42)
+        harem_train_hf_final = train_val_split_harem["train"]
+        harem_val_hf_final = train_val_split_harem["test"]
+    else:
+        harem_train_hf_final = harem_train_hf
+        harem_val_hf_final = None # Sem validação se muito pequeno
+
+    ft_harem_train_dataset = HAREMNERDataset(harem_train_hf_final, tokenizer, label_map_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
+    ft_harem_train_loader = DataLoader(ft_harem_train_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
+    
+    ft_harem_val_loader = None
+    if harem_val_hf_final and len(harem_val_hf_final) > 0:
+        ft_harem_val_dataset = HAREMNERDataset(harem_val_hf_final, tokenizer, label_map_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
+        ft_harem_val_loader = DataLoader(ft_harem_val_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=False, num_workers=0)
+
+
+    # Carregar backbone pré-treinado e criar modelo NER
+    bert_base_for_ner = BERTBaseModel(
+        vocab_size=tokenizer.get_vocab_size(), hidden_size=MODEL_HIDDEN_SIZE, num_layers=MODEL_NUM_LAYERS,
+        num_attention_heads=MODEL_NUM_ATTENTION_HEADS, intermediate_size=MODEL_INTERMEDIATE_SIZE,
+        max_len_config=MAX_LEN, pad_token_id=PAD_TOKEN_ID)
+    if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
+        bertlm_state_dict = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
+        bert_base_state_dict = {k.replace("bert_base.", ""): v for k, v in bertlm_state_dict.items() if k.startswith("bert_base.")}
+        if bert_base_state_dict: bert_base_for_ner.load_state_dict(bert_base_state_dict)
+        else: print("AVISO (NER): Pesos do backbone não encontrados no arquivo salvo.")
+    else: print(f"AVISO (NER): {PRETRAINED_BERTLM_SAVE_FILENAME} não encontrado. Usando backbone aleatório.")
+
+    harem_ner_model = BERTForTokenClassification(bert_base_for_ner, MODEL_HIDDEN_SIZE, NUM_NER_TAGS).to(DEVICE)
+    optimizer_ner = torch.optim.AdamW(harem_ner_model.parameters(), lr=FINETUNE_LR)
+    criterion_ner = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_LABEL_ID_NER) # Ignorar -100
+
+    trainer_ner = GenericTrainer(
+        model=harem_ner_model, train_dataloader=ft_harem_train_loader, val_dataloader=ft_harem_val_loader,
+        optimizer=optimizer_ner, criterion=criterion_ner, device=DEVICE,
+        model_save_path=HAREM_MODEL_SAVE_FILENAME, task_type="ner", vocab_size=NUM_NER_TAGS, id2label=id2label_harem
+    )
+    trainer_ner.train(num_epochs=FINETUNE_EPOCHS)
+
+except Exception as e: print(f"Erro no Bloco 11 (HAREM NER): {e}"); import traceback; traceback.print_exc()
+
+print("\n--- Script Completo com Fine-tuning e Avaliação (ASSIN2 NLI, HAREM NER) Finalizado ---")
