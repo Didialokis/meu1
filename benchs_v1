@@ -740,3 +740,32 @@ except Exception as e:
     traceback.print_exc()
     # Se o erro for de dataset não encontrado ou split, pode ser necessário
     # instalar o 'gdown' se o dataset depender dele, ou verificar nomes exatos no Hugging Face Hub.
+
+
+//////////
+
+# --- Início do Bloco 10 (Diagnóstico Primeiro) ---
+import datasets # Certifique-se que está importado
+
+print("Verificando splits disponíveis para o dataset 'assin', configuração 'ptbr'...")
+try:
+    # Carrega TODA a configuração 'ptbr'
+    assin_config_ptbr_info = datasets.load_dataset("assin", name="ptbr", trust_remote_code=True)
+    
+    print("\nSplits disponíveis na configuração 'ptbr' do dataset 'assin':")
+    available_splits = list(assin_config_ptbr_info.keys())
+    print(available_splits)
+    
+    # Sugestões de nomes que você pode procurar na lista acima:
+    # Para ASSIN 2 RTE (NLI):
+    # - 'train_assin2_rte'
+    # - 'validation_assin2_rte'
+    # - 'test_assin2_rte'
+    # Ou talvez nomes mais genéricos como 'train', 'validation', 'test',
+    # e você precisaria filtrar o conteúdo depois (mais complexo).
+    # É provável que os nomes específicos como 'train_assin2_rte' estejam lá.
+
+except Exception as e:
+    print(f"Erro ao tentar carregar informações do dataset 'assin' com config 'ptbr': {e}")
+    print("Verifique o nome do dataset, a configuração 'ptbr' e sua conexão com a internet.")
+    raise # Para a execução para você poder analisar
