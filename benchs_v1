@@ -1867,32 +1867,30 @@ except Exception as e:
 # --- Bloco 11: Fine-tuning e Avaliação no HAREM (NER) ---
 print("\n--- Bloco 11: Fine-tuning e Avaliação HAREM (NER) ---")
 HAREM_MODEL_SAVE_FILENAME = "aroeira_harem_ner_model.pth"
-HAREM_SUBSET_SIZE = 250 # 'selective' HAREM já é pequeno, mas limite para teste rápido. None para usar o split carregado.
-PAD_TOKEN_LABEL_ID_NER = -100 # ID padrão para ignorar tokens no loss de NER (CrossEntropyLoss)
+HAREM_SUBSET_SIZE = 250
+PAD_TOKEN_LABEL_ID_NER = -100 # Usado para ignorar tokens no loss (CrossEntropyLoss)
 # FINETUNE_EPOCHS, FINETUNE_BATCH_SIZE, FINETUNE_LR são do Bloco 2
 
 # 11.1. Modelo para Classificação de Tokens (NER)
 class BERTForTokenClassification(nn.Module):
     def __init__(self, bert_base: BERTBaseModel, hidden_size, num_labels):
-        super().__init__()
-        self.bert_base = bert_base
-        self.dropout = nn.Dropout(0.1) # Dropout típico antes da camada final
-        self.classifier = nn.Linear(hidden_size, num_labels) # hidden_size de bert_base
+        super().__init__(); self.bert_base = bert_base
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size, num_labels)
     def forward(self, input_ids, attention_mask, segment_ids):
         sequence_output = self.bert_base(input_ids, attention_mask, segment_ids)
-        # Aplica o classificador em cada token da sequência
         return self.classifier(self.dropout(sequence_output))
 
 # 11.2. Dataset para HAREM NER
 class HAREMNERDataset(Dataset):
-    def __init__(self, hf_dataset_split, tokenizer, id2label_map, max_len, pad_token_label_id):
+    def __init__(self, hf_dataset_split, tokenizer, id2label_map, max_len, pad_token_label_id=-100): # Definição corrigida
         self.tokenizer = tokenizer
-        self.id2label = id2label_map # Usado pelo GenericTrainer para avaliação com seqeval
+        self.id2label = id2label_map # Para o GenericTrainer
         self.max_len = max_len
         self.pad_token_label_id = pad_token_label_id
 
-        self.all_tokens_encodings = [] # Armazenará os objetos Encoding completos
-        self.all_aligned_labels_as_ids = [] # Armazenará as listas de IDs de label alinhados
+        self.all_tokens_encodings = []
+        self.all_aligned_labels_as_ids = []
 
         processed_count = 0
         skipped_count = 0
@@ -1900,47 +1898,35 @@ class HAREMNERDataset(Dataset):
         print(f"DEBUG HAREM Dataset: Iniciando processamento de {len(hf_dataset_split)} exemplos brutos de entrada.")
 
         for i_example, example in enumerate(tqdm(hf_dataset_split, desc="Processando HAREM (Dataset Class)", file=sys.stdout)):
-            original_tokens = example.get("tokens")       # Lista de strings (palavras)
-            ner_tag_ids_from_dataset = example.get("ner_tags") # Lista de INTEIROS (IDs das tags NER)
+            original_tokens = example.get("tokens")
+            ner_tag_ids_from_dataset = example.get("ner_tags")
 
             if not original_tokens or ner_tag_ids_from_dataset is None or len(original_tokens) != len(ner_tag_ids_from_dataset):
                 skipped_count += 1
-                # Imprime com menos frequência para não poluir muito
-                if skipped_count < 5 or (len(hf_dataset_split) > 0 and i_example > 0 and i_example % (len(hf_dataset_split)//10 + 1) == 0):
-                    print(f"DEBUG HAREM Dataset: Exemplo {i_example} IGNORADO (tokens/ner_tags ausentes ou tamanhos incompatíveis). "
-                          f"Tokens: {len(original_tokens) if original_tokens else 0}, Tags: {len(ner_tag_ids_from_dataset) if ner_tag_ids_from_dataset else 0}")
+                if skipped_count < 5 or (len(hf_dataset_split) > 0 and i_example > 0 and i_example % (max(1,len(hf_dataset_split)//10)) == 0): # Evita divisão por zero
+                    print(f"DEBUG HAREM Dataset: Exemplo {i_example} IGNORADO (tokens/ner_tags ausentes ou tamanhos incompatíveis).")
                 continue
 
             text_to_tokenize = " ".join(original_tokens)
-            # O tokenizador já está configurado para adicionar <s>, </s>, truncar e aplicar padding para MAX_LEN
             encoding = self.tokenizer.encode(text_to_tokenize)
-            
-            word_ids = encoding.word_ids # Mapeia cada sub-token para o índice da palavra original
+            word_ids = encoding.word_ids
             
             aligned_label_ids = []
             previous_word_idx = None
-            for subtoken_idx, word_idx_in_original_tokens in enumerate(word_ids):
-                if word_idx_in_original_tokens is None: # Token especial (<s>, </s>, <pad> do tokenizer)
+            for word_idx_in_original_tokens in word_ids:
+                if word_idx_in_original_tokens is None: 
                     aligned_label_ids.append(self.pad_token_label_id)
-                elif word_idx_in_original_tokens != previous_word_idx: # Primeiro sub-token de uma nova palavra
-                    # Usa diretamente o ID da tag NER da palavra original correspondente
+                elif word_idx_in_original_tokens != previous_word_idx: 
                     aligned_label_ids.append(ner_tag_ids_from_dataset[word_idx_in_original_tokens])
-                else: # Sub-token subsequente da mesma palavra
-                    # Estratégia simples: marcar subsequentes para serem ignorados no loss (-100).
-                    # Para IOB2 completo, a lógica para gerar I-TAGs seria mais complexa aqui.
+                else: 
                     aligned_label_ids.append(self.pad_token_label_id)
                 previous_word_idx = word_idx_in_original_tokens
             
-            # Verificação de sanidade (opcional, mas útil para depurar alinhamento)
             if len(encoding.ids) != len(aligned_label_ids):
-                if i_example < 5 : # Imprime para os primeiros 5 casos de mismatch
-                    print(f"ALERTA DEBUG HAREM: Exemplo {i_example} - Mismatch de tamanho! "
-                          f"Input IDs: {len(encoding.ids)}, Aligned Labels: {len(aligned_label_ids)}")
-                    print(f"  Original Tokens: {original_tokens}")
-                    print(f"  Encoded Tokens: {encoding.tokens}")
-                    print(f"  Word IDs: {word_ids}")
+                if i_example < 5 :
+                    print(f"ALERTA DEBUG HAREM: Exemplo {i_example} - Mismatch de tamanho! Input IDs: {len(encoding.ids)}, Aligned Labels: {len(aligned_label_ids)}")
                 skipped_count += 1
-                continue # Pula este exemplo se o alinhamento falhar
+                continue
 
             self.all_tokens_encodings.append(encoding)
             self.all_aligned_labels_as_ids.append(aligned_label_ids)
@@ -1951,74 +1937,69 @@ class HAREMNERDataset(Dataset):
              print(f"AVISO SÉRIO EM HAREMNERDataset: Nenhum exemplo do dataset de entrada ({len(hf_dataset_split)} exs) foi processado.")
 
     def __len__(self): return len(self.all_tokens_encodings)
-
     def __getitem__(self, idx):
         encoding = self.all_tokens_encodings[idx]
         labels = self.all_aligned_labels_as_ids[idx]
         return {"input_ids": torch.tensor(encoding.ids, dtype=torch.long),
                 "attention_mask": torch.tensor(encoding.attention_mask, dtype=torch.long),
-                "segment_ids": torch.zeros(len(encoding.ids), dtype=torch.long), # Default para NER
+                "segment_ids": torch.zeros(len(encoding.ids), dtype=torch.long),
                 "labels": torch.tensor(labels, dtype=torch.long)}
 
 try:
     print("Carregando HAREM ('selective' config)...")
-    # A configuração 'selective' é menor. 'total' contém o Primeiro HAREM completo.
-    # O HAREM já vem com 'ner_tags' como IDs numéricos.
     harem_raw = datasets.load_dataset("harem", "selective", trust_remote_code=True) 
     
-    # Criar mapeamento de labels para HAREM
     harem_ner_feature = harem_raw["train"].features["ner_tags"].feature
     id2label_harem = {i: name for i, name in enumerate(harem_ner_feature.names)}
-    label2id_harem = {name: i for i, name in enumerate(harem_ner_feature.names)} # Útil para referência
+    # label2id_harem é útil para referência, mas não passado para HAREMNERDataset.__init__
+    label2id_harem = {name: i for i, name in enumerate(harem_ner_feature.names)} 
     NUM_NER_TAGS = len(id2label_harem)
 
     print(f"Mapeamento de Labels HAREM (id2label, primeiros 5 de {NUM_NER_TAGS}): {list(id2label_harem.items())[:5]}")
 
-    harem_train_full_hf = harem_raw["train"] # HAREM selective só tem split 'train'
-    
-    # Aplicar HAREM_SUBSET_SIZE
+    harem_train_full_hf = harem_raw["train"]
+    harem_train_hf_subset = harem_train_full_hf
     if HAREM_SUBSET_SIZE is not None and len(harem_train_full_hf) > HAREM_SUBSET_SIZE:
         harem_train_hf_subset = harem_train_full_hf.select(range(HAREM_SUBSET_SIZE))
-    else:
-        harem_train_hf_subset = harem_train_full_hf # Usa o que foi carregado (todo o 'selective train')
     
     print(f"DEBUG HAREM: Tamanho do subset de treino HAREM para processamento: {len(harem_train_hf_subset)}")
 
-    # Para HAREM, 'selective' não tem um split de validação dedicado.
-    # Vamos criar um a partir do conjunto de treino para demonstração.
-    # Em um cenário real, você poderia usar o dataset 'total' e seus splits, ou um split de teste dedicado se disponível.
-    if len(harem_train_hf_subset) > 10: # Precisa de exemplos suficientes para dividir
+    ft_harem_train_dataset_hf = harem_train_hf_subset
+    ft_harem_val_dataset_hf = None # Simplificando, sem split de validação para HAREM neste exemplo
+    
+    if len(harem_train_hf_subset) > 10 and False: # Desabilitado para este exemplo, mas aqui seria o split
         train_val_harem_split = harem_train_hf_subset.train_test_split(test_size=0.2, shuffle=True, seed=42)
         ft_harem_train_dataset_hf = train_val_harem_split['train']
-        ft_harem_val_dataset_hf = train_val_harem_split['test'] # Usando 'test' como validação
+        ft_harem_val_dataset_hf = train_val_harem_split['test']
         print(f"HAREM treino dividido em: {len(ft_harem_train_dataset_hf)} para treino, {len(ft_harem_val_dataset_hf)} para validação.")
     else:
-        ft_harem_train_dataset_hf = harem_train_hf_subset # Usa tudo para treino se for muito pequeno
-        ft_harem_val_dataset_hf = None
-        print("HAREM subset muito pequeno para divisão treino/validação. Usando tudo para treino.")
+        print("HAREM usando subset para treino, sem split de validação dedicado neste exemplo.")
 
-    ft_harem_train_dataset = HAREMNERDataset(ft_harem_train_dataset_hf, tokenizer, label2id_harem, id2label_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
+    # <<< CHAMADA CORRIGIDA AQUI >>>
+    ft_harem_train_dataset = HAREMNERDataset(
+        ft_harem_train_dataset_hf, 
+        tokenizer, 
+        id2label_harem, # Passando o mapa id->str
+        MAX_LEN, 
+        PAD_TOKEN_LABEL_ID_NER
+    )
     
-    if len(ft_harem_train_dataset) == 0: # Checagem importante
-        raise ValueError("Dataset de treino HAREM (ft_harem_train_dataset) está vazio após processamento. Verifique HAREMNERDataset.")
+    if len(ft_harem_train_dataset) == 0:
+        raise ValueError("Dataset de treino HAREM (ft_harem_train_dataset) está vazio após processamento.")
         
     ft_harem_train_loader = DataLoader(ft_harem_train_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
     
     ft_harem_val_loader = None
     if ft_harem_val_dataset_hf and len(ft_harem_val_dataset_hf) > 0:
-        ft_harem_val_dataset = HAREMNERDataset(ft_harem_val_dataset_hf, tokenizer, label2id_harem, id2label_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
+        ft_harem_val_dataset = HAREMNERDataset(ft_harem_val_dataset_hf, tokenizer, id2label_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
         if len(ft_harem_val_dataset) > 0:
             ft_harem_val_loader = DataLoader(ft_harem_val_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=False, num_workers=0)
-        else:
-            print("AVISO: Dataset de validação HAREM ficou vazio após processamento na classe HAREMNERDataset.")
     else:
         print("Nenhum dataset de validação para HAREM será usado.")
 
-
-    # Carregar backbone pré-treinado e criar modelo NER
     bert_base_for_ner = BERTBaseModel(
         vocab_size=tokenizer.get_vocab_size(), hidden_size=MODEL_HIDDEN_SIZE, num_layers=MODEL_NUM_LAYERS,
-        num_heads=MODEL_NUM_ATTENTION_HEADS, # CORRIGIDO
+        num_heads=MODEL_NUM_ATTENTION_HEADS, 
         intermediate_size=MODEL_INTERMEDIATE_SIZE,
         max_len_config=MAX_LEN, pad_token_id=PAD_TOKEN_ID)
 
@@ -2026,25 +2007,20 @@ try:
         print(f"Carregando state_dict do BERTLM de '{PRETRAINED_BERTLM_SAVE_FILENAME}'...")
         bertlm_state_dict = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
         bert_base_state_dict = {k.replace("bert_base.", ""): v for k, v in bertlm_state_dict.items() if k.startswith("bert_base.")}
-        if bert_base_state_dict: 
-            bert_base_for_ner.load_state_dict(bert_base_state_dict)
-            print("Pesos do backbone BERT carregados para NER.")
-        else: 
-            print("AVISO (NER): Nenhum peso para 'bert_base.' encontrado no arquivo salvo do pré-treino.")
-    else: 
-        print(f"AVISO (NER): Modelo pré-treinado '{PRETRAINED_BERTLM_SAVE_FILENAME}' não encontrado. Usando backbone com pesos aleatórios.")
+        if bert_base_state_dict: bert_base_for_ner.load_state_dict(bert_base_state_dict); print("Pesos do backbone BERT carregados para NER.")
+        else: print("AVISO (NER): Nenhum peso para 'bert_base.' encontrado.")
+    else: print(f"AVISO (NER): {PRETRAINED_BERTLM_SAVE_FILENAME} não encontrado.")
 
     harem_ner_model = BERTForTokenClassification(bert_base_for_ner, MODEL_HIDDEN_SIZE, NUM_NER_TAGS).to(DEVICE)
     optimizer_ner = torch.optim.AdamW(harem_ner_model.parameters(), lr=FINETUNE_LR)
-    # PAD_TOKEN_LABEL_ID_NER (-100) é o ignore_index para CrossEntropyLoss em tarefas de token classification
-    criterion_ner = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_LABEL_ID_NER) 
+    criterion_ner = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_LABEL_ID_NER)
 
     trainer_ner = GenericTrainer(
-        model=harem_ner_model, train_dataloader=ft_harem_train_loader, val_dataloader=ft_harem_val_loader,
+        model=harem_ner_model, train_dataloader=ft_harem_train_loader, val_dataloader=ft_harem_val_loader, # val_loader é None
         optimizer=optimizer_ner, criterion=criterion_ner, device=DEVICE,
         model_save_path=HAREM_MODEL_SAVE_FILENAME, task_type="ner", 
-        vocab_size=NUM_NER_TAGS, # Para NER, este é o número de tags NER (para o reshape do loss)
-        id2label=id2label_harem # Passando o mapeamento id->string label para o trainer usar com seqeval
+        vocab_size=NUM_NER_TAGS, 
+        id2label=id2label_harem 
     )
     trainer_ner.train(num_epochs=FINETUNE_EPOCHS)
 
@@ -2052,8 +2028,6 @@ except Exception as e:
     print(f"Erro no Bloco 11 (HAREM NER): {e}")
     import traceback
     traceback.print_exc()
-    # Se o erro for de dataset não encontrado, pode ser necessário instalar dependências extras:
-    # !pip install pyarrow # ou outras que o HAREM possa precisar
     raise
 
 print("\n--- Script Completo com Fine-tuning e Avaliação (ASSIN2 NLI, HAREM NER) Finalizado ---")
