@@ -1,100 +1,126 @@
-# --- Bloco 6: Arquitetura BERT (Implementações do Artigo) ---
-print("\n--- Bloco 6: Definindo Arquitetura BERT (Estilo Artigo) ---")
+# --- Bloco 12: Teste Interativo do Modelo MLM Pré-treinado ---
+# Este bloco deve ser executado APÓS o Bloco 9 ter treinado e salvo o modelo.
 
-class ArticlePositionalEmbedding(nn.Module): # Embeddings posicionais sinusoidais
-    def __init__(self, d_model, max_len=MAX_LEN):
-        super().__init__(); pe = torch.zeros(max_len, d_model).float(); pe.requires_grad = False
-        pos_col = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos_col * div_term)
-        pe[:, 1::2] = torch.cos(pos_col * div_term)
-        self.pe = pe.unsqueeze(0)
-    def forward(self, x_ids): return self.pe[:, :x_ids.size(1)]
+print("\n--- Bloco 12: Teste Interativo do Modelo MLM (Estilo Artigo) ---")
 
-class ArticleBERTEmbedding(nn.Module): # Combina embeddings de token, segmento e posição
-    def __init__(self, vocab_sz, d_model, seq_len, dropout_rate, pad_idx):
-        super().__init__(); self.tok = nn.Embedding(vocab_sz, d_model, padding_idx=pad_idx)
-        self.seg = nn.Embedding(3, d_model, padding_idx=0) # Segments 0 (padding), 1 (SentA), 2 (SentB)
-        self.pos = ArticlePositionalEmbedding(d_model, seq_len)
-        self.drop = nn.Dropout(p=dropout_rate)
-    def forward(self, sequence_ids, segment_label_ids):
-        x = self.tok(sequence_ids) + self.pos(sequence_ids) + self.seg(segment_label_ids)
-        return self.drop(x)
-
-class ArticleMultiHeadedAttention(nn.Module): # Mecanismo de Multi-Head Attention
-    def __init__(self, num_heads, d_model, dropout_rate=MODEL_DROPOUT):
-        super().__init__(); assert d_model % num_heads == 0; self.d_k = d_model // num_heads
-        self.heads = num_heads; self.drop = nn.Dropout(dropout_rate)
-        self.q_lin = nn.Linear(d_model,d_model); self.k_lin = nn.Linear(d_model,d_model); self.v_lin = nn.Linear(d_model,d_model)
-        self.out_lin = nn.Linear(d_model, d_model)
-    def forward(self, q_in, k_in, v_in, mha_mask): # mha_mask (bs, 1, 1, seq_len) - 0 para PAD
-        bs = q_in.size(0)
-        q = self.q_lin(q_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
-        k = self.k_lin(k_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
-        v = self.v_lin(v_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
-        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.d_k)
-        if mha_mask is not None: scores = scores.masked_fill(mha_mask == 0, -1e9)
-        weights = self.drop(F.softmax(scores, dim=-1))
-        context = torch.matmul(weights, v).transpose(1,2).contiguous().view(bs,-1, self.heads*self.d_k)
-        return self.out_lin(context)
-
-class ArticleFeedForward(nn.Module): # Rede Feed-Forward
-    def __init__(self, d_model, ff_hidden_size, dropout_rate=MODEL_DROPOUT):
-        super().__init__(); self.fc1 = nn.Linear(d_model, ff_hidden_size)
-        self.fc2 = nn.Linear(ff_hidden_size, d_model); self.drop = nn.Dropout(dropout_rate)
-        self.activ = nn.GELU()
-    def forward(self, x): return self.fc2(self.drop(self.activ(self.fc1(x))))
-
-class ArticleEncoderLayer(nn.Module): # Uma camada do Encoder Transformer
-    def __init__(self, d_model, num_heads, ff_hidden_size, dropout_rate=MODEL_DROPOUT):
-        super().__init__(); self.norm1 = nn.LayerNorm(d_model); self.norm2 = nn.LayerNorm(d_model)
-        self.attn = ArticleMultiHeadedAttention(num_heads, d_model, dropout_rate)
-        self.ff = ArticleFeedForward(d_model, ff_hidden_size, dropout_rate); self.drop = nn.Dropout(dropout_rate)
-    def forward(self, embeds, mha_padding_mask): # mha_padding_mask (bs, 1, 1, seq_len)
-        attended = self.attn(embeds, embeds, embeds, mha_padding_mask)
-        x = self.norm1(embeds + self.drop(attended)) # Add & Norm (Post-LN)
-        ff_out = self.ff(x)
-        return self.norm2(x + self.drop(ff_out)) # Add & Norm (Post-LN)
-
-class ArticleBERT(nn.Module): # BERT Backbone (Estilo Artigo)
-    def __init__(self, vocab_sz, d_model, n_layers, heads, seq_len, pad_idx, # Nome do parâmetro para padding é 'pad_idx'
-                 dropout_rate=MODEL_DROPOUT, ff_h_size=MODEL_FF_HIDDEN_SIZE): # dropout_rate e ff_h_size com defaults
-        super().__init__()
-        self.d_model = d_model # Salva d_model para o Trainer/ScheduledOptim
-        self.emb = ArticleBERTEmbedding(vocab_sz, d_model, seq_len, dropout_rate, pad_idx)
-        self.enc_blocks = nn.ModuleList(
-            [ArticleEncoderLayer(d_model, heads, ff_h_size, dropout_rate) for _ in range(n_layers)])
-        self.pad_idx = pad_idx # Usado no método forward para criar a máscara
-
-    def forward(self, input_ids, segment_ids): # O artigo não passa attention_mask aqui, ela é criada internamente
-        # Cria a máscara de atenção baseada no pad_idx.
-        # (input_ids != self.pad_idx) resulta em True para tokens reais, False para padding.
-        # A implementação do MHA do artigo espera uma máscara onde 0 indica padding.
-        mha_padding_mask = (input_ids != self.pad_idx).unsqueeze(1).unsqueeze(2) # Shape: (bs, 1, 1, seq_len)
+# Verifica se as definições necessárias e variáveis existem
+if 'ArticleBERT' not in globals() or 'ArticleBERTLMWithHeads' not in globals():
+    print("ERRO: As classes de modelo ArticleBERT ou ArticleBERTLMWithHeads não estão definidas. Execute o Bloco 6.")
+elif 'tokenizer_pt' not in globals() or tokenizer_pt is None:
+    print("ERRO: O 'tokenizer_pt' não está definido. Execute o Bloco 4.")
+elif 'PRETRAINED_BERT_SAVE_FILENAME' not in globals() or \
+     'MODEL_D_MODEL' not in globals() or \
+     'MODEL_N_LAYERS' not in globals() or \
+     'MODEL_HEADS' not in globals() or \
+     'MAX_LEN' not in globals() or \
+     'PAD_TOKEN_ID_FOR_PRETRAIN' not in globals() or \
+     'MODEL_DROPOUT' not in globals() or \
+     'MODEL_FF_HIDDEN_SIZE' not in globals() or \
+     'DEVICE' not in globals():
+    print("ERRO: Uma ou mais constantes globais (MODEL_*, MAX_LEN, PAD_TOKEN_ID_FOR_PRETRAIN, DEVICE) não estão definidas. Execute o Bloco 2.")
+else:
+    try:
+        print(f"Carregando modelo pré-treinado de: {PRETRAINED_BERT_SAVE_FILENAME}")
+        # Recriar a arquitetura do modelo BERT base (backbone)
+        loaded_bert_article_backbone = ArticleBERT(
+            vocab_sz=tokenizer_pt.get_vocab_size(),
+            d_model=MODEL_D_MODEL,
+            n_layers=MODEL_N_LAYERS,
+            heads=MODEL_HEADS,
+            seq_len=MAX_LEN,
+            pad_idx=PAD_TOKEN_ID_FOR_PRETRAIN, 
+            dropout_rate=MODEL_DROPOUT,
+            ff_h_size=MODEL_FF_HIDDEN_SIZE
+        )
+        # Recriar o modelo completo com as cabeças MLM e NSP
+        interactive_model = ArticleBERTLMWithHeads(
+            loaded_bert_article_backbone,
+            tokenizer_pt.get_vocab_size()
+        )
         
-        x = self.emb(input_ids, segment_ids)
-        for block in self.enc_blocks:
-            x = block(x, mha_padding_mask) # Passa a máscara para cada EncoderLayer
-        return x
+        if not Path(PRETRAINED_BERT_SAVE_FILENAME).exists():
+            print(f"ERRO: Arquivo do modelo pré-treinado '{PRETRAINED_BERT_SAVE_FILENAME}' não encontrado. Execute o Bloco 9 (treinamento) primeiro.")
+        else:
+            interactive_model.load_state_dict(torch.load(PRETRAINED_BERT_SAVE_FILENAME, map_location=DEVICE))
+            interactive_model.to(DEVICE)
+            interactive_model.eval() # Colocar em modo de avaliação (desativa dropout, etc.)
+            print("Modelo pré-treinado carregado com sucesso e em modo de avaliação.")
 
-class ArticleNSPHead(nn.Module): # Cabeça para Next Sentence Prediction
-    def __init__(self, hidden_d_model):
-        super().__init__(); self.linear = nn.Linear(hidden_d_model, 2)
-        self.log_softmax = nn.LogSoftmax(dim=-1)
-    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out[:, 0]))
+            def predict_mlm_pytorch_style(text_with_mask: str, model_to_test: ArticleBERTLMWithHeads, tokenizer_to_use, device_to_use: str, top_k: int = 5):
+                # Tokenizar a entrada. O tokenizer_pt já está configurado com BertProcessing, padding e truncation.
+                encoded = tokenizer_to_use.encode(text_with_mask)
+                input_ids = torch.tensor([encoded.ids]).to(device_to_use)
+                
+                # Criar segment_ids para uma única sentença (ou o primeiro segmento de um par)
+                # O ArticleBERTEmbedding espera 0 para padding, 1 para SentA, 2 para SentB.
+                # Para MLM de sentença única, usamos segmento 1 para tokens reais, 0 para padding.
+                segment_ids_list = []
+                for id_val in encoded.ids:
+                    if id_val == tokenizer_to_use.token_to_id("[PAD]"):
+                        segment_ids_list.append(0) # Segmento 0 para PAD
+                    else:
+                        segment_ids_list.append(1) # Segmento 1 para tokens reais de Sentença A
+                segment_ids = torch.tensor([segment_ids_list]).to(device_to_use)
 
-class ArticleMLMHead(nn.Module): # Cabeça para Masked Language Model
-    def __init__(self, hidden_d_model, vocab_sz):
-        super().__init__(); self.linear = nn.Linear(hidden_d_model, vocab_sz)
-        self.log_softmax = nn.LogSoftmax(dim=-1)
-    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out))
+                # O modelo ArticleBERT cria a attention_mask internamente a partir do input_ids e pad_idx.
+                # Portanto, não precisamos passar attention_mask explicitamente para model_to_test.forward().
+                
+                with torch.no_grad():
+                    # O modelo ArticleBERTLMWithHeads retorna (nsp_output, mlm_output)
+                    _, mlm_logits = model_to_test(input_ids, segment_ids)
+                    # mlm_logits tem shape (batch_size, seq_len, vocab_size)
 
-class ArticleBERTLMWithHeads(nn.Module): # Modelo BERT completo com cabeças MLM e NSP
-    def __init__(self, bert_model: ArticleBERT, vocab_size: int):
-        super().__init__(); self.bert = bert_model
-        self.nsp_head = ArticleNSPHead(self.bert.d_model)
-        self.mlm_head = ArticleMLMHead(self.bert.d_model, vocab_size)
-    # O forward do ArticleBERT cria a máscara internamente, então não precisamos passá-la aqui
-    def forward(self, input_ids, segment_ids): # Removido attention_mask daqui, pois ArticleBERT lida com isso
-        bert_output = self.bert(input_ids, segment_ids)
-        return self.nsp_head(bert_output), self.mlm_head(bert_output)
+                mask_token_id_val = tokenizer_to_use.token_to_id("[MASK]")
+                mask_indices = (input_ids[0] == mask_token_id_val).nonzero(as_tuple=True)[0]
+
+                results = []
+                if mask_indices.numel() == 0:
+                    print("   Nenhum token [MASK] encontrado na entrada tokenizada.")
+                    return [], encoded.tokens
+
+                for mask_idx_tensor in mask_indices:
+                    mask_idx = mask_idx_tensor.item()
+                    token_logits = mlm_logits[0, mask_idx, :] # Logits para esta posição [MASK]
+                    
+                    # Aplicar Softmax para obter probabilidades (opcional, mas bom para interpretação)
+                    # Como os heads do modelo já usam LogSoftmax, podemos usar .exp() para obter probs.
+                    token_probs = torch.exp(token_logits) 
+                    
+                    top_k_probs, top_k_ids = torch.topk(token_probs, top_k)
+                    
+                    top_k_tokens = [tokenizer_to_use.id_to_token(tid.item()) for tid in top_k_ids]
+                    results.append({
+                        "mask_original_index": mask_idx, # Posição do MASK nos input_ids
+                        "predictions": list(zip(top_k_tokens, top_k_probs.cpu().tolist()))
+                    })
+                return results, encoded.tokens
+
+            # Loop interativo
+            print("\nDigite uma sentença com '[MASK]' para ver as previsões do MLM.")
+            print("Exemplo: 'O Aroeira é um [MASK] de PLN para o português.'")
+            print("Digite 'sair' para terminar.")
+            
+            while True:
+                user_text = input("Sua sentença com [MASK]: ")
+                if user_text.lower() == 'sair':
+                    break
+                if "[MASK]" not in user_text:
+                    print("Por favor, inclua pelo menos um token [MASK] na sua sentença.")
+                    continue
+                
+                mlm_predictions, tokenized_input_display = predict_mlm_pytorch_style(user_text, interactive_model, tokenizer_pt, DEVICE)
+                
+                print(f"   Entrada Tokenizada: {' '.join(tokenized_input_display)}")
+                if mlm_predictions:
+                    for pred_info in mlm_predictions:
+                        print(f"   Previsões para [MASK] na posição (tokenizada) {pred_info['mask_original_index']}:")
+                        for token, prob in pred_info['predictions']:
+                            print(f"      - '{token}' (prob: {prob:.4f})")
+                else:
+                    print("   Não foi possível obter predições (verifique se há [MASK]s e se o modelo carregou).")
+                print("-" * 30)
+                
+    except Exception as e_load:
+        print(f"Erro ao carregar ou testar o modelo: {e_load}")
+        import traceback
+        traceback.print_exc()
