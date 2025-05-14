@@ -510,3 +510,102 @@ print("--- A lógica de fine-tuning e avaliação permaneceria conceitualmente a
 # # Depois, você usaria 'pretrained_article_bert_backbone' ao criar
 # # BERTForSequencePairClassification e BERTForTokenClassification nos Blocos 10 e 11,
 # # similar a como 'bert_base_for_nli' e 'bert_base_for_ner' eram usados.
+
+////////////////////////////////////////
+
+# --- Bloco 4: Treinando o Tokenizador (Estilo Artigo, usando ByteLevelBPE) ---
+print("\n--- Bloco 4: Treinando o Tokenizador ---")
+
+# TOKENIZER_VOCAB_FILENAME e TOKENIZER_MERGES_FILENAME são definidos no Bloco 2
+# Ex: TOKENIZER_VOCAB_FILENAME = "aroeira_articlestyle_tokenizer-vocab.json"
+#     TOKENIZER_MERGES_FILENAME = "aroeira_articlestyle_tokenizer-merges.txt"
+# TEMP_TOKENIZER_TRAIN_FILE é o Path para o arquivo de texto com as sentenças do Aroeira (do Bloco 3)
+# tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)] (do Bloco 3)
+
+# Verifica se os arquivos do tokenizador já existem para evitar retreinamento desnecessário
+vocab_file = Path(".") / TOKENIZER_VOCAB_FILENAME
+merges_file = Path(".") / TOKENIZER_MERGES_FILENAME
+
+if not vocab_file.exists() or not merges_file.exists():
+    if not tokenizer_train_files_list or not Path(tokenizer_train_files_list[0]).exists():
+        raise FileNotFoundError(f"Arquivo de treino para tokenizador ({tokenizer_train_files_list[0] if tokenizer_train_files_list else 'N/A'}) não encontrado ou a lista está vazia. Execute o Bloco 3.")
+    
+    # O artigo usa BertWordPieceTokenizer. Mantemos ByteLevelBPETokenizer para consistência com
+    # o que já funcionava, mas aplicamos configurações para se assemelhar (lowercase).
+    # O artigo também usa strip_accents=False (implícito ou explícito), o que é bom para português.
+    # ByteLevelBPETokenizer não remove acentos por padrão.
+    bpe_tokenizer_instance = ByteLevelBPETokenizer(
+        lowercase=True # Conforme sugestão do artigo para o WordPiece
+    )
+    
+    # O prefixo para save_model é usado para gerar nomes como "prefixo-vocab.json", "prefixo-merges.txt"
+    # Precisamos extrair o prefixo dos nomes de arquivo definidos no Bloco 2.
+    # Ex: "aroeira_articlestyle_tokenizer-vocab.json" -> prefixo "aroeira_articlestyle_tokenizer"
+    tokenizer_save_prefix = TOKENIZER_VOCAB_FILENAME.replace("-vocab.json", "")
+
+    print(f"Treinando tokenizador ByteLevelBPE com dados de: {tokenizer_train_files_list[0]}...")
+    bpe_tokenizer_instance.train(
+        files=tokenizer_train_files_list, # Lista de arquivos de texto bruto
+        vocab_size=VOCAB_SIZE,
+        min_frequency=MIN_FREQUENCY_TOKENIZER,
+        special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"] # Tokens especiais estilo BERT
+    )
+    
+    # Salva os arquivos vocab.json e merges.txt no diretório atual com o prefixo.
+    bpe_tokenizer_instance.save_model(".", prefix=tokenizer_save_prefix)
+    print(f"Tokenizador treinado e salvo como '{TOKENIZER_VOCAB_FILENAME}' e '{TOKENIZER_MERGES_FILENAME}'.")
+else:
+    print(f"Tokenizador já existe ('{TOKENIZER_VOCAB_FILENAME}', '{TOKENIZER_MERGES_FILENAME}'). Carregando...")
+
+# Carrega o tokenizador ByteLevelBPE treinado a partir dos arquivos vocab e merges
+# Esta é a forma correta de carregar um ByteLevelBPETokenizer salvo anteriormente.
+tokenizer_pt = ByteLevelBPETokenizer(
+    vocab=str(vocab_file), # Caminho para o arquivo de vocabulário (ex: vocab.json)
+    merges=str(merges_file), # Caminho para o arquivo de merges (ex: merges.txt)
+    lowercase=True # Deve corresponder às configurações de treinamento
+)
+
+# Configura o pós-processador para adicionar [CLS] e [SEP] automaticamente (estilo BERT)
+# Acessamos o tokenizador Rust subjacente através de ._tokenizer
+if tokenizer_pt.token_to_id("[CLS]") is not None and tokenizer_pt.token_to_id("[SEP]") is not None:
+    tokenizer_pt._tokenizer.post_processor = BertProcessing(
+        sep=("[SEP]", tokenizer_pt.token_to_id("[SEP]")),
+        cls=("[CLS]", tokenizer_pt.token_to_id("[CLS]")),
+    )
+else:
+    print("AVISO: Tokens [CLS] ou [SEP] não encontrados no vocabulário do tokenizador carregado. Pós-processamento BertProcessing não será aplicado.")
+
+# Habilita truncamento e padding para MAX_LEN
+if tokenizer_pt.token_to_id("[PAD]") is not None:
+    tokenizer_pt.enable_truncation(max_length=MAX_LEN)
+    tokenizer_pt.enable_padding(
+        pad_id=tokenizer_pt.token_to_id("[PAD]"), 
+        pad_token="[PAD]", 
+        length=MAX_LEN
+    )
+    PAD_TOKEN_ID_FOR_PRETRAIN = tokenizer_pt.token_to_id("[PAD]")
+    print(f"Padding e Truncation habilitados para MAX_LEN={MAX_LEN}. PAD ID: {PAD_TOKEN_ID_FOR_PRETRAIN}")
+else:
+    PAD_TOKEN_ID_FOR_PRETRAIN = 0 # Fallback, mas idealmente [PAD] deve existir
+    print(f"AVISO: Token [PAD] não encontrado. Padding pode não funcionar como esperado. Usando PAD ID {PAD_TOKEN_ID_FOR_PRETRAIN} como fallback.")
+
+
+print(f"Vocabulário do Tokenizador carregado: {tokenizer_pt.get_vocab_size()} tokens.")
+
+# O artigo usa 'tokenizer.vocab' para pegar IDs. O objeto tokenizer_pt (ByteLevelBPETokenizer)
+# usa token_to_id(). Se as classes seguintes do artigo precisarem de um dict .vocab,
+# teríamos que criá-lo: vocab_dict_for_article = tokenizer_pt.get_vocab()
+# Mas é melhor adaptar as classes do artigo para usar tokenizer_pt.token_to_id().
+# As classes do artigo já usam tokenizer.token_to_id() ou tokenizer.cls_token_id, etc.,
+# que são atributos que o transformers.BertTokenizer possui.
+# O tokenizer_pt é da biblioteca 'tokenizers'. Para ter a interface exata do
+# 'transformers.BertTokenizer' (que o artigo usa após carregar o vocab),
+# precisaríamos de um wrapper ou usar BertTokenizer.from_pretrained(str(TOKENIZER_DIR))
+# se tivéssemos salvo o vocab no formato vocab.txt e uma config.json.
+# Para este exemplo, o ArticleStyleBERTDataset foi adaptado para usar os métodos de tokenizer_pt.
+
+# Verificação final do PAD ID para NLLLoss, se necessário.
+# O Trainer do artigo usa ignore_index=0.
+if PAD_TOKEN_ID_FOR_PRETRAIN != 0:
+    print(f"ALERTA para Trainer do Artigo: PAD_TOKEN_ID é {PAD_TOKEN_ID_FOR_PRETRAIN}, mas o Trainer do artigo (se usado literalmente) "
+          f"pode esperar ignore_index=0 para a NLLLoss do MLM. Ajuste o ignore_index na loss se necessário.")
