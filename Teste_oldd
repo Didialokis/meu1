@@ -1,14 +1,17 @@
 # --- Bloco 8: Preparando Componentes para Pré-Treinamento (Estilo Artigo) ---
 print("\n--- Bloco 8: Preparando Componentes para Pré-Treinamento (Estilo Artigo) ---")
 
-# Verifica se as sentenças do Aroeira foram carregadas
-if not all_aroeira_individual_sentences:
-    raise SystemExit("Lista 'all_aroeira_individual_sentences' está vazia. Verifique a execução do Bloco 3.")
+# Verifica se as sentenças do Aroeira foram carregadas do Bloco 3
+if not 'all_aroeira_individual_sentences' in globals() or not all_aroeira_individual_sentences:
+    raise SystemExit("Lista 'all_aroeira_individual_sentences' está vazia ou não definida. Execute o Bloco 3.")
+if not 'tokenizer_pt' in globals() or not tokenizer_pt:
+    raise SystemExit("Variável 'tokenizer_pt' não definida. Execute o Bloco 4.")
+
 
 # Divide as sentenças do Aroeira em conjuntos de treino e validação para o pré-treinamento
-val_split_ratio_pt_art = 0.1 # Proporção para validação
+val_split_ratio_pt_art = 0.1 # 10% para validação
 num_val_pt_art = int(len(all_aroeira_individual_sentences) * val_split_ratio_pt_art)
-if num_val_pt_art < 1 and len(all_aroeira_individual_sentences) > 1: # Garante ao menos 1 exemplo de validação se possível
+if num_val_pt_art < 1 and len(all_aroeira_individual_sentences) > 1: # Garante ao menos 1 exemplo de validação
     num_val_pt_art = 1
 
 train_sents_pt_art = all_aroeira_individual_sentences[num_val_pt_art:]
@@ -20,7 +23,7 @@ if not train_sents_pt_art:
     train_sents_pt_art = all_aroeira_individual_sentences
     val_sents_pt_art = []
 
-print(f"Sentenças para Pré-Treino (Estilo Artigo): Treino={len(train_sents_pt_art)}, Validação={len(val_sents_pt_art)}")
+print(f"Sentenças Pré-Treino (Estilo Artigo): Treino={len(train_sents_pt_art)}, Validação={len(val_sents_pt_art)}")
 
 # Cria instâncias do ArticleStyleBERTDataset e DataLoaders
 # Usa tokenizer_pt (definido e configurado no Bloco 4)
@@ -30,22 +33,23 @@ train_dl_pt_art = DataLoader(train_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, sh
 val_dl_pt_art = None
 if val_sents_pt_art and len(val_sents_pt_art) > 0:
     val_ds_pt_art = ArticleStyleBERTDataset(val_sents_pt_art, tokenizer_pt, seq_len=MAX_LEN)
-    if len(val_ds_pt_art) > 0: # Checagem adicional se o processamento do dataset resultou em exemplos
+    if len(val_ds_pt_art) > 0: # Checa se o dataset de validação não ficou vazio após processamento
         val_dl_pt_art = DataLoader(val_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
 else:
     print("Nenhum conjunto de validação será usado para o pré-treinamento.")
 
 # Instanciação do Modelo BERT (Estilo Artigo)
 # O backbone ArticleBERT é definido no Bloco 6
+print(f"Instanciando ArticleBERT com PAD_TOKEN_ID_FOR_PRETRAIN = {PAD_TOKEN_ID_FOR_PRETRAIN}")
 article_bert_model = ArticleBERT(
     vocab_sz=tokenizer_pt.get_vocab_size(),
     d_model=MODEL_D_MODEL,
     n_layers=MODEL_N_LAYERS,
-    num_heads=MODEL_HEADS, # Usa a constante MODEL_HEADS definida no Bloco 2
+    heads=MODEL_HEADS,                    # Parâmetro 'heads' como definido na classe
     seq_len=MAX_LEN,
-    pad_idx_for_bert=PAD_TOKEN_ID_FOR_PRETRAIN, # PAD_TOKEN_ID do tokenizer_pt
-    dropout_rate=MODEL_DROPOUT,
-    ff_h_size=MODEL_FF_HIDDEN_SIZE
+    pad_idx=PAD_TOKEN_ID_FOR_PRETRAIN,    # Parâmetro 'pad_idx' como definido na classe
+    dropout_rate=MODEL_DROPOUT,           # Parâmetro 'dropout_rate' como definido na classe
+    ff_h_size=MODEL_FF_HIDDEN_SIZE        # Parâmetro 'ff_h_size' como definido na classe
 )
 
 # Modelo Combinado com Cabeças MLM e NSP (definido no Bloco 6)
@@ -70,3 +74,5 @@ trainer_article = ArticleStyleBERTTrainer(
     pad_idx_mlm_loss=PAD_TOKEN_ID_FOR_PRETRAIN # Para o ignore_index da NLLLoss do MLM
 )
 print("Componentes (estilo artigo) para pré-treinamento MLM+NSP prontos.")
+
+# O Bloco 9 (execução do treino: trainer_article.train(num_epochs=EPOCHS_PRETRAIN)) viria na sequência.
