@@ -609,3 +609,68 @@ print(f"Vocabulário do Tokenizador carregado: {tokenizer_pt.get_vocab_size()} t
 if PAD_TOKEN_ID_FOR_PRETRAIN != 0:
     print(f"ALERTA para Trainer do Artigo: PAD_TOKEN_ID é {PAD_TOKEN_ID_FOR_PRETRAIN}, mas o Trainer do artigo (se usado literalmente) "
           f"pode esperar ignore_index=0 para a NLLLoss do MLM. Ajuste o ignore_index na loss se necessário.")
+//////////////////////////////
+
+# --- Bloco 8: Preparando e Executando o Pré-Treinamento (Estilo Artigo) ---
+print("\n--- Bloco 8: Preparando Componentes para Pré-Treinamento (Estilo Artigo) ---")
+
+if not all_aroeira_individual_sentences: # Checagem de segurança
+    raise SystemExit("Lista 'all_aroeira_individual_sentences' está vazia. Verifique o Bloco 3.")
+
+# Divisão de dados para treino/validação do pré-treinamento
+val_split_pt_art = 0.1
+num_val_pt_art = int(len(all_aroeira_individual_sentences) * val_split_pt_art)
+if num_val_pt_art < 1 and len(all_aroeira_individual_sentences) > 1: num_val_pt_art = 1
+
+train_sents_pt_art = all_aroeira_individual_sentences[num_val_pt_art:]
+val_sents_pt_art = all_aroeira_individual_sentences[:num_val_pt_art]
+if not train_sents_pt_art: # Caso o dataset seja muito pequeno e tudo vá para validação
+    train_sents_pt_art = all_aroeira_individual_sentences
+    val_sents_pt_art = []
+
+print(f"Sentenças Pré-Treino (Artigo): {len(train_sents_pt_art)}, Validação: {len(val_sents_pt_art)}")
+
+# Usar ArticleStyleBERTDataset e tokenizer_pt (definido no Bloco 4 corrigido)
+train_ds_pt_art = ArticleStyleBERTDataset(train_sents_pt_art, tokenizer_pt, seq_len=MAX_LEN) # <<< CORRIGIDO AQUI
+train_dl_pt_art = DataLoader(train_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, num_workers=0)
+
+val_dl_pt_art = None
+if val_sents_pt_art and len(val_sents_pt_art) > 0:
+    val_ds_pt_art = ArticleStyleBERTDataset(val_sents_pt_art, tokenizer_pt, seq_len=MAX_LEN) # <<< CORRIGIDO AQUI
+    if len(val_ds_pt_art) > 0: # Checa se o dataset de validação não ficou vazio após processamento
+        val_dl_pt_art = DataLoader(val_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
+
+# Instanciação do Modelo BERT (Estilo Artigo)
+article_bert_model = ArticleBERT(
+    vocab_sz=tokenizer_pt.get_vocab_size(), # <<< CORRIGIDO AQUI
+    d_model=MODEL_D_MODEL,
+    n_layers=MODEL_N_LAYERS,
+    num_heads=MODEL_NUM_ATTENTION_HEADS,
+    seq_len=MAX_LEN,
+    pad_idx_for_bert=PAD_TOKEN_ID_FOR_PRETRAIN, # Usar o PAD_TOKEN_ID do tokenizer_pt
+    dropout_rate=MODEL_DROPOUT,
+    ff_h_size=MODEL_FF_HIDDEN_SIZE
+)
+# Modelo Combinado com Cabeças MLM e NSP
+article_bertlm_with_heads = ArticleBERTLMWithHeads(
+    article_bert_model, 
+    tokenizer_pt.get_vocab_size() # <<< CORRIGIDO AQUI
+)
+
+# Trainer (Estilo Artigo)
+trainer_article = ArticleStyleBERTTrainer(
+    model=article_bertlm_with_heads,
+    train_dataloader=train_dl_pt_art,
+    val_dataloader=val_dl_pt_art,
+    d_model_for_optim=MODEL_D_MODEL, # Para ScheduledOptim
+    lr=LEARNING_RATE_ADAM,
+    betas=ADAM_BETAS,
+    weight_decay=ADAM_WEIGHT_DECAY,
+    warmup_steps=N_WARMUP_STEPS,
+    device=DEVICE,
+    model_save_path=PRETRAINED_BERT_SAVE_FILENAME,
+    pad_idx_mlm_loss=PAD_TOKEN_ID_FOR_PRETRAIN # Usar o PAD_TOKEN_ID do tokenizer_pt
+)
+print("Componentes (estilo artigo) prontos para pré-treinamento.")
+
+# --- (O Bloco 9 que chama trainer_article.train_epochs() viria depois) ---
