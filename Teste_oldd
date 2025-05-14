@@ -1,0 +1,512 @@
+# --- Bloco 1: Imports Essenciais ---
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam
+import datasets
+import tokenizers # Para tokenizers.__version__
+from tokenizers import ByteLevelBPETokenizer # Mantendo BPE, artigo usa WordPiece
+from tokenizers.processors import BertProcessing
+from tqdm.auto import tqdm
+import random
+from pathlib import Path
+import sys
+import math
+import numpy as np # Para ScheduledOptim
+import itertools # Usado no random_word do artigo
+
+# Métricas para benchmarks (usadas posteriormente nos blocos de fine-tuning)
+from sklearn.metrics import accuracy_score, f1_score
+from seqeval.metrics import classification_report as seqeval_classification_report
+from seqeval.scheme import IOB2
+
+print(f"PyTorch: {torch.__version__}")
+print(f"Datasets: {datasets.__version__}")
+print(f"Tokenizers: {tokenizers.__version__}")
+
+# --- Bloco 2: Constantes e Configurações (Estilo Artigo e Aroeira) ---
+# Gerais
+MAX_LEN = 64 # Comprimento da sequência usado no artigo e para este pré-treino
+AROEIRA_SUBSET_SIZE = 10000 # Subconjunto do Aroeira para rodar mais rápido
+VOCAB_SIZE = 30000 # Tamanho do vocabulário do tokenizador
+MIN_FREQUENCY_TOKENIZER = 2
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Pré-treinamento (MLM + NSP) - Parâmetros do artigo ajustados
+EPOCHS_PRETRAIN = 3 # Artigo usa 20, reduzido para nosso subset
+BATCH_SIZE_PRETRAIN = 16 # Artigo usa 32
+# Adam (usado pelo artigo, diferente do AdamW que usamos antes)
+LEARNING_RATE_ADAM = 1e-4
+ADAM_BETAS = (0.9, 0.999)
+ADAM_WEIGHT_DECAY = 0.01 # O artigo não especifica weight_decay para Adam puro, mas é comum
+# ScheduledOptim (do artigo "Attention is All You Need")
+N_WARMUP_STEPS = 5000 # Artigo usa 10000, ajustado para menos dados/épocas
+
+# Arquitetura BERT (seguindo d_model, n_layers, heads do artigo, mas com valores menores)
+MODEL_D_MODEL = 256       # Dimensão do embedding e hidden_size (artigo usa 768)
+MODEL_N_LAYERS = 3        # Número de EncoderLayers (artigo usa 12)
+MODEL_HEADS = 4           # Número de cabeças de atenção (artigo usa 12)
+MODEL_DROPOUT = 0.1
+# Feed-forward hidden size no artigo é d_model * 4
+MODEL_FF_HIDDEN_SIZE = MODEL_D_MODEL * 4
+
+# Nomes de Arquivos
+TOKENIZER_VOCAB_FILENAME = "aroeira_articlestyle_tokenizer-vocab.json"
+TOKENIZER_MERGES_FILENAME = "aroeira_articlestyle_tokenizer-merges.txt"
+PRETRAINED_BERT_SAVE_FILENAME = "aroeira_bert_articlestyle_pretrained.pth"
+TEMP_TOKENIZER_TRAIN_FILE = Path("temp_aroeira_for_tokenizer_articlestyle.txt")
+
+# Constantes para Fine-tuning (serão usadas nos blocos posteriores)
+FINETUNE_EPOCHS = 2
+FINETUNE_BATCH_SIZE = 8
+FINETUNE_LR = 3e-5
+
+print(f"Dispositivo: {DEVICE}")
+print(f"Subconjunto Aroeira (Pré-Treino): {AROEIRA_SUBSET_SIZE if AROEIRA_SUBSET_SIZE is not None else 'Completo'}")
+print(f"Modelo BERT (Estilo Artigo): d_model={MODEL_D_MODEL}, Camadas={MODEL_N_LAYERS}, Cabeças={MODEL_HEADS}")
+
+# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira ---
+print("\n--- Bloco 3: Carregando Dados do Aroeira para Pré-Treino ---")
+# Para o tokenizador, usamos todas as sentenças.
+# Para NSP, a classe Dataset pegará sentenças desta lista.
+all_aroeira_individual_sentences = []
+try:
+    streamed_aroeira_dataset = datasets.load_dataset("Itau-Unibanco/aroeira",split="train",streaming=True,trust_remote_code=True)
+    text_column_name = "text"
+    
+    _collected_examples = []
+    _source_iterable = streamed_aroeira_dataset
+    _desc_tqdm = "Coletando e extraindo sentenças Aroeira"
+    _tqdm_total = None
+
+    if AROEIRA_SUBSET_SIZE is not None:
+        _stream_iterator = iter(streamed_aroeira_dataset)
+        try:
+            for _ in range(AROEIRA_SUBSET_SIZE): _collected_examples.append(next(_stream_iterator))
+        except StopIteration: print(f"Alerta: Stream Aroeira esgotado. Coletados {len(_collected_examples)}.")
+        _source_iterable = _collected_examples
+        _tqdm_total = len(_collected_examples)
+    else:
+        print("AVISO: Processando stream completo do Aroeira.")
+
+    for example in tqdm(_source_iterable, total=_tqdm_total, desc=_desc_tqdm, file=sys.stdout):
+        sentence = example.get(text_column_name)
+        if isinstance(sentence, str) and sentence.strip():
+            all_aroeira_individual_sentences.append(sentence.strip())
+
+    if not all_aroeira_individual_sentences: raise ValueError("Nenhuma sentença Aroeira foi extraída.")
+    print(f"Total de sentenças Aroeira para pré-treino: {len(all_aroeira_individual_sentences)}")
+
+    if TEMP_TOKENIZER_TRAIN_FILE.exists(): TEMP_TOKENIZER_TRAIN_FILE.unlink()
+    with open(TEMP_TOKENIZER_TRAIN_FILE, "w", encoding="utf-8") as fp:
+        for sentence in all_aroeira_individual_sentences: fp.write(sentence + "\n")
+    tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)]
+    print(f"Arquivo temporário para tokenizador: {tokenizer_train_files_list[0]}")
+except Exception as e: print(f"Erro Bloco 3: {e}"); import traceback; traceback.print_exc(); raise
+
+# --- Bloco 4: Treinando o Tokenizador ---
+# O artigo usa BertWordPieceTokenizer. Manteremos ByteLevelBPETokenizer por simplicidade,
+# mas ajustaremos os tokens especiais e o tratamento de lowercase para alinhar.
+print("\n--- Bloco 4: Treinando o Tokenizador ---")
+if not Path(TOKENIZER_VOCAB_FILENAME).exists() or not Path(TOKENIZER_MERGES_FILENAME).exists():
+    if not tokenizer_train_files_list or not Path(tokenizer_train_files_list[0]).exists():
+        raise FileNotFoundError("Arquivo de treino para tokenizador não encontrado.")
+    
+    # O artigo usa lowercase=True, strip_accents=False (o default do BertWordPieceTokenizer pode ser True para strip_accents)
+    # Nosso BPE não tem strip_accents, mas o lowercase=True é importante para o artigo.
+    bpe_tokenizer_model = ByteLevelBPETokenizer(lowercase=True) 
+    tokenizer_save_prefix = TOKENIZER_VOCAB_FILENAME.replace("-vocab.json", "")
+
+    print(f"Treinando tokenizador BPE com {tokenizer_train_files_list}...")
+    bpe_tokenizer_model.train(
+        files=tokenizer_train_files_list,
+        vocab_size=VOCAB_SIZE,
+        min_frequency=MIN_FREQUENCY_TOKENIZER,
+        special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"] # Tokens especiais do BERT
+    )
+    bpe_tokenizer_model.save_model(".", prefix=tokenizer_save_prefix)
+    print(f"Tokenizador treinado e salvo.")
+else:
+    print(f"Tokenizador já existe. Carregando...")
+
+# Carregar o tokenizador para ter uma interface similar à do Hugging Face BertTokenizer
+# que o artigo usa após o treino (tokenizer = BertTokenizer.from_pretrained(vocab_file_path))
+# Para ByteLevelBPETokenizer, usamos a interface da biblioteca `tokenizers`.
+tokenizer_pt = tokenizers.Tokenizer.from_file(str(Path(".") / TOKENIZER_VOCAB_FILENAME))
+tokenizer_pt.post_processor = BertProcessing( # Adiciona [SEP] e [CLS]
+    sep=("[SEP]", tokenizer_pt.token_to_id("[SEP]")),
+    cls=("[CLS]", tokenizer_pt.token_to_id("[CLS]")),
+)
+tokenizer_pt.enable_truncation(max_length=MAX_LEN)
+tokenizer_pt.enable_padding(pad_id=tokenizer_pt.token_to_id("[PAD]"), pad_token="[PAD]", length=MAX_LEN)
+
+PAD_TOKEN_ID_FOR_PRETRAIN = tokenizer_pt.token_to_id("[PAD]")
+# O artigo assume que o PAD_TOKEN_ID é 0 para o NLLLoss(ignore_index=0).
+# Se nosso PAD_TOKEN_ID não for 0, precisaremos ajustar o ignore_index na loss de MLM.
+print(f"Vocabulário do Tokenizador: {tokenizer_pt.get_vocab_size()}, PAD ID: {PAD_TOKEN_ID_FOR_PRETRAIN}")
+
+
+# --- Bloco 5: BERTDataset (Estilo Artigo para MLM+NSP) ---
+print("\n--- Bloco 5: Definindo Dataset (Estilo Artigo) ---")
+class ArticleStyleBERTDataset(Dataset):
+    def __init__(self, corpus_sents, hf_tokenizer, seq_len):
+        self.tokenizer = hf_tokenizer # Espera interface Tokenizer da Hugging Face
+        self.seq_len = seq_len
+        self.corpus_sents = corpus_sents # Lista de sentenças individuais
+        self.corpus_len = len(self.corpus_sents)
+
+        # Mapeamento de tokens especiais para IDs (assumindo que o tokenizer os tem)
+        self.cls_id = self.tokenizer.token_to_id("[CLS]")
+        self.sep_id = self.tokenizer.token_to_id("[SEP]")
+        self.pad_id = self.tokenizer.token_to_id("[PAD]")
+        self.mask_id = self.tokenizer.token_to_id("[MASK]")
+        self.vocab_size = self.tokenizer.get_vocab_size()
+
+    def __len__(self):
+        return self.corpus_len
+
+    def __getitem__(self, item_idx):
+        s1_str, s2_str, is_next_label = self._get_sentence_pair_for_nsp(item_idx)
+        s1_masked_ids, s1_mlm_labels = self._random_word_masking_article(s1_str)
+        s2_masked_ids, s2_mlm_labels = self._random_word_masking_article(s2_str)
+
+        # Formato: [CLS] s1_masked [SEP] s2_masked [SEP]
+        input_ids = [self.cls_id] + s1_masked_ids + [self.sep_id] + s2_masked_ids + [self.sep_id]
+        # Formato labels MLM: [PAD] s1_mlm_labels [PAD] s2_mlm_labels [PAD] (como no artigo)
+        mlm_labels = [self.pad_id] + s1_mlm_labels + [self.pad_id] + s2_mlm_labels + [self.pad_id]
+        
+        len_s1_segment = len(s1_masked_ids) + 2 # Tokens de s1 + [CLS] + [SEP]
+        len_s2_segment = len(s2_masked_ids) + 1 # Tokens de s2 + [SEP]
+        segment_ids = ([1] * len_s1_segment) + ([2] * len_s2_segment) # Artigo usa 1 e 2
+
+        # Truncar e Pad
+        input_ids = input_ids[:self.seq_len]
+        mlm_labels = mlm_labels[:self.seq_len]
+        segment_ids = segment_ids[:self.seq_len]
+
+        padding_needed = self.seq_len - len(input_ids)
+        input_ids.extend([self.pad_id] * padding_needed)
+        mlm_labels.extend([self.pad_id] * padding_needed)
+        segment_ids.extend([0] * padding_needed) # Segmento 0 para padding
+
+        return {"bert_input": torch.tensor(input_ids),
+                "bert_label": torch.tensor(mlm_labels),
+                "segment_label": torch.tensor(segment_ids),
+                "is_next": torch.tensor(is_next_label)}
+
+    def _random_word_masking_article(self, sentence_str): # Lógica de MLM do artigo
+        words = sentence_str.strip().split() # Divide por espaços
+        output_token_ids, output_label_ids = [], []
+        if not words: return [], []
+
+        for word_str in words:
+            if not word_str: continue
+            # O artigo tokeniza palavra por palavra e remove CLS/SEP.
+            # Nosso tokenizer_pt.encode(palavra, add_special_tokens=False) é mais direto.
+            sub_tokens_for_word_ids = self.tokenizer.encode(word_str, add_special_tokens=False).ids
+            if not sub_tokens_for_word_ids: continue
+
+            prob = random.random()
+            if prob < 0.15: # Mascarar esta "palavra original" (que pode ser >1 sub-token)
+                prob_action = random.random()
+                if prob_action < 0.8: # 80% -> MASK
+                    output_token_ids.extend([self.mask_id] * len(sub_tokens_for_word_ids))
+                elif prob_action < 0.9: # 10% -> Token Aleatório
+                    output_token_ids.extend([random.randrange(self.vocab_size) for _ in sub_tokens_for_word_ids])
+                else: # 10% -> Manter Original
+                    output_token_ids.extend(sub_tokens_for_word_ids)
+                output_label_ids.extend(sub_tokens_for_word_ids)
+            else: # Não mascara
+                output_token_ids.extend(sub_tokens_for_word_ids)
+                output_label_ids.extend([self.pad_id] * len(sub_tokens_for_word_ids))
+        return output_token_ids, output_label_ids
+
+    def _get_sentence_pair_for_nsp(self, item_idx): # Lógica NSP adaptada para Aroeira
+        s1 = self.corpus_sents[item_idx]
+        if random.random() > 0.5: # Par positivo
+            s2_idx = item_idx + 1
+            if s2_idx >= self.corpus_len: s2_idx = item_idx -1 # Pega anterior se for a última
+            if s2_idx < 0: s2_idx = item_idx # Se só 1 sentença no corpus
+            s2 = self.corpus_sents[s2_idx]
+            is_next_label = 1 # True
+        else: # Par negativo
+            rand_idx = random.randrange(self.corpus_len)
+            while self.corpus_len > 1 and rand_idx == item_idx : # Evita pegar a mesma s1
+                rand_idx = random.randrange(self.corpus_len)
+            s2 = self.corpus_sents[rand_idx]
+            is_next_label = 0 # False
+        # O artigo trunca as strings aqui por palavras, mas vamos deixar o tokenizer lidar com sub-tokens e MAX_LEN
+        return s1, s2, is_next_label
+
+# --- Bloco 6: Arquitetura BERT (Estilo Artigo) ---
+print("\n--- Bloco 6: Definindo Arquitetura BERT (Estilo Artigo) ---")
+class ArticlePositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=MAX_LEN):
+        super().__init__(); pe = torch.zeros(max_len, d_model).float(); pe.requires_grad = False
+        for pos in range(max_len):
+            for i in range(0, d_model, 2):
+                pe[pos, i] = math.sin(pos / (10000 ** ((2 * i)/d_model)))
+                pe[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1))/d_model)))
+        self.pe = pe.unsqueeze(0)
+    def forward(self, x_ids): return self.pe[:, :x_ids.size(1)]
+
+class ArticleBERTEmbedding(nn.Module):
+    def __init__(self, vocab_sz, emb_d_model, seq_len, dropout, pad_idx):
+        super().__init__(); self.tok = nn.Embedding(vocab_sz, emb_d_model, padding_idx=pad_idx)
+        self.seg = nn.Embedding(3, emb_d_model, padding_idx=0) # 0 para pad, 1 para SentA, 2 para SentB
+        self.pos = ArticlePositionalEmbedding(emb_d_model, seq_len)
+        self.drop = nn.Dropout(p=dropout)
+    def forward(self, seq_ids, seg_label_ids):
+        return self.drop(self.tok(seq_ids) + self.pos(seq_ids) + self.seg(seg_label_ids))
+
+class ArticleMultiHeadedAttention(nn.Module):
+    def __init__(self, heads, d_model, dropout=MODEL_DROPOUT):
+        super().__init__(); assert d_model % heads == 0; self.d_k = d_model // heads
+        self.heads = heads; self.drop = nn.Dropout(dropout)
+        self.q_lin, self.k_lin, self.v_lin = nn.Linear(d_model,d_model), nn.Linear(d_model,d_model), nn.Linear(d_model,d_model)
+        self.out_lin = nn.Linear(d_model, d_model)
+    def forward(self, q_in, k_in, v_in, mask_in): # mask_in é attention_mask (bs, 1, 1, seq_len)
+        bs = q_in.size(0)
+        q = self.q_lin(q_in).view(bs, -1, self.heads, self.d_k).transpose(1,2) # (bs, h, seq, d_k)
+        k = self.k_lin(k_in).view(bs, -1, self.heads, self.d_k).transpose(1,2)
+        v = self.v_lin(v_in).view(bs, -1, self.heads, self.d_k).transpose(1,2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask_in is not None: scores = scores.masked_fill(mask_in == 0, -1e9) # mask_in (bs, 1, 1, seq) -> broadcast
+        weights = self.drop(F.softmax(scores, dim=-1))
+        context = torch.matmul(weights, v).transpose(1,2).contiguous().view(bs, -1, self.heads * self.d_k)
+        return self.out_lin(context)
+
+class ArticleFeedForward(nn.Module):
+    def __init__(self, d_model, ff_hidden_size, dropout=MODEL_DROPOUT):
+        super().__init__(); self.fc1 = nn.Linear(d_model, ff_hidden_size)
+        self.fc2 = nn.Linear(ff_hidden_size, d_model); self.drop = nn.Dropout(dropout)
+        self.activ = nn.GELU()
+    def forward(self, x): return self.fc2(self.drop(self.activ(self.fc1(x))))
+
+class ArticleEncoderLayer(nn.Module):
+    def __init__(self, d_model, heads, ff_hidden_size, dropout=MODEL_DROPOUT):
+        super().__init__(); self.norm1 = nn.LayerNorm(d_model); self.norm2 = nn.LayerNorm(d_model)
+        self.attn = ArticleMultiHeadedAttention(heads, d_model, dropout)
+        self.ff = ArticleFeedForward(d_model, ff_hidden_size, dropout); self.drop = nn.Dropout(dropout)
+    def forward(self, embeds, mha_mask): # mha_mask (bs, 1, 1, seq_len)
+        attended = self.attn(embeds, embeds, embeds, mha_mask)
+        x = self.norm1(embeds + self.drop(attended))
+        ff_out = self.ff(x)
+        return self.norm2(x + self.drop(ff_out))
+
+class ArticleBERT(nn.Module): # BERT Backbone
+    def __init__(self, vocab_sz, d_model, n_layers, heads, seq_len, pad_idx, drop_prob=MODEL_DROPOUT, ff_hidden_sz=MODEL_FF_HIDDEN_SIZE):
+        super().__init__(); self.d_model = d_model
+        self.emb = ArticleBERTEmbedding(vocab_sz, d_model, seq_len, drop_prob, pad_idx)
+        self.enc_blocks = nn.ModuleList([ArticleEncoderLayer(d_model, heads, ff_hidden_sz, drop_prob) for _ in range(n_layers)])
+    def forward(self, input_ids, segment_ids, attention_mask): # attention_mask (bs, seq_len)
+        mha_mask = attention_mask.unsqueeze(1).unsqueeze(2) # (bs, 1, 1, seq_len) para MHA
+        x = self.emb(input_ids, segment_ids)
+        for block in self.enc_blocks: x = block(x, mha_mask)
+        return x
+
+class ArticleNextSentencePredictionHead(nn.Module):
+    def __init__(self, hidden_d_model):
+        super().__init__(); self.linear = nn.Linear(hidden_d_model, 2)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out[:, 0])) # Usa output do [CLS]
+
+class ArticleMaskedLanguageModelHead(nn.Module):
+    def __init__(self, hidden_d_model, vocab_sz):
+        super().__init__(); self.linear = nn.Linear(hidden_d_model, vocab_sz)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out)) # Em todos os tokens
+
+class ArticleBERTLMWithHeads(nn.Module): # Combina BERT com cabeças MLM e NSP
+    def __init__(self, bert_model: ArticleBERT, vocab_size: int):
+        super().__init__(); self.bert = bert_model
+        self.nsp_head = ArticleNextSentencePredictionHead(self.bert.d_model)
+        self.mlm_head = ArticleMaskedLanguageModelHead(self.bert.d_model, vocab_size)
+    def forward(self, input_ids, segment_ids, attention_mask):
+        bert_output = self.bert(input_ids, segment_ids, attention_mask)
+        return self.nsp_head(bert_output), self.mlm_head(bert_output)
+
+# --- Bloco 7: Otimizador Agendado e Trainer (Estilo Artigo) ---
+print("\n--- Bloco 7: Definindo Otimizador e Trainer (Estilo Artigo) ---")
+class ScheduledOptim(): # Do artigo (Attention is All You Need)
+    def __init__(self, optimizer, d_model, n_warmup_steps):
+        self._optimizer = optimizer; self.n_warmup_steps = n_warmup_steps
+        self.n_current_steps = 0; self.init_lr = np.power(d_model, -0.5)
+    def step_and_update_lr(self): self._update_learning_rate(); self._optimizer.step()
+    def zero_grad(self): self._optimizer.zero_grad()
+    def _get_lr_scale(self):
+        if self.n_current_steps == 0: return 0.0
+        if self.n_warmup_steps == 0: return np.power(self.n_current_steps, -0.5)
+        return np.minimum(np.power(self.n_current_steps, -0.5), 
+                          np.power(self.n_warmup_steps, -1.5) * self.n_current_steps)
+    def _update_learning_rate(self):
+        self.n_current_steps += 1; lr = self.init_lr * self._get_lr_scale()
+        for param_group in self._optimizer.param_groups: param_group['lr'] = lr
+
+class ArticleStyleBERTTrainer:
+    def __init__(self, model, train_dl, val_dl, d_model_for_optim,
+                 lr=LEARNING_RATE_ADAM, betas=ADAM_BETAS, weight_decay=ADAM_WEIGHT_DECAY,
+                 warmup_steps=N_WARMUP_STEPS, device=DEVICE, log_freq=10, 
+                 model_save_path=PRETRAINED_BERT_SAVE_FILENAME, pad_idx_for_loss=PAD_TOKEN_ID_FOR_PRETRAIN):
+        self.dev = device; self.model = model.to(self.dev)
+        self.train_dl, self.val_dl = train_dl, val_dl
+        self.opt = Adam(self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+        self.opt_schedule = ScheduledOptim(self.opt, d_model_for_optim, warmup_steps)
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_for_loss) # Artigo usa 0, adaptamos
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq, self.save_path = log_freq, model_save_path
+        self.best_val_loss = float('inf')
+        print("Total de Parâmetros (ArticleStyle):", sum([p.nelement() for p in self.model.parameters()]))
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training); dl = self.train_dl if is_training else self.val_dl
+        if not dl: return None
+        avg_loss, tot_nsp_ok, tot_nsp_el = 0.0, 0, 0
+        mode = "Train" if is_training else "Val"
+        data_iter = tqdm(enumerate(dl), total=len(dl), desc=f"Epoch {epoch_num+1} [{mode}] (MLM+NSP)", file=sys.stdout)
+
+        for i, data in data_iter:
+            data = {k: v.to(self.dev) for k, v in data.items()}
+            # Nosso ArticleBERTDataset não retorna attention_mask, o ArticleBERT cria internamente.
+            # Mas vamos passar explicitamente para o ArticleBERTLMWithHeads -> ArticleBERT
+            attention_mask = (data["bert_input"] != PAD_TOKEN_ID_FOR_PRETRAIN) # (bs, seq_len)
+
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], attention_mask)
+            
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, mlm_out.size(-1)), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
+
+            if is_training: self.opt_schedule.zero_grad(); loss.backward(); self.opt_schedule.step_and_update_lr()
+            
+            avg_loss += loss.item()
+            nsp_ok = nsp_out.argmax(dim=-1).eq(data["is_next"]).sum().item()
+            tot_nsp_ok += nsp_ok; tot_nsp_el += data["is_next"].nelement()
+
+            if i % self.log_freq == 0:
+                data_iter.set_postfix({
+                    "avg_loss": avg_loss / (i + 1),
+                    "nsp_acc": tot_nsp_ok / tot_nsp_el * 100 if tot_nsp_el > 0 else 0,
+                    "lr": self.opt_schedule._optimizer.param_groups[0]['lr'] if is_training else 0.0
+                })
+        final_avg_loss = avg_loss / len(dl)
+        final_nsp_acc = tot_nsp_ok * 100.0 / tot_nsp_el if tot_nsp_el > 0 else 0.0
+        print(f"Epoch {epoch_num+1} [{mode}] - Avg Loss: {final_avg_loss:.4f}, NSP Acc: {final_nsp_acc:.2f}%")
+        return final_avg_loss
+
+    def train_epochs(self, num_epochs): # Nomeado para evitar conflito com train() do Trainer anterior
+        print(f"Iniciando pré-treinamento (MLM+NSP) por {num_epochs} épocas...")
+        for epoch in range(num_epochs):
+            self._run_epoch(epoch, is_training=True)
+            val_loss = None
+            if self.val_dl: val_loss = self._run_epoch(epoch, is_training=False)
+            if val_loss is not None and val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                print(f"Nova melhor Val Loss: {self.best_val_loss:.4f}. Salvando modelo: {self.save_path}")
+                torch.save(self.model.state_dict(), self.save_path)
+            elif not self.val_dl and epoch == num_epochs - 1:
+                print(f"Sem validação. Salvando modelo da última época: {self.save_path}")
+                torch.save(self.model.state_dict(), self.save_path)
+            print("-" * 30)
+        print(f"Pré-treinamento concluído. Melhor Val Loss: {self.best_val_loss if self.best_val_loss != float('inf') else 'N/A'}")
+
+
+# --- Bloco 8: Preparando e Executando o Pré-Treinamento (Estilo Artigo) ---
+print("\n--- Bloco 8: Preparando para Pré-Treinamento (Estilo Artigo) ---")
+if not all_aroeira_individual_sentences: raise SystemExit("Lista de sentenças Aroeira vazia.")
+
+val_split_ratio_pt = 0.1
+num_val_pt = int(len(all_aroeira_individual_sentences) * val_split_ratio_pt)
+if num_val_pt < 1 and len(all_aroeira_individual_sentences) > 1: num_val_pt = 1
+train_sents_pt = all_aroeira_individual_sentences[num_val_pt:]
+val_sents_pt = all_aroeira_individual_sentences[:num_val_pt]
+if not train_sents_pt: train_sents_pt = all_aroeira_individual_sentences; val_sents_pt = []
+
+train_ds_pt = ArticleStyleBERTDataset(train_sents_pt, tokenizer_hf_interface, seq_len=MAX_LEN)
+train_dl_pt = DataLoader(train_ds_pt, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, num_workers=0)
+val_dl_pt = None
+if val_sents_pt and len(val_sents_pt) > 0:
+    val_ds_pt = ArticleStyleBERTDataset(val_sents_pt, tokenizer_hf_interface, seq_len=MAX_LEN)
+    if len(val_ds_pt) > 0: val_dl_pt = DataLoader(val_ds_pt, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
+
+# Instanciação do Modelo BERT (Estilo Artigo)
+article_bert_model = ArticleBERT(
+    vocab_sz=tokenizer_hf_interface.get_vocab_size(),
+    d_model=MODEL_D_MODEL,
+    n_layers=MODEL_N_LAYERS,
+    heads=MODEL_HEADS,
+    seq_len=MAX_LEN, # Para ArticlePositionalEmbedding e ArticleBERTEmbedding
+    pad_idx=PAD_TOKEN_ID_FOR_PRETRAIN, # Para ArticleBERTEmbedding
+    drop_prob=MODEL_DROPOUT,
+    ff_hidden_sz=MODEL_FF_HIDDEN_SIZE
+)
+# Modelo Combinado com Cabeças MLM e NSP
+article_bertlm_with_heads = ArticleBERTLMWithHeads(article_bert_model, tokenizer_hf_interface.get_vocab_size())
+
+# Trainer (Estilo Artigo)
+trainer_article_style = ArticleStyleBERTTrainer(
+    model=article_bertlm_with_heads,
+    train_dataloader=train_dl_pt,
+    val_dataloader=val_dl_pt,
+    d_model_for_optim=MODEL_D_MODEL, # Para ScheduledOptim
+    lr=LEARNING_RATE_ADAM, # Adam base LR
+    warmup_steps=N_WARMUP_STEPS,
+    device=DEVICE,
+    model_save_path=PRETRAINED_BERT_SAVE_FILENAME,
+    pad_idx_for_loss=PAD_TOKEN_ID_FOR_PRETRAIN # Importante para NLLLoss do MLM
+)
+print("Componentes para pré-treinamento (estilo artigo) prontos.")
+
+# --- Bloco 9: Executando o Pré-Treinamento (Estilo Artigo) ---
+print("\n--- Bloco 9: Iniciando Pré-Treinamento (Estilo Artigo, MLM+NSP) ---")
+try:
+    trainer_article_style.train_epochs(num_epochs=EPOCHS_PRETRAIN)
+except Exception as e: print(f"Erro pré-treinamento (estilo artigo): {e}"); import traceback; traceback.print_exc(); raise
+
+
+# --- Bloco 10 e 11 (Fine-tuning ASSIN e HAREM) ---
+# Estes blocos precisariam ser adaptados para usar o 'article_bert_model' (o backbone)
+# treinado acima, em vez do 'bert_base_model_pt' do nosso script anterior.
+# A lógica de carregar os pesos do backbone do 'article_bertlm_with_heads.bert.state_dict()'
+# e passá-lo para os modelos BERTForSequencePairClassification e BERTForTokenClassification
+# seria similar.
+# Por ora, vou deixar estes blocos como placeholders comentados,
+# pois a refatoração principal foi nos blocos de pré-treinamento.
+
+print("\n\n--- Blocos de Fine-tuning (10 e 11) precisariam ser adaptados ---")
+print("--- para usar o 'article_bert_model' treinado nos blocos anteriores. ---")
+print("--- A lógica de fine-tuning e avaliação permaneceria conceitualmente a mesma. ---")
+
+# Exemplo de como você carregaria o backbone treinado:
+#
+# pretrained_article_bert_backbone = ArticleBERT(
+# vocab_sz=tokenizer_hf_interface.get_vocab_size(),
+# d_model=MODEL_D_MODEL,
+# n_layers=MODEL_N_LAYERS,
+# heads=MODEL_HEADS,
+# seq_len=MAX_LEN,
+# pad_idx=PAD_TOKEN_ID_FOR_PRETRAIN,
+# drop_prob=MODEL_DROPOUT,
+# ff_hidden_sz=MODEL_FF_HIDDEN_SIZE
+# )
+#
+# if Path(PRETRAINED_BERT_SAVE_FILENAME).exists():
+#     print(f"Carregando state_dict do ArticleBERTLMWithHeads de '{PRETRAINED_BERT_SAVE_FILENAME}'...")
+#     full_model_state_dict = torch.load(PRETRAINED_BERT_SAVE_FILENAME, map_location=DEVICE)
+#    
+#     # Extrair o state_dict apenas para o 'bert' (o backbone)
+#     backbone_state_dict = {
+# k.replace("bert.", ""): v
+# for k, v in full_model_state_dict.items()
+# if k.startswith("bert.") # Assume que o backbone é chamado 'bert' em ArticleBERTLMWithHeads
+#     }
+# if backbone_state_dict:
+#         pretrained_article_bert_backbone.load_state_dict(backbone_state_dict)
+# print("Backbone BERT (estilo artigo) carregado com pesos pré-treinados.")
+# else:
+# print(f"AVISO: {PRETRAINED_BERT_SAVE_FILENAME} não encontrado ou sem pesos para 'bert.'. Usando backbone aleatório para fine-tuning.")
+#
+# # Depois, você usaria 'pretrained_article_bert_backbone' ao criar
+# # BERTForSequencePairClassification e BERTForTokenClassification nos Blocos 10 e 11,
+# # similar a como 'bert_base_for_nli' e 'bert_base_for_ner' eram usados.
