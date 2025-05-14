@@ -1,78 +1,100 @@
-# --- Bloco 8: Preparando Componentes para Pré-Treinamento (Estilo Artigo) ---
-print("\n--- Bloco 8: Preparando Componentes para Pré-Treinamento (Estilo Artigo) ---")
+# --- Bloco 6: Arquitetura BERT (Implementações do Artigo) ---
+print("\n--- Bloco 6: Definindo Arquitetura BERT (Estilo Artigo) ---")
 
-# Verifica se as sentenças do Aroeira foram carregadas do Bloco 3
-if not 'all_aroeira_individual_sentences' in globals() or not all_aroeira_individual_sentences:
-    raise SystemExit("Lista 'all_aroeira_individual_sentences' está vazia ou não definida. Execute o Bloco 3.")
-if not 'tokenizer_pt' in globals() or not tokenizer_pt:
-    raise SystemExit("Variável 'tokenizer_pt' não definida. Execute o Bloco 4.")
+class ArticlePositionalEmbedding(nn.Module): # Embeddings posicionais sinusoidais
+    def __init__(self, d_model, max_len=MAX_LEN):
+        super().__init__(); pe = torch.zeros(max_len, d_model).float(); pe.requires_grad = False
+        pos_col = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos_col * div_term)
+        pe[:, 1::2] = torch.cos(pos_col * div_term)
+        self.pe = pe.unsqueeze(0)
+    def forward(self, x_ids): return self.pe[:, :x_ids.size(1)]
 
+class ArticleBERTEmbedding(nn.Module): # Combina embeddings de token, segmento e posição
+    def __init__(self, vocab_sz, d_model, seq_len, dropout_rate, pad_idx):
+        super().__init__(); self.tok = nn.Embedding(vocab_sz, d_model, padding_idx=pad_idx)
+        self.seg = nn.Embedding(3, d_model, padding_idx=0) # Segments 0 (padding), 1 (SentA), 2 (SentB)
+        self.pos = ArticlePositionalEmbedding(d_model, seq_len)
+        self.drop = nn.Dropout(p=dropout_rate)
+    def forward(self, sequence_ids, segment_label_ids):
+        x = self.tok(sequence_ids) + self.pos(sequence_ids) + self.seg(segment_label_ids)
+        return self.drop(x)
 
-# Divide as sentenças do Aroeira em conjuntos de treino e validação para o pré-treinamento
-val_split_ratio_pt_art = 0.1 # 10% para validação
-num_val_pt_art = int(len(all_aroeira_individual_sentences) * val_split_ratio_pt_art)
-if num_val_pt_art < 1 and len(all_aroeira_individual_sentences) > 1: # Garante ao menos 1 exemplo de validação
-    num_val_pt_art = 1
+class ArticleMultiHeadedAttention(nn.Module): # Mecanismo de Multi-Head Attention
+    def __init__(self, num_heads, d_model, dropout_rate=MODEL_DROPOUT):
+        super().__init__(); assert d_model % num_heads == 0; self.d_k = d_model // num_heads
+        self.heads = num_heads; self.drop = nn.Dropout(dropout_rate)
+        self.q_lin = nn.Linear(d_model,d_model); self.k_lin = nn.Linear(d_model,d_model); self.v_lin = nn.Linear(d_model,d_model)
+        self.out_lin = nn.Linear(d_model, d_model)
+    def forward(self, q_in, k_in, v_in, mha_mask): # mha_mask (bs, 1, 1, seq_len) - 0 para PAD
+        bs = q_in.size(0)
+        q = self.q_lin(q_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
+        k = self.k_lin(k_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
+        v = self.v_lin(v_in).view(bs,-1,self.heads,self.d_k).transpose(1,2)
+        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.d_k)
+        if mha_mask is not None: scores = scores.masked_fill(mha_mask == 0, -1e9)
+        weights = self.drop(F.softmax(scores, dim=-1))
+        context = torch.matmul(weights, v).transpose(1,2).contiguous().view(bs,-1, self.heads*self.d_k)
+        return self.out_lin(context)
 
-train_sents_pt_art = all_aroeira_individual_sentences[num_val_pt_art:]
-val_sents_pt_art = all_aroeira_individual_sentences[:num_val_pt_art]
+class ArticleFeedForward(nn.Module): # Rede Feed-Forward
+    def __init__(self, d_model, ff_hidden_size, dropout_rate=MODEL_DROPOUT):
+        super().__init__(); self.fc1 = nn.Linear(d_model, ff_hidden_size)
+        self.fc2 = nn.Linear(ff_hidden_size, d_model); self.drop = nn.Dropout(dropout_rate)
+        self.activ = nn.GELU()
+    def forward(self, x): return self.fc2(self.drop(self.activ(self.fc1(x))))
 
-# Garante que há dados de treino, mesmo que o dataset seja muito pequeno
-if not train_sents_pt_art:
-    print("AVISO: Dataset de Aroeira muito pequeno, usando todos os exemplos para treino (sem validação para pré-treino).")
-    train_sents_pt_art = all_aroeira_individual_sentences
-    val_sents_pt_art = []
+class ArticleEncoderLayer(nn.Module): # Uma camada do Encoder Transformer
+    def __init__(self, d_model, num_heads, ff_hidden_size, dropout_rate=MODEL_DROPOUT):
+        super().__init__(); self.norm1 = nn.LayerNorm(d_model); self.norm2 = nn.LayerNorm(d_model)
+        self.attn = ArticleMultiHeadedAttention(num_heads, d_model, dropout_rate)
+        self.ff = ArticleFeedForward(d_model, ff_hidden_size, dropout_rate); self.drop = nn.Dropout(dropout_rate)
+    def forward(self, embeds, mha_padding_mask): # mha_padding_mask (bs, 1, 1, seq_len)
+        attended = self.attn(embeds, embeds, embeds, mha_padding_mask)
+        x = self.norm1(embeds + self.drop(attended)) # Add & Norm (Post-LN)
+        ff_out = self.ff(x)
+        return self.norm2(x + self.drop(ff_out)) # Add & Norm (Post-LN)
 
-print(f"Sentenças Pré-Treino (Estilo Artigo): Treino={len(train_sents_pt_art)}, Validação={len(val_sents_pt_art)}")
+class ArticleBERT(nn.Module): # BERT Backbone (Estilo Artigo)
+    def __init__(self, vocab_sz, d_model, n_layers, heads, seq_len, pad_idx, # Nome do parâmetro para padding é 'pad_idx'
+                 dropout_rate=MODEL_DROPOUT, ff_h_size=MODEL_FF_HIDDEN_SIZE): # dropout_rate e ff_h_size com defaults
+        super().__init__()
+        self.d_model = d_model # Salva d_model para o Trainer/ScheduledOptim
+        self.emb = ArticleBERTEmbedding(vocab_sz, d_model, seq_len, dropout_rate, pad_idx)
+        self.enc_blocks = nn.ModuleList(
+            [ArticleEncoderLayer(d_model, heads, ff_h_size, dropout_rate) for _ in range(n_layers)])
+        self.pad_idx = pad_idx # Usado no método forward para criar a máscara
 
-# Cria instâncias do ArticleStyleBERTDataset e DataLoaders
-# Usa tokenizer_pt (definido e configurado no Bloco 4)
-train_ds_pt_art = ArticleStyleBERTDataset(train_sents_pt_art, tokenizer_pt, seq_len=MAX_LEN)
-train_dl_pt_art = DataLoader(train_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, num_workers=0)
+    def forward(self, input_ids, segment_ids): # O artigo não passa attention_mask aqui, ela é criada internamente
+        # Cria a máscara de atenção baseada no pad_idx.
+        # (input_ids != self.pad_idx) resulta em True para tokens reais, False para padding.
+        # A implementação do MHA do artigo espera uma máscara onde 0 indica padding.
+        mha_padding_mask = (input_ids != self.pad_idx).unsqueeze(1).unsqueeze(2) # Shape: (bs, 1, 1, seq_len)
+        
+        x = self.emb(input_ids, segment_ids)
+        for block in self.enc_blocks:
+            x = block(x, mha_padding_mask) # Passa a máscara para cada EncoderLayer
+        return x
 
-val_dl_pt_art = None
-if val_sents_pt_art and len(val_sents_pt_art) > 0:
-    val_ds_pt_art = ArticleStyleBERTDataset(val_sents_pt_art, tokenizer_pt, seq_len=MAX_LEN)
-    if len(val_ds_pt_art) > 0: # Checa se o dataset de validação não ficou vazio após processamento
-        val_dl_pt_art = DataLoader(val_ds_pt_art, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
-else:
-    print("Nenhum conjunto de validação será usado para o pré-treinamento.")
+class ArticleNSPHead(nn.Module): # Cabeça para Next Sentence Prediction
+    def __init__(self, hidden_d_model):
+        super().__init__(); self.linear = nn.Linear(hidden_d_model, 2)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out[:, 0]))
 
-# Instanciação do Modelo BERT (Estilo Artigo)
-# O backbone ArticleBERT é definido no Bloco 6
-print(f"Instanciando ArticleBERT com PAD_TOKEN_ID_FOR_PRETRAIN = {PAD_TOKEN_ID_FOR_PRETRAIN}")
-article_bert_model = ArticleBERT(
-    vocab_sz=tokenizer_pt.get_vocab_size(),
-    d_model=MODEL_D_MODEL,
-    n_layers=MODEL_N_LAYERS,
-    heads=MODEL_HEADS,                    # Parâmetro 'heads' como definido na classe
-    seq_len=MAX_LEN,
-    pad_idx=PAD_TOKEN_ID_FOR_PRETRAIN,    # Parâmetro 'pad_idx' como definido na classe
-    dropout_rate=MODEL_DROPOUT,           # Parâmetro 'dropout_rate' como definido na classe
-    ff_h_size=MODEL_FF_HIDDEN_SIZE        # Parâmetro 'ff_h_size' como definido na classe
-)
+class ArticleMLMHead(nn.Module): # Cabeça para Masked Language Model
+    def __init__(self, hidden_d_model, vocab_sz):
+        super().__init__(); self.linear = nn.Linear(hidden_d_model, vocab_sz)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out))
 
-# Modelo Combinado com Cabeças MLM e NSP (definido no Bloco 6)
-article_bertlm_with_heads = ArticleBERTLMWithHeads(
-    article_bert_model,
-    tokenizer_pt.get_vocab_size()
-)
-
-# Trainer (Estilo Artigo, definido no Bloco 7)
-# Inclui o otimizador Adam e o ScheduledOptim internamente.
-trainer_article = ArticleStyleBERTTrainer(
-    model=article_bertlm_with_heads,
-    train_dataloader=train_dl_pt_art,
-    val_dataloader=val_dl_pt_art, # Pode ser None
-    d_model_for_optim=MODEL_D_MODEL, # Usado pelo ScheduledOptim
-    lr=LEARNING_RATE_ADAM,         # Taxa de aprendizado base para Adam
-    betas=ADAM_BETAS,
-    weight_decay=ADAM_WEIGHT_DECAY,
-    warmup_steps=N_WARMUP_STEPS,   # Para ScheduledOptim
-    device=DEVICE,
-    model_save_path=PRETRAINED_BERT_SAVE_FILENAME,
-    pad_idx_mlm_loss=PAD_TOKEN_ID_FOR_PRETRAIN # Para o ignore_index da NLLLoss do MLM
-)
-print("Componentes (estilo artigo) para pré-treinamento MLM+NSP prontos.")
-
-# O Bloco 9 (execução do treino: trainer_article.train(num_epochs=EPOCHS_PRETRAIN)) viria na sequência.
+class ArticleBERTLMWithHeads(nn.Module): # Modelo BERT completo com cabeças MLM e NSP
+    def __init__(self, bert_model: ArticleBERT, vocab_size: int):
+        super().__init__(); self.bert = bert_model
+        self.nsp_head = ArticleNSPHead(self.bert.d_model)
+        self.mlm_head = ArticleMLMHead(self.bert.d_model, vocab_size)
+    # O forward do ArticleBERT cria a máscara internamente, então não precisamos passá-la aqui
+    def forward(self, input_ids, segment_ids): # Removido attention_mask daqui, pois ArticleBERT lida com isso
+        bert_output = self.bert(input_ids, segment_ids)
+        return self.nsp_head(bert_output), self.mlm_head(bert_output)
