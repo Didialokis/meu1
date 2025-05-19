@@ -1,0 +1,2 @@
+# Exemplo: Rodar preparação de dados, tokenizador e pré-treinamento
+%run bert_pipeline.py --do_dataprep_tokenizer --do_pretrain --aroeira_subset_size 5000 --epochs_pretrain 1 --output_dir ./run_outputs
