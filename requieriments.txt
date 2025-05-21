@@ -1,0 +1,22 @@
+# requirements.txt
+
+# Framework principal de Deep Learning
+torch==2.3.0
+
+# Para carregar e manipular datasets (Aroeira, ASSIN, HAREM)
+datasets==2.19.0
+
+# Para treinar e usar o tokenizador ByteLevelBPE
+tokenizers==0.19.1
+
+# Para barras de progresso
+tqdm==4.66.4
+
+# Para métricas de avaliação (accuracy, f1_score em NLI)
+scikit-learn==1.4.2
+
+# Para avaliação específica de NER (F1 a nível de entidade)
+seqeval==1.2.2
+
+# Fundamental para operações numéricas, dependência de muitas bibliotecas de DL/ML
+numpy==1.26.4
