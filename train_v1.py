@@ -1,42 +1,33 @@
 import sagemaker
 from sagemaker.huggingface import HuggingFace
-from sagemaker import get_execution_role
-import os # Necessário para os.path.basename
+import os
 
-# Inicializa a sessão e o role do SageMaker
-sagemaker_session = sagemaker.Session() # Nome correto da classe
-role = get_execution_role()
+# Configuração da Sessão e Role do SageMaker
+try:
+    sagemaker_session = sagemaker.Session()
+    role = sagemaker.get_execution_role()
+    sagemaker_default_bucket = sagemaker_session.default_bucket()
+    print(f"Sessão SageMaker e Role configurados. Bucket padrão: {sagemaker_default_bucket}")
+except Exception as e:
+    print(f"AVISO: Não foi possível obter role/sessão SageMaker automaticamente: {e}. Usando placeholders.")
+    role = "arn:aws:iam::SEU_ACCOUNT_ID:role/SEU_SAGEMAKER_EXECUTION_ROLE" # SUBSTITUA se rodar localmente
+    sagemaker_session = sagemaker.Session()
+    sagemaker_default_bucket = "seu-bucket-sagemaker-padrao" # SUBSTITUA se rodar localmente
+print(f"Role ARN: {role}")
 
-print(f"SageMaker Role ARN: {role}")
-print(f"Sessão SageMaker: {sagemaker_session}")
-sagemaker_default_bucket = sagemaker_session.default_bucket()
-if sagemaker_default_bucket:
-    print(f"Bucket S3 Padrão: {sagemaker_default_bucket}")
-
-# Caminho S3 para o seu dataset Aroeira principal
-# Este arquivo JSON será baixado para o container de treinamento.
-train_data_s3_path = 's3://393325852832-processedtexts/moderated/final_dataset_autoral_rights.json'
-
-# Hiperparâmetros que serão passados para o script de treinamento (bert_aroeira_v2.py)
-# As chaves aqui devem corresponder aos nomes dos argumentos definidos no argparse do script de treino.
+# Hiperparâmetros para o script de treinamento MLM (train_pipeline.py)
+# Foco em streaming direto do Hub para Aroeira
 hyperparameters = {
     # Configs Gerais e de Dados
     'max_len': 128,
-    # 'aroeira_subset_size' não é mais estritamente necessário aqui se 'train_data_s3_path'
-    # já representa o conjunto de dados completo ou o subconjunto desejado para o Aroeira.
-    # Se o script de treino ainda tiver lógica para subsetting interno, você pode passar.
-    # Para este exemplo, assumimos que o JSON em S3 é o dataset a ser usado.
+    'aroeira_subset_size': 10000, # Controla quantos exemplos pegar do stream do Hub
     'vocab_size': 30000,
     'min_frequency_tokenizer': 2,
-    'trust_remote_code': "True", # Booleano como string para SageMaker
-
-    # Caminho para os dados DENTRO do container SageMaker (do canal 'train')
-    'sagemaker_input_data_dir': '/opt/ml/input/data/train/', # Corresponde ao canal 'train' no .fit()
-    'input_data_filename': os.path.basename(train_data_s3_path), # Nome do arquivo dentro do dir acima
+    'trust_remote_code': "True", # Para datasets.load_dataset
 
     # Configs Pré-treinamento MLM
-    'epochs_pretrain': 1,        # Exemplo: mantenha baixo para testes iniciais no SageMaker
-    'batch_size_pretrain': 8,    # Ajuste conforme o instance_type
+    'epochs_pretrain': 1,
+    'batch_size_pretrain': 8,
     'lr_pretrain': 5e-5,
 
     # Arquitetura Modelo BERT
@@ -46,65 +37,55 @@ hyperparameters = {
     'model_dropout_prob': 0.1,
     
     # Nomes de Arquivos de Saída (o script de treino adicionará o output_dir antes)
-    # O script de treino usará SM_MODEL_DIR (/opt/ml/model) como output_dir principal.
     'tokenizer_vocab_filename': "aroeira_mlm_tokenizer-vocab.json",
     'tokenizer_merges_filename': "aroeira_mlm_tokenizer-merges.txt",
     'pretrained_bertlm_save_filename': "aroeira_bertlm_pretrained.pth",
     'temp_tokenizer_train_file': "temp_aroeira_for_tokenizer.txt",
     
-    # Controle de Fluxo (foco apenas em MLM para este exemplo simplificado)
-    'do_dataprep_tokenizer': "True", # Executar preparação de dados e treino do tokenizador
-    'do_pretrain': "True",           # Executar pré-treinamento MLM
-    'do_finetune_nli': "False",      # Desabilitado
-    'do_finetune_ner': "False",      # Desabilitado
+    # Controle de Fluxo (foco apenas em MLM)
+    'do_dataprep_tokenizer': "True",
+    'do_pretrain': "True",
+    'do_finetune_nli': "False", 
+    'do_finetune_ner': "False",
     
-    # Argumentos comuns do HF Trainer (para compatibilidade se seu parse_args os tiver)
     'logging_steps': 50,
     'evaluation_strategy': "epoch", 
     'save_strategy': "epoch", 
-    'fp16': "False", # Defina como "True" se a instância e o script suportarem
+    'fp16': "False",
     'load_best_model_at_end': "False",
-    # Podem ser adicionados outros hiperparâmetros que seu script de treino espera
     'adam_beta1': 0.9,
     'adam_beta2': 0.999,
     'adam_epsilon': 1e-8,
     'weight_decay': 0.01,
+    # sagemaker_input_data_dir e input_data_filename foram removidos pois Aroeira virá do Hub
 }
-print(f"Hiperparâmetros configurados para o job: {hyperparameters}")
+print(f"Hiperparâmetros para o job: {hyperparameters}")
 
-# Configurar o Hugging Face Estimator
-# O nome do script de entrada deve ser o nome do seu arquivo .py principal
-ENTRY_POINT_SCRIPT = 'bert_aroeira_v2.py' # Conforme sua imagem
-SOURCE_DIRECTORY = './' # Assume que o script e requirements.txt estão no diretório atual
+# Configuração do HuggingFace Estimator
+SOURCE_DIRECTORY = './scripts/' 
+ENTRY_POINT_SCRIPT = 'train_pipeline.py' 
 
 huggingface_estimator = HuggingFace(
     entry_point=ENTRY_POINT_SCRIPT,
     source_dir=SOURCE_DIRECTORY,
     role=role,
-    transformers_version='4.36', # Mantendo as versões da sua imagem
-    pytorch_version='2.1.0',     # Mantendo as versões da sua imagem
-    py_version='py310',          # Mantendo as versões da sua imagem
+    transformers_version='4.36.0', # Ou '4.36'
+    pytorch_version='2.1.0',     # Ou '2.1'
+    py_version='py310',
     instance_count=1,
-    instance_type='ml.g5.2xlarge', # Mantendo a instância da sua imagem
+    instance_type='ml.g4dn.xlarge', 
     sagemaker_session=sagemaker_session,
     hyperparameters=hyperparameters,
-    dependencies=['requirements.txt'] # Assume que está na raiz de source_dir
+    dependencies=[os.path.join(SOURCE_DIRECTORY, 'requirements.txt')],
+    output_path=f"s3://{sagemaker_default_bucket}/aroeira_mlm_hub_stream_output/job_output/",
+    model_dir=f"s3://{sagemaker_default_bucket}/aroeira_mlm_hub_stream_output/model_artifacts/",
 )
-
-# Configurar o input de dados do S3 para o canal 'train'
-# O nome do canal 'train' aqui resultará no caminho /opt/ml/input/data/train/ no container
-s3_input_data = sagemaker.inputs.TrainingInput(
-    s3_data=train_data_s3_path,
-    distribution='FullyReplicated',
-    content_type='application/json', # Assumindo que seu arquivo S3 é JSON
-    s3_data_type='S3Prefix' 
-)
-inputs = {'train': s3_input_data} # Canal nomeado 'train'
 
 print(f"Iniciando job de treinamento SageMaker para: {os.path.join(SOURCE_DIRECTORY, ENTRY_POINT_SCRIPT)}")
-print(f"Dados de entrada S3: {train_data_s3_path} -> canal 'train'")
-print(f"Dados estarão disponíveis em: {hyperparameters['sagemaker_input_data_dir']}{hyperparameters['input_data_filename']}")
+print("O script de treino baixará/fará stream dos datasets (Aroeira, etc.) diretamente do Hugging Face Hub.")
 
-huggingface_estimator.fit(inputs, wait=True) # wait=True para o script esperar a conclusão
+# Para esta configuração, não precisamos passar 'inputs' para .fit() para o Aroeira,
+# pois o script de treino o carregará do Hub.
+huggingface_estimator.fit(wait=True)
 
-print("Job do SageMaker submetido/concluído.")
+print("Job do SageMaker (MLM Aroeira via Hub Streaming) submetido/concluído.")
