@@ -387,3 +387,39 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+//////////////////////////////////////////////////////
+def main():
+    ARGS = parse_args()
+    
+    # Assegurar que os diretórios de output existem
+    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    # --- CORREÇÃO AQUI ---
+    # 1. Crie o caminho completo para o arquivo de log usando o output_dir.
+    log_file_path = Path(ARGS.output_dir) / 'training_log.log'
+    
+    # 2. Passe a variável string para a função de setup.
+    setup_logging(ARGS.log_level, str(log_file_path))
+    # ---------------------
+
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    logger.info("--- Configurações Utilizadas ---")
+    for arg_name, value in vars(ARGS).items():
+        logger.info(f"{arg_name}: {value}")
+    logger.info("---------------------------------")
+    
+    # O resto da função continua igual
+    tokenizer, pad_id, sentences_list = setup_data_and_train_tokenizer(ARGS, logger)
+    run_bert_pretraining_nsp_mlm(ARGS, tokenizer, pad_id, sentences_list, logger)
+    
+    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+if __name__ == "__main__":
+    main()
