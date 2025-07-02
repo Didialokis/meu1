@@ -1,3 +1,18 @@
+        # --- MODIFICAÇÃO PRINCIPAL AQUI ---
+        # Em vez de pedir o split="train", definimos explicitamente que
+        # o split 'train' é composto pelo arquivo inteiro.
+        
+        # 1. Carrega o dataset, mapeando o nome do split para o arquivo
+        dataset_dict = datasets.load_dataset(
+            "json",
+            data_files={'train': ARGS.s3_data_path}, # <-- Mapeamento explícito
+            streaming=True
+        )
+        
+        # 2. Seleciona o split 'train' do dicionário de datasets retornado
+        streamed_ds = dataset_dict['train']
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
