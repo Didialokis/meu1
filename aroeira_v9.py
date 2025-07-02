@@ -1,45 +1,27 @@
-def main():
-    ARGS = parse_args()
+# --- MODIFICAÇÃO (CORREÇÃO DO BUG): Função de carregamento de shard com iterador explícito ---
+def load_data_shard(stream_iterator, args, logger, shard_num: int, stage_name: str = "Training"):
+    """
+    Carrega um fragmento (shard) do dataset usando um iterador explícito para evitar bugs.
+    """
+    logger.info(f"--- Carregando Shard de Dados Nº {shard_num + 1} para a Fase de '{stage_name}' ---")
     
-    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    shard_sents_list = []
+    text_col = "text"
     
-    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
-    setup_logging(ARGS.log_level, str(log_file))
-    logger = logging.getLogger(__name__)
+    # Usa um loop 'for' com um contador para pegar o número exato de itens para o shard
+    # Isso é mais robusto do que o método .take() da biblioteca
+    for i, ex in enumerate(tqdm(stream_iterator, desc=f"Processando Shard {shard_num + 1} ({stage_name})")):
+        if i >= args.shard_size:
+            break # Para quando o shard estiver cheio
+        
+        sent = ex.get(text_col)
+        if isinstance(sent, str) and sent.strip():
+            shard_sents_list.append(sent.strip())
+            
+    if not shard_sents_list:
+        logger.warning(f"Nenhuma sentença carregada para o shard {shard_num + 1}. Fim do dataset?")
 
-    logger.info(f"Dispositivo selecionado: {ARGS.device}")
-    logger.info("--- Configurações Utilizadas ---")
-    for arg_name, value in vars(ARGS).items():
-        logger.info(f"{arg_name}: {value}")
-    logger.info("---------------------------------")
-    
-    # --- MODIFICAÇÃO: Construir o padrão glob para encontrar todos os arquivos batch ---
-    # Garante que não haja uma barra dupla caso o usuário já a inclua.
-    base_data_path = ARGS.s3_data_path.rstrip('/')
-    glob_data_path = f"{base_data_path}/batch_*.jsonl"
-    
-    logger.info(f"Inicializando stream de dados a partir do padrão glob: {glob_data_path}")
-    try:
-        # Passamos o padrão glob para data_files
-        streamed_ds = datasets.load_dataset("json", data_files=glob_data_path, split="train", streaming=True)
-    except Exception as e:
-        logger.error(f"Falha ao inicializar o stream de dados com o padrão glob: {e}")
-        logger.error("Verifique se o caminho do diretório está correto e se os arquivos batch_*.jsonl existem nele.")
-        sys.exit(1)
-    # --------------------------------------------------------------------------------
-
-    # O resto do fluxo permanece o mesmo, passando o streamed_ds para as funções.
-    # 1. Prepara o tokenizador (usará o stream contínuo para pegar o primeiro shard)
-    tokenizer, pad_id = setup_and_train_tokenizer(streamed_ds, ARGS, logger)
-    
-    # 2. Inicia o loop de treinamento (usará o mesmo stream contínuo para todos os shards)
-    run_pretraining_on_shards(streamed_ds, ARGS, tokenizer, pad_id, logger)
-    
-    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
-
-if __name__ == "__main__":
-    main()
+    return shard_sents_list
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 import torch
