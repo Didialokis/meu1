@@ -359,3 +359,43 @@ python train_bert_sharded.py \
     --checkpoint_dir "./teste_checkpoints" \
     --batch_size_pretrain 16 \
     --epochs_per_shard 2
+/////////////////////////////////////////////
+
+
+        def main():
+    ARGS = parse_args()
+    
+    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    setup_logging(ARGS.log_level, str(log_file))
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    logger.info("--- Configurações Utilizadas ---")
+    for arg_name, value in vars(ARGS).items():
+        logger.info(f"{arg_name}: {value}")
+    logger.info("---------------------------------")
+    
+    # --- MODIFICAÇÃO: Inicializa o stream de dados UMA ÚNICA VEZ ---
+    logger.info(f"Inicializando stream de dados a partir de: {ARGS.s3_data_path}")
+    try:
+        streamed_ds = datasets.load_dataset("json", data_files=ARGS.s3_data_path, split="train", streaming=True)
+    except Exception as e:
+        logger.error(f"Falha ao inicializar o stream de dados: {e}")
+        logger.error("Verifique se o caminho do arquivo está correto e se as permissões de acesso (ex: s3fs) estão configuradas.")
+        sys.exit(1) # Encerra o script se não conseguir acessar os dados
+    # ------------------------------------------------------------
+
+    # 1. Prepara o tokenizador usando o stream principal
+    tokenizer, pad_id = setup_and_train_tokenizer(streamed_ds, ARGS, logger)
+    
+    # 2. Inicia o loop de treinamento sobre todos os shards, usando o mesmo stream
+    run_pretraining_on_shards(streamed_ds, ARGS, tokenizer, pad_id, logger)
+    
+    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+if __name__ == "__main__":
+    # O parse_args() e todas as outras classes (modelo, trainer) devem estar definidas antes desta linha
+    main()
