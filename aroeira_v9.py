@@ -1,16 +1,87 @@
-        # --- MODIFICAÇÃO PRINCIPAL AQUI ---
-        # Em vez de pedir o split="train", definimos explicitamente que
-        # o split 'train' é composto pelo arquivo inteiro.
+def setup_and_train_tokenizer(args, logger):
+    """
+    Prepara e treina o tokenizador. AGORA CRIA SEU PRÓPRIO STREAM para ser independente.
+    """
+    logger.info("--- Fase: Preparação do Tokenizador ---")
+    
+    # 1. Cria um stream temporário apenas para o tokenizador
+    logger.info(f"Criando stream temporário para tokenizador a partir de: {args.s3_data_path}")
+    streamed_ds = datasets.load_dataset("json", data_files=args.s3_data_path, split="train", streaming=True)
+    
+    # 2. Usa o primeiro shard como amostra
+    # A função load_data_shard ainda é útil como auxiliar aqui
+    sentences_for_tokenizer = load_data_shard(streamed_ds, args, logger, shard_num=0, stage_name="Tokenizer")
+
+    if not sentences_for_tokenizer:
+        raise RuntimeError("Não foi possível carregar o primeiro shard para treinar o tokenizador. Verifique o caminho dos dados.")
+
+    # O resto da função é idêntico
+    temp_file = Path(args.output_dir) / "temp_for_tokenizer.txt"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        for s_line in sentences_for_tokenizer: f.write(s_line + "\n")
+    
+    TOKENIZER_ASSETS_DIR = Path(args.output_dir) / "tokenizer_assets"
+    TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    if not (TOKENIZER_ASSETS_DIR / "vocab.txt").exists():
+        logger.info("Treinando novo tokenizador com base no primeiro shard...")
+        wp_trainer = BertWordPieceTokenizer(clean_text=True, lowercase=True)
+        wp_trainer.train(files=[str(temp_file)], vocab_size=args.vocab_size, min_frequency=args.min_frequency_tokenizer, special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"])
+        wp_trainer.save_model(str(TOKENIZER_ASSETS_DIR))
+    else:
+        logger.info(f"Tokenizador já existe em '{TOKENIZER_ASSETS_DIR}'. Carregando...")
+
+    tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+    logger.info("Tokenizador preparado com sucesso.")
+    return tokenizer, tokenizer.pad_token_id
+
+
+
+
+
+
+
+
+
+
+
+3. run_pretraining_on_shards (agora cria seu próprio stream)
+
+Esta é a mudança crucial. A função de treinamento principal agora inicializa seu próprio stream, garantindo que ele comece do zero.
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    """Orquestra o processo de treinamento, iterando sobre múltiplos shards de dados."""
+    logger.info("--- INICIANDO PROCESSO DE TREINAMENTO EM SHARDS ---")
+    
+    # --- MODIFICAÇÃO CRUCIAL: Inicializa um novo stream para a fase de treinamento ---
+    logger.info(f"Criando stream principal de treinamento a partir de: {args.s3_data_path}")
+    try:
+        streamed_ds_training = datasets.load_dataset("json", data_files=args.s3_data_path, split="train", streaming=True)
+    except Exception as e:
+        logger.error(f"Falha ao inicializar o stream de dados para o treinamento: {e}")
+        return
+    # ----------------------------------------------------------------------------
+
+    shard_num = 0
+    while True:
+        if args.num_shards != -1 and shard_num >= args.num_shards:
+            logger.info(f"Número definido de shards ({args.num_shards}) processado. Finalizando.")
+            break
         
-        # 1. Carrega o dataset, mapeando o nome do split para o arquivo
-        dataset_dict = datasets.load_dataset(
-            "json",
-            data_files={'train': ARGS.s3_data_path}, # <-- Mapeamento explícito
-            streaming=True
-        )
+        # Passa o stream de TREINAMENTO para a função de carregar o shard
+        sentences_list = load_data_shard(streamed_ds_training, args, logger, shard_num)
         
-        # 2. Seleciona o split 'train' do dicionário de datasets retornado
-        streamed_ds = dataset_dict['train']
+        if not sentences_list:
+            logger.info("Shard vazio encontrado. O dataset foi processado por completo. Finalizando o treinamento.")
+            break
+
+        # O resto do loop permanece inalterado...
+        val_split = int(len(sentences_list) * 0.1); train_sents, val_sents = sentences_list[val_split:], sentences_list[:val_split]
+        # ... (código para criar Dataset, DataLoader, Modelo e Trainer) ...
+        # ... (chamada para trainer.train()) ...
+        
+        shard_num += 1
+
+    logger.info("--- PROCESSO DE TREINAMENTO EM SHARDS CONCLUÍDO ---")
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 import torch
