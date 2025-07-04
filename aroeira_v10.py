@@ -104,64 +104,122 @@ def load_checkpoint(args, model, optimizer, scheduler):
 
 # --- CORREÇÃO: Lógica do Tokenizer para lidar com outputs no S3 ---
 def setup_and_train_tokenizer(args, logger):
-    """Prepara e treina o tokenizador, salvando os artefatos em S3 se necessário."""
+    """
+    Prepara e treina o tokenizador. Gerencia I/O local e S3 de forma robusta.
+    """
     logger.info("--- Fase: Preparação do Tokenizador ---")
-    
-    # 1. Carregar dados para treinar o tokenizador (lógica inalterada)
-    # ... (código para listar arquivos e carregar o primeiro shard/grupo de arquivos) ...
-    
-    # 2. Salvar arquivos do tokenizador em um diretório LOCAL TEMPORÁRIO
-    local_temp_tokenizer_dir = Path("./temp_tokenizer_assets")
-    local_temp_tokenizer_dir.mkdir(parents=True, exist_ok=True)
 
-    # Verifica se os arquivos já existem no S3 para não treinar de novo
+    # Define os caminhos. Se o output for S3, usamos um diretório temporário local.
     is_s3_output = args.output_dir.startswith("s3://")
-    s3 = s3fs.S3FileSystem() if is_s3_output else None
-    s3_tokenizer_path = f"{args.output_dir.rstrip('/')}/tokenizer_assets/"
-    
-    if is_s3_output and s3.exists(s3_tokenizer_path):
-        logger.info(f"Baixando tokenizador pré-existente do S3: {s3_tokenizer_path}")
-        s3.get(s3_tokenizer_path, str(local_temp_tokenizer_dir), recursive=True)
+    if is_s3_output:
+        # Usa um diretório temporário que será limpo no final
+        local_tokenizer_path = Path("./temp_tokenizer_assets")
+        s3_tokenizer_path = f"{args.output_dir.rstrip('/')}/tokenizer_assets/"
+        s3 = s3fs.S3FileSystem()
     else:
-        # A lógica de treino original que salva em um diretório local
-        # (código para treinar com wp_trainer e salvar em local_temp_tokenizer_dir)
-        # ...
-        
-        # 3. Se o output for S3, FAZ O UPLOAD do diretório local temporário para o S3
+        # Se for local, trabalha diretamente no diretório final
+        local_tokenizer_path = Path(args.output_dir) / "tokenizer_assets"
+        s3, s3_tokenizer_path = None, None
+
+    # Limpa o diretório temporário local, caso tenha sobrado de uma execução anterior
+    if is_s3_output and local_tokenizer_path.exists():
+        shutil.rmtree(local_tokenizer_path)
+    local_tokenizer_path.mkdir(parents=True, exist_ok=True)
+    
+    # Verifica se o tokenizador já existe no destino final (local ou S3)
+    final_destination_exists = s3.exists(s3_tokenizer_path) if is_s3_output else local_tokenizer_path.exists() and any(local_tokenizer_path.iterdir())
+
+    if final_destination_exists:
+        logger.info(f"Tokenizador já existe no destino final.")
         if is_s3_output:
-            logger.info(f"Fazendo upload dos arquivos do tokenizador para {s3_tokenizer_path}")
-            s3.put(str(local_temp_tokenizer_dir), s3_tokenizer_path, recursive=True)
+            logger.info(f"Baixando de {s3_tokenizer_path} para {local_tokenizer_path}")
+            s3.get(s3_tokenizer_path, str(local_tokenizer_path), recursive=True)
+    else:
+        logger.info("Tokenizador não encontrado no destino. Gerando agora...")
+        
+        # Carrega os dados para treinar o tokenizador
+        base_data_path = args.s3_data_path.rstrip('/')
+        glob_data_path = f"{base_data_path}/batch_*.jsonl" if "batch_*.jsonl" not in base_data_path else base_data_path
+        s3_data_client = s3fs.S3FileSystem()
+        all_files = sorted(s3_data_client.glob(glob_data_path))
+        
+        if not all_files:
+            raise RuntimeError(f"Nenhum arquivo encontrado em {glob_data_path} para treinar o tokenizador.")
+            
+        files_for_tokenizer = all_files[:args.files_per_shard_tokenizer]
+        logger.info(f"Usando os primeiros {len(files_for_tokenizer)} arquivos para treinar o tokenizador.")
+        full_path_files = [f"s3://{f}" if not f.startswith('s3://') else f for f in files_for_tokenizer]
+        
+        tokenizer_ds = datasets.load_dataset("json", data_files=full_path_files, split="train")
+        sentences_for_tokenizer = [ex['text'] for ex in tokenizer_ds if ex and ex.get('text')]
+        
+        # Escreve sentenças em um arquivo de texto temporário
+        temp_text_file = local_tokenizer_path / "temp_corpus.txt"
+        with open(temp_text_file, "w", encoding="utf-8") as f:
+            for s_line in sentences_for_tokenizer: f.write(s_line + "\n")
+            
+        # Treina e salva os arquivos do tokenizador no diretório local
+        wp_trainer = BertWordPieceTokenizer(clean_text=True, lowercase=True)
+        wp_trainer.train(
+            files=[str(temp_text_file)],
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_frequency_tokenizer,
+            special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"]
+        )
+        wp_trainer.save_model(str(local_tokenizer_path))
+        temp_text_file.unlink() # Deleta o arquivo de corpus que pode ser grande
 
-    # 4. Carrega o tokenizador a partir do diretório LOCAL temporário
-    logger.info(f"Carregando tokenizador de: {local_temp_tokenizer_dir}")
-    tokenizer = BertTokenizer.from_pretrained(str(local_temp_tokenizer_dir), local_files_only=True)
-    
-    # 5. Limpa a pasta temporária
-    shutil.rmtree(local_temp_tokenizer_dir)
-    
+        # Se o destino for S3, faz o upload dos arquivos recém-criados
+        if is_s3_output:
+            logger.info(f"Fazendo upload do novo tokenizador para {s3_tokenizer_path}")
+            s3.put(str(local_tokenizer_path), s3_tokenizer_path, recursive=True)
+
+    # Carrega o tokenizador a partir do caminho LOCAL (seja ele o final ou o temporário)
+    logger.info(f"Carregando modelo do tokenizador do caminho local: {local_tokenizer_path}")
+    tokenizer = BertTokenizer.from_pretrained(str(local_tokenizer_path))
+    pad_id = tokenizer.pad_token_id
+
+    # Se usamos um diretório temporário, limpa no final
+    if is_s3_output:
+        shutil.rmtree(local_tokenizer_path)
+
     logger.info("Tokenizador preparado com sucesso.")
-    return tokenizer, tokenizer.pad_token_id
-
-
-# --- CORREÇÃO: `main` não cria mais pastas locais para caminhos S3 ---
+    return tokenizer, pad_id
 def main():
     ARGS = parse_args()
     
-    # Só cria diretórios se os caminhos forem locais
+    # --- MODIFICAÇÃO: Só cria diretórios se os caminhos forem locais ---
     if not ARGS.output_dir.startswith("s3://"):
         Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
     if not ARGS.checkpoint_dir.startswith("s3://"):
         Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     
-    # O path do log SEMPRE deve ser local
-    log_output_dir = "./logs"
-    Path(log_output_dir).mkdir(parents=True, exist_ok=True)
-    log_file = Path(log_output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    # O log SEMPRE será salvo localmente para evitar problemas de I/O
+    local_log_dir = Path("./training_logs")
+    local_log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = local_log_dir / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
     setup_logging(ARGS.log_level, str(log_file))
     logger = logging.getLogger(__name__)
 
-    # O resto da função main permanece o mesmo
-    # ...
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    logger.info("--- Configurações Utilizadas ---")
+    for arg_name, value in vars(ARGS).items():
+        logger.info(f"{arg_name}: {value}")
+    logger.info("---------------------------------")
+    
+    # 1. Prepara o tokenizador (cria e usa seu próprio stream temporário)
+    # Esta etapa é robusta e lida com S3
+    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    
+    # 2. Inicia o loop de treinamento principal
+    # Esta função agora contém a lógica de checkpoint correta
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
+    
+    logger.info("--- Pipeline de Pré-treinamento Finalizado com Sucesso ---")
+
+if __name__ == "__main__":
+    # Garanta que todas as definições de classe e função estejam acima desta linha
+    main()
 
 //////////////////////////////////////////////////////////////////////////////////
 
