@@ -1,5 +1,172 @@
 import torch
 import torch.nn as nn
+# ... (outras importações inalteradas)
+import s3fs # <-- Adicionar esta importação
+import shutil # <-- Adicionar para gerenciar pastas temporárias
+
+# --- Funções e Classes do Modelo (Inalteradas) ---
+# Todas as classes do modelo, de ArticleStyleBERTDataset a PretrainingTrainer
+# permanecem como na última versão. Para manter a resposta limpa,
+# o foco será nas funções que foram alteradas.
+# ... (Cole aqui as classes ArticleStyleBERTDataset, ArticleBERT, PretrainingTrainer, etc.)
+
+# --- CORREÇÃO: Funções de Checkpoint com suporte direto a S3 ---
+
+def save_checkpoint(args, shard_num, model, optimizer, scheduler, best_val_loss):
+    """Salva um checkpoint completo, funcionando em caminhos locais ou S3."""
+    checkpoint_path_str = f"{args.checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
+    best_model_path_str = f"{args.output_dir.rstrip('/')}/best_model.pth"
+    logger = logging.getLogger(__name__)
+
+    state = {
+        'shard_num': shard_num,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss
+    }
+
+    is_s3 = checkpoint_path_str.startswith("s3://")
+    
+    try:
+        if is_s3:
+            s3 = s3fs.S3FileSystem()
+            logger.info(f"Salvando checkpoint diretamente no S3: {checkpoint_path_str}")
+            with s3.open(checkpoint_path_str, 'wb') as f:
+                torch.save(state, f)
+        else:
+            # Comportamento antigo para caminhos locais
+            Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(state, checkpoint_path_str)
+
+        logger.info(f"Checkpoint salvo. Shard {shard_num} concluído.")
+
+        if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
+            save_checkpoint.global_best_val_loss = best_val_loss
+            logger.info(f"*** Nova melhor validação global encontrada ({best_val_loss:.4f}). Salvando melhor modelo... ***")
+            if is_s3:
+                with s3.open(best_model_path_str, 'wb') as f:
+                    torch.save(model.state_dict(), f)
+            else:
+                Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), best_model_path_str)
+            logger.info(f"Melhor modelo salvo em: {best_model_path_str}")
+
+    except Exception as e:
+        logger.error(f"Falha ao salvar checkpoint em '{checkpoint_path_str}': {e}")
+
+# Inicializa o atributo estático
+save_checkpoint.global_best_val_loss = float('inf')
+
+
+def load_checkpoint(args, model, optimizer, scheduler):
+    """Carrega o último checkpoint, funcionando com caminhos locais ou S3."""
+    checkpoint_path_str = f"{args.checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
+    start_shard = 0
+    logger = logging.getLogger(__name__)
+    is_s3 = checkpoint_path_str.startswith("s3://")
+    
+    try:
+        # Verifica a existência do arquivo
+        if is_s3:
+            s3 = s3fs.S3FileSystem()
+            if not s3.exists(checkpoint_path_str):
+                logger.info("Nenhum checkpoint encontrado no S3. Iniciando do zero.")
+                return start_shard
+        else:
+            if not Path(checkpoint_path_str).exists():
+                logger.info("Nenhum checkpoint local encontrado. Iniciando do zero.")
+                return start_shard
+
+        logger.info(f"Carregando checkpoint de: {checkpoint_path_str}")
+        
+        # Carrega o arquivo
+        if is_s3:
+            with s3.open(checkpoint_path_str, 'rb') as f:
+                checkpoint = torch.load(f, map_location=args.device)
+        else:
+            checkpoint = torch.load(checkpoint_path_str, map_location=args.device)
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        save_checkpoint.global_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        start_shard = checkpoint.get('shard_num', -1) + 1
+        
+        logger.info(f"Checkpoint carregado. Resumindo do Shard {start_shard}. Melhor Val Loss global: {save_checkpoint.global_best_val_loss:.4f}")
+
+    except Exception as e:
+        logger.error(f"Não foi possível carregar o checkpoint de '{checkpoint_path_str}'. Iniciando do zero. Erro: {e}")
+        start_shard = 0
+
+    return start_shard
+
+
+# --- CORREÇÃO: Lógica do Tokenizer para lidar com outputs no S3 ---
+def setup_and_train_tokenizer(args, logger):
+    """Prepara e treina o tokenizador, salvando os artefatos em S3 se necessário."""
+    logger.info("--- Fase: Preparação do Tokenizador ---")
+    
+    # 1. Carregar dados para treinar o tokenizador (lógica inalterada)
+    # ... (código para listar arquivos e carregar o primeiro shard/grupo de arquivos) ...
+    
+    # 2. Salvar arquivos do tokenizador em um diretório LOCAL TEMPORÁRIO
+    local_temp_tokenizer_dir = Path("./temp_tokenizer_assets")
+    local_temp_tokenizer_dir.mkdir(parents=True, exist_ok=True)
+
+    # Verifica se os arquivos já existem no S3 para não treinar de novo
+    is_s3_output = args.output_dir.startswith("s3://")
+    s3 = s3fs.S3FileSystem() if is_s3_output else None
+    s3_tokenizer_path = f"{args.output_dir.rstrip('/')}/tokenizer_assets/"
+    
+    if is_s3_output and s3.exists(s3_tokenizer_path):
+        logger.info(f"Baixando tokenizador pré-existente do S3: {s3_tokenizer_path}")
+        s3.get(s3_tokenizer_path, str(local_temp_tokenizer_dir), recursive=True)
+    else:
+        # A lógica de treino original que salva em um diretório local
+        # (código para treinar com wp_trainer e salvar em local_temp_tokenizer_dir)
+        # ...
+        
+        # 3. Se o output for S3, FAZ O UPLOAD do diretório local temporário para o S3
+        if is_s3_output:
+            logger.info(f"Fazendo upload dos arquivos do tokenizador para {s3_tokenizer_path}")
+            s3.put(str(local_temp_tokenizer_dir), s3_tokenizer_path, recursive=True)
+
+    # 4. Carrega o tokenizador a partir do diretório LOCAL temporário
+    logger.info(f"Carregando tokenizador de: {local_temp_tokenizer_dir}")
+    tokenizer = BertTokenizer.from_pretrained(str(local_temp_tokenizer_dir), local_files_only=True)
+    
+    # 5. Limpa a pasta temporária
+    shutil.rmtree(local_temp_tokenizer_dir)
+    
+    logger.info("Tokenizador preparado com sucesso.")
+    return tokenizer, tokenizer.pad_token_id
+
+
+# --- CORREÇÃO: `main` não cria mais pastas locais para caminhos S3 ---
+def main():
+    ARGS = parse_args()
+    
+    # Só cria diretórios se os caminhos forem locais
+    if not ARGS.output_dir.startswith("s3://"):
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    if not ARGS.checkpoint_dir.startswith("s3://"):
+        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    # O path do log SEMPRE deve ser local
+    log_output_dir = "./logs"
+    Path(log_output_dir).mkdir(parents=True, exist_ok=True)
+    log_file = Path(log_output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    setup_logging(ARGS.log_level, str(log_file))
+    logger = logging.getLogger(__name__)
+
+    # O resto da função main permanece o mesmo
+    # ...
+
+//////////////////////////////////////////////////////////////////////////////////
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
