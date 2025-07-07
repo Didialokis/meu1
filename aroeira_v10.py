@@ -1,3 +1,67 @@
+
+
+
+
+def main():
+    ARGS = parse_args()
+    
+    # --- MODIFICAÇÃO: Lógica do Modo de Teste Rápido ---
+    if ARGS.quick_test:
+        # Sobrescreve os argumentos para um teste rápido
+        ARGS.num_global_epochs = 1
+        ARGS.files_per_shard_training = 1
+        ARGS.files_per_shard_tokenizer = 1
+        ARGS.num_shards_limit = 2 # Processa apenas 2 shards
+        ARGS.batch_size_pretrain = 4
+        ARGS.max_len = 32
+        ARGS.model_d_model = 64
+        ARGS.model_n_layers = 1
+        ARGS.model_heads = 2
+        ARGS.output_dir = "./bert_quick_test_outputs"
+        ARGS.checkpoint_dir = "./checkpoints_quick_test"
+        # Limpa checkpoints antigos de teste para garantir um início limpo
+        if os.path.exists(os.path.join(ARGS.checkpoint_dir, "latest_checkpoint.pth")):
+             os.remove(os.path.join(ARGS.checkpoint_dir, "latest_checkpoint.pth"))
+    # --------------------------------------------------------
+    
+    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    setup_logging(ARGS.log_level, str(log_file))
+    logger = logging.getLogger(__name__)
+
+    if ARGS.quick_test:
+        logger.warning("="*50)
+        logger.warning("MODO DE TESTE RÁPIDO ATIVADO. AS CONFIGURAÇÕES FORAM REDUZIDAS.")
+        logger.warning("="*50)
+
+    # ... o resto da função main continua como antes ...
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    # ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////////////////////////////////////////
 import torch
 import torch.nn as nn
 # ... (outras importações inalteradas)
