@@ -1,18 +1,9 @@
-
-import s3fs # Adicione esta importação no topo do seu arquivo
-from pathlib import Path
-import torch
-import logging
-
-# --- CORREÇÃO: Função de salvar checkpoint ciente do S3 ---
+# --- CORREÇÃO: Função de salvar checkpoint usando Boto3 ---
 def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
-    """
-    Salva um checkpoint completo, funcionando tanto para caminhos locais quanto S3.
-    """
+    """Salva um checkpoint completo, usando Boto3 para caminhos S3."""
     checkpoint_dir = args.checkpoint_dir
     is_s3 = checkpoint_dir.startswith("s3://")
     
-    # Prepara o dicionário de estado para salvar
     state = {
         'global_epoch': global_epoch,
         'shard_num': shard_num,
@@ -23,72 +14,80 @@ def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, 
         'rng_state': random.getstate(),
     }
 
-    # Salva o checkpoint mais recente
     if is_s3:
-        s3 = s3fs.S3FileSystem()
-        checkpoint_path = f"{checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
-        logging.info(f"Salvando checkpoint no S3: {checkpoint_path} (Época Global {global_epoch+1}, Shard {shard_num+1})")
-        with s3.open(checkpoint_path, 'wb') as f:
-            torch.save(state, f)
-    else: # Caminho local
+        s3_client = boto3.client('s3')
+        checkpoint_path_s3 = f"{checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
+        bucket_name, key_name = checkpoint_path_s3.replace("s3://", "").split("/", 1)
+
+        with io.BytesIO() as buffer:
+            torch.save(state, buffer)
+            buffer.seek(0) # Volta ao início do buffer para a leitura do upload
+            s3_client.upload_fileobj(buffer, Bucket=bucket_name, Key=key_name)
+        logging.info(f"Checkpoint salvo no S3: {checkpoint_path_s3}")
+    else: # Lógica para caminho local
         path_obj = Path(checkpoint_dir)
         path_obj.mkdir(parents=True, exist_ok=True)
         checkpoint_path = path_obj / "latest_checkpoint.pth"
-        logging.info(f"Salvando checkpoint localmente: {checkpoint_path} (Época Global {global_epoch+1}, Shard {shard_num+1})")
         torch.save(state, checkpoint_path)
+        logging.info(f"Checkpoint salvo localmente: {checkpoint_path}")
 
-    # Salva o melhor modelo se um novo recorde for alcançado
+    # Lógica para salvar o melhor modelo (também com suporte a S3)
     if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
         save_checkpoint.global_best_val_loss = best_val_loss
         best_model_path_str = f"{args.output_dir.rstrip('/')}/best_model.pth"
-        
-        logging.info(f"*** Nova melhor validação global encontrada ({best_val_loss:.4f}). Salvando modelo em {best_model_path_str} ***")
-        if is_s3:
-            with s3.open(best_model_path_str, 'wb') as f:
-                torch.save(model.state_dict(), f)
-        else:
-            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), Path(best_model_path_str))
+        logging.info(f"*** Nova melhor validação global ({best_val_loss:.4f}). Modelo salvo em {best_model_path_str} ***")
 
-# Inicializa o atributo estático para rastrear a melhor perda global
+        with io.BytesIO() as buffer:
+            torch.save(model.state_dict(), buffer)
+            buffer.seek(0)
+            if best_model_path_str.startswith("s3://"):
+                bucket_name, key_name = best_model_path_str.replace("s3://", "").split("/", 1)
+                s3_client.upload_fileobj(buffer, Bucket=bucket_name, Key=key_name)
+            else:
+                Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+                with open(Path(best_model_path_str), 'wb') as f:
+                    f.write(buffer.read())
+
 save_checkpoint.global_best_val_loss = float('inf')
 
-
-# --- CORREÇÃO: Função de carregar checkpoint ciente do S3 ---
+# --- CORREÇÃO: Função de carregar checkpoint usando Boto3 ---
 def load_checkpoint(args, model, optimizer, scheduler):
-    """
-    Carrega o último checkpoint, funcionando tanto de caminhos locais quanto S3.
-    """
+    """Carrega o último checkpoint, usando Boto3 para caminhos S3."""
     checkpoint_dir = args.checkpoint_dir
-    is_s3 = checkpoint_dir.startswith("s3://")
-    start_epoch = 0
-    start_shard = 0
-    
-    checkpoint_exists = False
-    if is_s3:
-        s3 = s3fs.S3FileSystem()
-        checkpoint_path = f"{checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
-        if s3.exists(checkpoint_path):
-            checkpoint_exists = True
-    else: # Caminho local
-        checkpoint_path = Path(checkpoint_dir) / "latest_checkpoint.pth"
-        if checkpoint_path.exists():
-            checkpoint_exists = True
+    start_epoch, start_shard = 0, 0
 
-    if not checkpoint_exists:
-        logging.info("Nenhum checkpoint encontrado. Iniciando treinamento do zero.")
-        return start_epoch, start_shard
+    if checkpoint_dir.startswith("s3://"):
+        checkpoint_path_s3 = f"{checkpoint_dir.rstrip('/')}/latest_checkpoint.pth"
+        bucket_name, key_name = checkpoint_path_s3.replace("s3://", "").split("/", 1)
+        s3_client = boto3.client('s3')
+        
+        try:
+            logging.info(f"Tentando carregar checkpoint do S3: s3://{bucket_name}/{key_name}")
+            with io.BytesIO() as buffer:
+                s3_client.download_fileobj(Bucket=bucket_name, Key=key_name, Fileobj=buffer)
+                buffer.seek(0) # Volta ao início do buffer para a leitura
+                checkpoint = torch.load(buffer, map_location=args.device)
+            
+            logging.info("Checkpoint do S3 encontrado e carregado na memória.")
 
-    logging.info(f"Carregando checkpoint de: {checkpoint_path}")
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                logging.info("Nenhum checkpoint encontrado no S3 (erro 404). Iniciando do zero.")
+                return start_epoch, start_shard
+            else:
+                logging.error(f"Erro do Boto3 ao acessar S3: {e}")
+                raise e # Lança outros erros (ex: permissão)
     
-    # Carrega os dados do S3 ou localmente
-    if is_s3:
-        with s3.open(checkpoint_path, 'rb') as f:
-            checkpoint = torch.load(f, map_location=args.device)
-    else:
-        checkpoint = torch.load(checkpoint_path, map_location=args.device)
-    
-    # Aplica o estado aos objetos
+    else: # Lógica para caminho local
+        checkpoint_path_local = Path(checkpoint_dir) / "latest_checkpoint.pth"
+        if not checkpoint_path_local.exists():
+            logging.info("Nenhum checkpoint encontrado localmente. Iniciando do zero.")
+            return start_epoch, start_shard
+        
+        logging.info(f"Carregando checkpoint de: {checkpoint_path_local}")
+        checkpoint = torch.load(checkpoint_path_local, map_location=args.device)
+
+    # Aplica o estado aos objetos (lógica comum para local e S3)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -97,13 +96,11 @@ def load_checkpoint(args, model, optimizer, scheduler):
     if 'rng_state' in checkpoint:
         random.setstate(checkpoint['rng_state'])
     
-    # Retorna a próxima época e o próximo shard a serem processados
     start_epoch = checkpoint.get('global_epoch', 0)
     start_shard = checkpoint.get('shard_num', -1) + 1
     
-    logging.info(f"Checkpoint carregado. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
+    logging.info(f"Checkpoint restaurado com sucesso. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
     return start_epoch, start_shard
-
 
 /////////////////////////////////////////////////////////////////////////////////////
 def main():
