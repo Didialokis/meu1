@@ -1,3 +1,154 @@
+Código Completo das Funções Modificadas
+Apenas as funções parse_args, save_checkpoint e run_pretraining_on_shards precisam de alterações. A função load_checkpoint não precisa mudar, pois ela sempre deve resumir a partir do latest_checkpoint.pth.
+
+1. parse_args() - Adicionando um Argumento para Controlar o Novo Comportamento
+
+Vamos adicionar uma flag para que você possa ligar ou desligar o salvamento dos snapshots de época.
+
+Python
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Script de Pré-treino BERT com Shards e Checkpoints Versionados por Época.")
+    
+    # ... (todos os argumentos anteriores) ...
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Diretório para salvar checkpoints.")
+
+    # --- MODIFICAÇÃO: Argumento para controlar os snapshots de época ---
+    parser.add_argument("--save_epoch_checkpoints", action='store_true',
+                        help="Se especificado, salva um checkpoint separado no final de cada época global.")
+
+    # ... (resto dos argumentos) ...
+    
+    args = parser.parse_args()
+    if args.device is None:
+        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    return args
+Nota: action='store_true' cria uma flag booleana. Se você incluir --save_epoch_checkpoints no seu comando, o valor será True. Se não incluir, será False.
+
+2. save_checkpoint() - Modificada para Salvar Snapshots de Época
+
+A função agora terá um parâmetro extra, save_epoch_snapshot, para decidir se deve ou não criar o arquivo de versão da época.
+
+Python
+
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
+    """
+    Salva um checkpoint. Sempre salva 'latest_checkpoint.pth'.
+    Opcionalmente, salva um snapshot versionado da época.
+    """
+    checkpoint_dir_str = args.checkpoint_dir
+    is_s3 = checkpoint_dir_str.startswith("s3://")
+    s3 = s3fs.S3FileSystem() if is_s3 else None
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+    }
+
+    # 1. Salva o estado em um buffer na memória
+    buffer = io.BytesIO()
+    torch.save(state, buffer)
+
+    # 2. Sempre salva/sobrescreve o 'latest_checkpoint.pth' para resumo
+    buffer.seek(0) # Rebobina o buffer para o início
+    if is_s3:
+        latest_path = f"{checkpoint_dir_str.rstrip('/')}/latest_checkpoint.pth"
+        with s3.open(latest_path, 'wb') as f:
+            f.write(buffer.read())
+    else:
+        latest_path = Path(checkpoint_dir_str) / "latest_checkpoint.pth"
+        with open(latest_path, 'wb') as f:
+            f.write(buffer.read())
+    logging.info(f"Checkpoint de resumo salvo em: {latest_path}")
+
+    # --- MODIFICAÇÃO: Lógica para salvar o snapshot da época ---
+    # 3. Se solicitado, salva um novo arquivo de checkpoint para a época
+    if save_epoch_snapshot:
+        buffer.seek(0) # Rebobina o buffer novamente
+        epoch_filename = f"epoch_{global_epoch + 1:02d}_checkpoint.pth"
+        
+        if is_s3:
+            epoch_path = f"{checkpoint_dir_str.rstrip('/')}/{epoch_filename}"
+            with s3.open(epoch_path, 'wb') as f:
+                f.write(buffer.read())
+        else:
+            epoch_path = Path(checkpoint_dir_str) / epoch_filename
+            with open(epoch_path, 'wb') as f:
+                f.write(buffer.read())
+        logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo em: {epoch_path} ***")
+
+    # A lógica para salvar o melhor modelo continua a mesma...
+    if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
+        # ... (código para salvar best_model.pth)
+3. run_pretraining_on_shards() - Orquestrando Quando Salvar
+
+Esta função agora decide quando passar o sinalizador save_epoch_snapshot=True para a função save_checkpoint.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
+    
+    # ... (código para buscar a lista de arquivos `all_files_master_list`) ...
+    
+    # Instancia modelo e otimizadores fora do loop
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    # Loop de ÉPOCA GLOBAL
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
+        
+        current_files = list(all_files_master_list)
+        if start_shard == 0:
+            random.shuffle(current_files)
+            logger.info("Ordem dos arquivos de dados foi embaralhada para esta época.")
+        
+        file_shards = [current_files[i:i + args.files_per_shard_training] for i in range(0, len(current_files), args.files_per_shard_training)]
+        
+        # Loop INTERNO sobre os shards
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar DataLoaders) ...
+            
+            trainer = PretrainingTrainer(...)
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # --- MODIFICAÇÃO: Lógica de chamada do save_checkpoint ---
+            # Verifica se este é o último shard da época atual
+            is_last_shard_of_epoch = (shard_num == len(file_shards) - 1)
+            
+            # Decide se o snapshot da época deve ser salvo
+            should_save_epoch_snapshot = is_last_shard_of_epoch and args.save_epoch_checkpoints
+
+            # Salva o checkpoint, passando a flag para o snapshot
+            save_checkpoint(
+                args,
+                global_epoch=epoch_num,
+                shard_num=shard_num,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_loss=best_loss_in_shard,
+                save_epoch_snapshot=should_save_epoch_snapshot
+            )
+            # --------------------------------------------------------
+
+        # Reseta o start_shard para 0 para a próxima época global
+        start_shard = 0
+
+    logger.info(f"--- {args.num_global_epochs} ÉPOCAS GLOBAIS CONCLUÍDAS ---")
+
+//////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////
 # --- CORREÇÃO: Função de salvar checkpoint usando Boto3 ---
 # --- CORREÇÃO FINAL: Função de salvar checkpoint usando Boto3 ---
 def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
