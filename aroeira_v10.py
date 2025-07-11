@@ -1,299 +1,278 @@
-Adicionando Novas Métricas (Passo a Passo)
-Vamos adicionar as métricas que você solicitou: F1-Score, Recall e Precisão para a tarefa de NSP, e as métricas de resumo de dados.
+Com certeza. Esta é uma excelente adição para transformar o script de um simples executor para uma ferramenta de experimentação séria, onde você pode monitorar a performance e visualizar os resultados.
 
-Passo 1: Instalar a Dependência
-Para calcular F1, precisão e recall, a biblioteca scikit-learn é o padrão. Se você ainda não a tem, instale-a:
+Vamos dividir a sua solicitação em três partes e implementar cada uma delas:
+
+Métricas de Classificação por Shard: Adicionar o cálculo de Acurácia, Precisão, Recall (TPR) e F1-Score para a tarefa de Next Sentence Prediction (NSP) a cada shard processado.
+
+Log Estruturado para Gráficos: Salvar essas métricas em um arquivo CSV a cada shard, para que possam ser facilmente lidas e plotadas posteriormente.
+
+Relatório Final de Treinamento: Calcular e exibir um resumo no final de todo o processo, com o total de documentos, tamanho dos dados e uma estimativa de tokens.
+
+Para o cálculo das métricas, usaremos a biblioteca padrão da indústria, scikit-learn.
+
+Instalação (caso necessário):
 
 Bash
 
-pip install scikit-learn
-Passo 2: Modificar PretrainingTrainer._run_epoch para Calcular as Métricas
-Precisamos que esta função colete todas as previsões e rótulos da tarefa NSP durante uma passagem pelos dados para então calcular as métricas.
+pip install scikit-learn pandas matplotlib seaborn
+Código Completo das Funções Modificadas
+A seguir estão as funções que precisam ser alteradas ou adicionadas. O restante do código (classes do modelo, etc.) permanece o mesmo.
 
-Substitua a função PretrainingTrainer._run_epoch inteira por esta versão:
+1. Novas Funções para Log em CSV
+
+Adicione estas duas novas funções no início do seu script, após as importações.
 
 Python
 
-# Adicione esta importação no topo do seu arquivo
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+import csv
 
-# Dentro da classe PretrainingTrainer:
-def _run_epoch(self, epoch_num, is_training):
-    self.model.train(is_training)
-    dl = self.train_dl if is_training else self.val_dl
-    if not dl: return float('inf'), {} # Retorna um dicionário vazio se não houver dataloader
+# --- MODIFICAÇÃO: Funções para log estruturado em CSV ---
+def setup_csv_logger(csv_path):
+    """Cria o arquivo CSV e escreve o cabeçalho se o arquivo não existir."""
+    header = [
+        "timestamp", "global_epoch", "shard_num", "avg_loss", 
+        "nsp_accuracy", "nsp_precision", "nsp_recall", "nsp_f1"
+    ]
+    if not csv_path.exists():
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
 
-    total_loss_ep, tot_nsp_ok, tot_nsp_el = 0.0, 0, 0
-    
-    # --- NOVA MÉTRICA: Listas para coletar previsões e rótulos ---
-    all_nsp_labels = []
-    all_nsp_preds = []
-    total_tokens = 0
-    # -----------------------------------------------------------
+def log_metrics_to_csv(csv_path, metrics_dict):
+    """Adiciona uma nova linha de métricas ao arquivo CSV."""
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=metrics_dict.keys())
+        writer.writerow(metrics_dict)
+2. PretrainingTrainer._run_epoch - Modificada para Calcular Métricas
 
-    mode = "Train" if is_training else "Val"
-    desc = f"Epoch {epoch_num+1} [{mode}]"
-    data_iter = tqdm(dl, desc=desc, file=sys.stdout)
+Esta função agora irá coletar todas as predições e rótulos do shard para calcular as métricas de classificação no final.
 
-    for i_batch, data in enumerate(data_iter):
-        data = {k: v.to(self.dev) for k, v in data.items()}
+Python
+
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+class PretrainingTrainer:
+    # ... (o __init__ permanece o mesmo) ...
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl: return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
         
-        with torch.set_grad_enabled(is_training):
+        total_loss_ep = 0.0
+        # --- MODIFICAÇÃO: Listas para agregar rótulos e predições ---
+        all_labels, all_preds = [], []
+        
+        mode = "Train" if is_training else "Val"
+        desc = f"Epoch {epoch_num+1} [{mode}]"
+        data_iter = tqdm(dl, desc=desc, file=sys.stdout)
+
+        for i_batch, data in enumerate(data_iter):
+            data = {k: v.to(self.dev) for k, v in data.items()}
             nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
             loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
             loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
             loss = loss_nsp + loss_mlm
 
-        if is_training:
-            self.opt_schedule.zero_grad()
-            loss.backward()
-            self.opt_schedule.step_and_update_lr()
-        
-        total_loss_ep += loss.item()
-        
-        # --- NOVA MÉTRICA: Coletando dados para F1, Precisão, etc. ---
-        nsp_preds = nsp_out.argmax(dim=-1)
-        all_nsp_labels.extend(data["is_next"].cpu().numpy())
-        all_nsp_preds.extend(nsp_preds.cpu().numpy())
-        total_tokens += data["attention_mask"].sum().item() # Conta tokens não-padding
-        # ----------------------------------------------------------
+            if is_training:
+                self.opt_schedule.zero_grad()
+                loss.backward()
+                self.opt_schedule.step_and_update_lr()
+            
+            total_loss_ep += loss.item()
+            
+            # --- MODIFICAÇÃO: Coletar dados para cálculo de métricas ---
+            nsp_preds = nsp_out.argmax(dim=-1)
+            all_labels.extend(data["is_next"].cpu().numpy())
+            all_preds.extend(nsp_preds.cpu().numpy())
 
-        if (i_batch + 1) % self.log_freq == 0:
-            # Acurácia parcial para o TQDM
-            partial_acc = (torch.tensor(all_nsp_preds) == torch.tensor(all_nsp_labels)).float().mean().item()
-            lr = self.opt_schedule._optimizer.param_groups[0]['lr']
-            data_iter.set_postfix({"L":f"{total_loss_ep/(i_batch+1):.3f}", "NSP_Acc":f"{partial_acc*100:.2f}%", "LR":f"{lr:.2e}"})
-    
-    avg_total_l = total_loss_ep / len(dl) if len(dl) > 0 else 0
-    
-    # --- NOVA MÉTRICA: Calculando e retornando o dicionário de métricas ---
-    metrics = {}
-    if all_nsp_labels:
+            # O reporting por batch é muito volátil, mas podemos mostrar a acurácia do batch
+            if (i_batch + 1) % self.log_freq == 0:
+                batch_acc = accuracy_score(
+                    data["is_next"].cpu().numpy(), 
+                    nsp_preds.cpu().numpy()
+                )
+                lr = self.opt_schedule._optimizer.param_groups[0]['lr']
+                data_iter.set_postfix({"L":f"{loss.item():.3f}", "Batch_Acc":f"{batch_acc*100:.2f}%", "LR":f"{lr:.2e}"})
+        
+        # --- MODIFICAÇÃO: Calcular métricas agregadas para o shard/época inteiro ---
+        avg_total_l = total_loss_ep / len(dl) if len(dl) > 0 else 0
+        
+        # Usamos o scikit-learn para as métricas finais
+        # 'pos_label=1' assume que "IsNext" é a classe positiva
+        # 'zero_division=0' evita erros se não houver exemplos de uma classe
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels, all_preds, average='binary', pos_label=1, zero_division=0
+        )
+        accuracy = accuracy_score(all_labels, all_preds)
+        
         metrics = {
-            "avg_loss": avg_total_l,
-            "accuracy": (torch.tensor(all_nsp_preds) == torch.tensor(all_nsp_labels)).float().mean().item(),
-            "f1_score": f1_score(all_nsp_labels, all_nsp_preds, zero_division=0),
-            "precision": precision_score(all_nsp_labels, all_nsp_preds, zero_division=0),
-            "recall": recall_score(all_nsp_labels, all_nsp_preds, zero_division=0),
-            "confusion_matrix": confusion_matrix(all_nsp_labels, all_nsp_preds).tolist(), # Convertido para lista para logs
-            "total_tokens_in_epoch": total_tokens
+            "loss": avg_total_l,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1
         }
+        
+        self.logger.info(
+            f"{desc} - "
+            f"AvgLoss: {metrics['loss']:.4f}, "
+            f"NSP Acc: {metrics['accuracy']*100:.2f}%, "
+            f"Precision: {metrics['precision']:.3f}, "
+            f"Recall: {metrics['recall']:.3f}, "
+            f"F1-Score: {metrics['f1']:.3f}"
+        )
+        return metrics
 
-    self.logger.info(
-        f"{desc} - "
-        f"AvgLoss: {metrics.get('avg_loss', 0):.4f}, "
-        f"Acc: {metrics.get('accuracy', 0)*100:.2f}%, "
-        f"F1: {metrics.get('f1_score', 0):.3f}, "
-        f"Precision: {metrics.get('precision', 0):.3f}, "
-        f"Recall: {metrics.get('recall', 0):.3f}"
-    )
-    
-    return avg_total_l, metrics
-Passo 3: Modificar PretrainingTrainer.train para Usar as Novas Métricas
-Ajuste a chamada a _run_epoch para lidar com o novo valor de retorno.
-
-Python
-
-# Dentro da classe PretrainingTrainer:
-def train(self, num_epochs):
-    self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
-    best_val_loss = float('inf')
-    final_metrics = {} # Dicionário para guardar as métricas da última época
-    for epoch in range(num_epochs):
-        _, train_metrics = self._run_epoch(epoch, is_training=True)
-        val_loss = float('inf')
-        if self.val_dl:
-            with torch.no_grad():
-                val_loss, val_metrics = self._run_epoch(epoch, is_training=False)
-                final_metrics = val_metrics # Salva as métricas de validação
-        else:
-            final_metrics = train_metrics # Salva as métricas de treino se não houver validação
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-    
-    # Retorna a melhor perda e o dicionário de métricas da última época de validação
-    return best_val_loss, final_metrics
-Passo 4: Modificar run_pretraining_on_shards para Registrar Tudo
-Esta é a função principal que irá acumular as estatísticas globais e escrever os logs para o CSV.
-
-Substitua a função run_pretraining_on_shards inteira por esta versão:
+    def train(self, num_epochs):
+        self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
+        best_val_metrics = {"loss": float('inf')}
+        for epoch in range(num_epochs):
+            self._run_epoch(epoch, is_training=True)
+            val_metrics = {"loss": float('inf')}
+            if self.val_dl:
+                with torch.no_grad():
+                    val_metrics = self._run_epoch(epoch, is_training=False)
+            if val_metrics["loss"] < best_val_metrics["loss"]:
+                best_val_metrics = val_metrics
+        return best_val_metrics
+3. run_pretraining_on_shards() - Orquestrando o Log e o Relatório Final
 
 Python
-
-import csv # Adicione esta importação no topo do seu arquivo
 
 def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
     logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
     
-    # --- NOVA MÉTRICA: Setup do logger CSV e contadores globais ---
-    metrics_csv_path = Path(args.output_dir) / "training_metrics.csv"
-    csv_header = [
-        "global_epoch", "shard_num", "avg_loss", "accuracy", "f1_score", 
-        "precision", "recall", "total_tokens_in_shard"
-    ]
-    if not metrics_csv_path.exists():
-        with open(metrics_csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(csv_header)
+    # --- MODIFICAÇÃO: Setup do logger CSV ---
+    csv_log_path = Path(args.output_dir) / "training_metrics.csv"
+    setup_csv_logger(csv_log_path)
+    logger.info(f"Métricas detalhadas serão salvas em: {csv_log_path}")
+    
+    # --- MODIFICAÇÃO: Buscar informações dos arquivos para o relatório final ---
+    logger.info("Buscando a lista e metadados dos arquivos de dados...")
+    base_data_path = args.s3_data_path.rstrip('/')
+    glob_data_path = f"{base_data_path}/batch_*.jsonl" if "batch_*.jsonl" not in base_data_path else base_data_path
+    s3 = s3fs.S3FileSystem(); all_files = sorted(s3.glob(glob_data_path))
+    if not all_files: logger.error(f"Nenhum arquivo de dados encontrado em '{glob_data_path}'."); return
+
+    total_bytes = sum(s3.info(f)['Size'] for f in all_files)
+    total_gb = total_bytes / (1024 ** 3)
+    logger.info(f"Encontrados {len(all_files)} arquivos de dados, tamanho total: {total_gb:.2f} GB.")
+    
+    # ... (código para instanciar modelo, otimizador, scheduler e carregar checkpoint) ...
 
     total_sentences_processed = 0
-    total_tokens_processed = 0
-    total_bytes_processed = 0
-    # -------------------------------------------------------------
-
-    logger.info("Buscando a lista completa de arquivos de dados...")
-    base_data_path = args.s3_data_path.rstrip('/')
-    glob_data_path = f"{base_data_path}/batch_*.jsonl" # ... (resto da lógica de encontrar arquivos)
-    # ...
-
-    s3 = s3fs.S3FileSystem(); all_files_master_list = sorted(s3.glob(glob_data_path))
-    if not all_files_master_list: logger.error(f"Nenhum arquivo de dados encontrado."); return
-
-    logger.info(f"Encontrados {len(all_files_master_list)} arquivos de dados.")
-    
-    # --- NOVA MÉTRICA: Obter o tamanho dos arquivos ---
-    file_sizes = {f: s3.info(f)['size'] for f in all_files_master_list}
-    # ----------------------------------------------------
-    
-    model = ArticleBERTLMWithHeads(...) # (argumentos do modelo)
-    optimizer = Adam(...)
-    scheduler = ScheduledOptim(...)
-    
-    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
-    
     # Loop de ÉPOCA GLOBAL
     for epoch_num in range(start_epoch, args.num_global_epochs):
-        # ... (lógica de embaralhar arquivos) ...
-        
-        file_shards = [all_files_master_list[i:i + args.files_per_shard_training] for i in range(0, len(all_files_master_list), args.files_per_shard_training)]
+        # ... (código para embaralhar e criar os file_shards) ...
         
         # Loop INTERNO sobre os shards
         for shard_num in range(start_shard, len(file_shards)):
-            # ... (lógica de carregar o shard e criar DataLoaders) ...
-            sentences_list = # ... carrega sentenças do shard ...
+            # ... (código para carregar o shard e criar DataLoaders) ...
             total_sentences_processed += len(sentences_list)
             
-            # --- NOVA MÉTRICA: Acumular o tamanho dos arquivos processados ---
-            shard_bytes = sum(file_sizes[f] for f in file_list_for_shard)
-            total_bytes_processed += shard_bytes
-            # -------------------------------------------------------------
-            
             trainer = PretrainingTrainer(...)
+            # trainer.train() agora retorna um dicionário de métricas
+            best_metrics_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
             
-            # O método train agora retorna as métricas
-            best_loss_in_shard, last_epoch_metrics = trainer.train(num_epochs=args.epochs_per_shard)
-            
-            # --- NOVA MÉTRICA: Escrever as métricas no CSV ---
-            if last_epoch_metrics:
-                total_tokens_processed += last_epoch_metrics.get("total_tokens_in_epoch", 0)
-                
-                with open(metrics_csv_path, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        epoch_num + 1,
-                        shard_num + 1,
-                        last_epoch_metrics.get('avg_loss', 0),
-                        last_epoch_metrics.get('accuracy', 0),
-                        last_epoch_metrics.get('f1_score', 0),
-                        last_epoch_metrics.get('precision', 0),
-                        last_epoch_metrics.get('recall', 0),
-                        last_epoch_metrics.get('total_tokens_in_epoch', 0),
-                    ])
-            # ---------------------------------------------------
+            # --- MODIFICAÇÃO: Logar métricas no CSV ---
+            log_entry = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "global_epoch": epoch_num + 1,
+                "shard_num": shard_num + 1,
+                "avg_loss": best_metrics_in_shard.get("loss"),
+                "nsp_accuracy": best_metrics_in_shard.get("accuracy"),
+                "nsp_precision": best_metrics_in_shard.get("precision"),
+                "nsp_recall": best_metrics_in_shard.get("recall"),
+                "nsp_f1": best_metrics_in_shard.get("f1")
+            }
+            log_metrics_to_csv(csv_log_path, log_entry)
 
-            save_checkpoint(...) # (chamada para salvar o checkpoint)
-
+            # Salva o checkpoint
+            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard['loss'])
+        
         start_shard = 0
 
-    # --- NOVA MÉTRICA: Log de Resumo Final ---
-    logger.info("--- RESUMO FINAL DO TREINAMENTO ---")
-    logger.info(f"Total de Documentos (sentenças) processados: {total_sentences_processed:,}")
-    logger.info(f"Total de Tokens processados: {int(total_tokens_processed):,}")
-    # Converte bytes para GB
-    total_gb_processed = total_bytes_processed / (1024 ** 3)
-    logger.info(f"Tamanho Total (GB) dos dados processados: {total_gb_processed:.2f} GB")
-    logger.info(f"Métricas detalhadas salvas em: {metrics_csv_path}")
+    # --- MODIFICAÇÃO: Relatório Final ---
+    logger.info("--- RELATÓRIO FINAL DE TREINAMENTO ---")
+    logger.info(f"Total de Épocas Globais Concluídas: {args.num_global_epochs}")
+    logger.info(f"Total de Arquivos Processados: {len(all_files)}")
+    # Como cada época reprocessa os arquivos, multiplicamos pelo número de épocas
+    logger.info(f"Total de Documentos/Sentenças Vistos pelo Modelo: {total_sentences_processed * args.num_global_epochs}")
+    # Estimativa de tokens (assumindo uma média, ajuste se souber um valor melhor)
+    avg_tokens_per_sent = 25 
+    total_tokens_estimate = total_sentences_processed * args.num_global_epochs * avg_tokens_per_sent
+    logger.info(f"Estimativa de Tokens Vistos: ~{total_tokens_estimate / 1e9:.2f} bilhões")
+    logger.info(f"Tamanho Total dos Dados (GB): {total_gb:.2f} GB")
     logger.info("------------------------------------")
-Passo 5: Como Gerar Gráficos
-Com o arquivo training_metrics.csv sendo gerado, criar gráficos se torna muito fácil usando pandas e matplotlib.
 
-Instale as dependências:
+///// /////// /////// ////// //////   //////   ///////  ///////   ///////    //////
+Como Utilizar os Dados para Gerar Gráficos
+O arquivo training_metrics.csv que agora é gerado é a sua fonte de dados para qualquer tipo de visualização. Aqui está um exemplo de script Python que você pode rodar após o treinamento para visualizar os resultados.
 
-Bash
-
-pip install pandas matplotlib
-Crie um script de visualização (plot_metrics.py):
+Arquivo plot_results.py:
 
 Python
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import argparse
+import seaborn as sns
 
-def plot_training_metrics(csv_path):
-    """
-    Lê o arquivo CSV de métricas e gera gráficos de progresso.
-    """
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        print(f"Erro: Arquivo não encontrado em '{csv_path}'")
-        return
+# Caminho para o seu arquivo de log CSV
+METRICS_FILE = './bert_outputs/training_metrics.csv'
 
-    # Cria uma coluna de 'passo global' para o eixo X
-    df['global_step'] = df.index
+# Carrega os dados com o pandas
+try:
+    df = pd.read_csv(METRICS_FILE)
+except FileNotFoundError:
+    print(f"Arquivo não encontrado: {METRICS_FILE}")
+    exit()
 
-    # Configura os plots
-    fig, axs = plt.subplots(3, 1, figsize=(12, 18))
-    fig.suptitle('Progresso do Treinamento do Modelo', fontsize=16)
+# Cria um passo de tempo contínuo (ex: shard global)
+df['global_shard'] = df.index + 1
 
-    # Gráfico 1: Perda (Loss)
-    axs[0].plot(df['global_step'], df['avg_loss'], marker='.', linestyle='-', label='Avg Loss')
-    axs[0].set_title('Perda Média por Shard')
-    axs[0].set_xlabel('Shard de Treinamento')
-    axs[0].set_ylabel('Loss')
-    axs[0].grid(True)
-    axs[0].legend()
+# Configura o estilo dos gráficos
+sns.set_theme(style="whitegrid")
 
-    # Gráfico 2: Acurácia e F1-Score
-    axs[1].plot(df['global_step'], df['accuracy'], marker='.', linestyle='-', label='Accuracy', color='blue')
-    axs[1].plot(df['global_step'], df['f1_score'], marker='.', linestyle='-', label='F1-Score', color='green')
-    axs[1].set_title('Acurácia e F1-Score (NSP) por Shard')
-    axs[1].set_xlabel('Shard de Treinamento')
-    axs[1].set_ylabel('Pontuação')
-    axs[1].grid(True)
-    axs[1].legend()
+# Cria uma figura com múltiplos subplots
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+fig.suptitle('Métricas de Treinamento ao Longo do Tempo', fontsize=16)
 
-    # Gráfico 3: Precisão e Recall
-    axs[2].plot(df['global_step'], df['precision'], marker='.', linestyle='-', label='Precision', color='red')
-    axs[2].plot(df['global_step'], df['recall'], marker='.', linestyle='-', label='Recall', color='purple')
-    axs[2].set_title('Precisão e Recall (NSP) por Shard')
-    axs[2].set_xlabel('Shard de Treinamento')
-    axs[2].set_ylabel('Pontuação')
-    axs[2].grid(True)
-    axs[2].legend()
+# 1. Gráfico de Perda (Loss)
+sns.lineplot(ax=axes[0, 0], data=df, x='global_shard', y='avg_loss', color='r')
+axes[0, 0].set_title('Perda Média (Loss) por Shard')
+axes[0, 0].set_xlabel('Shard Global Processado')
+axes[0, 0].set_ylabel('Loss')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
-    # Salva a figura
-    output_figure_path = 'training_progress.png'
-    plt.savefig(output_figure_path)
-    print(f"Gráfico salvo em: {output_figure_path}")
-    plt.show()
+# 2. Gráfico de Acurácia
+sns.lineplot(ax=axes[0, 1], data=df, x='global_shard', y='nsp_accuracy', color='g')
+axes[0, 1].set_title('Acurácia NSP por Shard')
+axes[0, 1].set_xlabel('Shard Global Processado')
+axes[0, 1].set_ylabel('Acurácia')
+axes[0, 1].set_ylim(0, 1) # Acurácia vai de 0 a 1
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_path", type=str, required=True, help="Caminho para o arquivo training_metrics.csv")
-    args = parser.parse_args()
-    plot_training_metrics(args.csv_path)
-Como usar o script de plotagem:
-Depois que seu treinamento rodar e criar o arquivo training_metrics.csv no seu diretório de output (ex: ./bert_outputs/training_metrics.csv), você pode gerar os gráficos com:
+# 3. Gráfico de F1-Score
+sns.lineplot(ax=axes[1, 0], data=df, x='global_shard', y='nsp_f1', color='b')
+axes[1, 0].set_title('F1-Score NSP por Shard')
+axes[1, 0].set_xlabel('Shard Global Processado')
+axes[1, 0].set_ylabel('F1-Score')
+axes[1, 0].set_ylim(0, 1)
 
-Bash
+# 4. Gráfico de Precisão vs Recall
+sns.lineplot(ax=axes[1, 1], data=df, x='global_shard', y='nsp_precision', label='Precisão')
+sns.lineplot(ax=axes[1, 1], data=df, x='global_shard', y='nsp_recall', label='Recall')
+axes[1, 1].set_title('Precisão vs. Recall NSP por Shard')
+axes[1, 1].set_xlabel('Shard Global Processado')
+axes[1, 1].set_ylabel('Pontuação')
+axes[1, 1].set_ylim(0, 1)
+axes[1, 1].legend()
 
-python plot_metrics.py --csv_path ./bert_outputs/training_metrics.csv
-Isso criará um arquivo training_progress.png com os gráficos do seu treinamento.
+# Ajusta o layout e salva a figura
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig('training_analysis.png')
+
+print("Gráfico 'training_analysis.png' gerado com sucesso.")
+plt.show()
 //////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
 # --- CORREÇÃO: Função de salvar checkpoint usando Boto3 ---
