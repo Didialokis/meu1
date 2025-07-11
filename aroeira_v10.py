@@ -1,3 +1,35 @@
+4
+# Dentro da classe PretrainingTrainer:
+
+def train(self, num_epochs):
+    self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
+    
+    # Inicializamos com um dicionário para manter a consistência
+    best_val_metrics_for_shard = {"loss": float('inf')}
+
+    for epoch in range(num_epochs):
+        # Roda a época de treino (não precisamos do retorno aqui)
+        self._run_epoch(epoch, is_training=True)
+        
+        # Define um valor padrão para as métricas de validação
+        current_val_metrics = {"loss": float('inf')}
+        
+        if self.val_dl:
+            with torch.no_grad():
+                # --- CORREÇÃO AQUI ---
+                # A função agora retorna um único dicionário
+                current_val_metrics = self._run_epoch(epoch, is_training=False)
+        
+        # Compara a perda (loss) do dicionário atual com a melhor perda registrada
+        if current_val_metrics["loss"] < best_val_metrics_for_shard["loss"]:
+            best_val_metrics_for_shard = current_val_metrics
+            self.logger.info(f"Nova melhor perda de validação neste shard: {best_val_metrics_for_shard['loss']:.4f}")
+
+    # Retorna o dicionário completo com as melhores métricas encontradas neste shard
+    return best_val_metrics_for_shard
+
+
+//////////////////////////////////
 Com certeza. Esta é uma excelente adição para transformar o script de um simples executor para uma ferramenta de experimentação séria, onde você pode monitorar a performance e visualizar os resultados.
 
 Vamos dividir a sua solicitação em três partes e implementar cada uma delas:
