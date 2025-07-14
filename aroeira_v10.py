@@ -1,277 +1,187 @@
-Com certeza. Esta é uma excelente adição para transformar o script de um simples executor para uma ferramenta de experimentação séria, onde você pode monitorar a performance e visualizar os resultados.
+Excelente pedido. Ter um histórico de checkpoints por época é uma prática muito valiosa, pois permite que você volte para um "estado dourado" do modelo, e não apenas para o último ponto de salvamento.
 
-Vamos dividir a sua solicitação em três partes e implementar cada uma delas:
+A solução ideal é implementar um sistema de dois níveis:
 
-Métricas de Classificação por Shard: Adicionar o cálculo de Acurácia, Precisão, Recall (TPR) e F1-Score para a tarefa de Next Sentence Prediction (NSP) a cada shard processado.
+Checkpoint de Resumo (latest_checkpoint.pth): Continuará a ser salvo ao final de cada shard. Sua única função é a recuperação de desastres, garantindo que você nunca perca mais do que o progresso de um shard se o processo for interrompido. Ele será constantemente sobrescrito.
 
-Log Estruturado para Gráficos: Salvar essas métricas em um arquivo CSV a cada shard, para que possam ser facilmente lidas e plotadas posteriormente.
+Snapshot de Época (epoch_01_checkpoint.pth, etc.): Um novo arquivo, nomeado com o número da época, que será salvo apenas no final de cada época global completa. Estes arquivos nunca serão sobrescritos, criando o seu histórico de versões.
 
-Relatório Final de Treinamento: Calcular e exibir um resumo no final de todo o processo, com o total de documentos, tamanho dos dados e uma estimativa de tokens.
+A boa notícia é que podemos implementar isso com poucas alterações, principalmente na função save_checkpoint e na forma como a chamamos.
 
-Para o cálculo das métricas, usaremos a biblioteca padrão da indústria, scikit-learn.
-
-Instalação (caso necessário):
-
-Bash
-
-pip install scikit-learn pandas matplotlib seaborn
 Código Completo das Funções Modificadas
-A seguir estão as funções que precisam ser alteradas ou adicionadas. O restante do código (classes do modelo, etc.) permanece o mesmo.
+Apenas as funções parse_args, save_checkpoint e run_pretraining_on_shards precisam de alterações. A função load_checkpoint não precisa mudar, pois ela sempre deve resumir a partir do latest_checkpoint.pth.
 
-1. Novas Funções para Log em CSV
+1. parse_args() - Adicionando um Argumento para Controlar o Novo Comportamento
 
-Adicione estas duas novas funções no início do seu script, após as importações.
-
-Python
-
-import csv
-
-# --- MODIFICAÇÃO: Funções para log estruturado em CSV ---
-def setup_csv_logger(csv_path):
-    """Cria o arquivo CSV e escreve o cabeçalho se o arquivo não existir."""
-    header = [
-        "timestamp", "global_epoch", "shard_num", "avg_loss", 
-        "nsp_accuracy", "nsp_precision", "nsp_recall", "nsp_f1"
-    ]
-    if not csv_path.exists():
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-
-def log_metrics_to_csv(csv_path, metrics_dict):
-    """Adiciona uma nova linha de métricas ao arquivo CSV."""
-    with open(csv_path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics_dict.keys())
-        writer.writerow(metrics_dict)
-2. PretrainingTrainer._run_epoch - Modificada para Calcular Métricas
-
-Esta função agora irá coletar todas as predições e rótulos do shard para calcular as métricas de classificação no final.
+Vamos adicionar uma flag para que você possa ligar ou desligar o salvamento dos snapshots de época.
 
 Python
 
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+def parse_args():
+    parser = argparse.ArgumentParser(description="Script de Pré-treino BERT com Shards e Checkpoints Versionados por Época.")
+    
+    # ... (todos os argumentos anteriores) ...
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Diretório para salvar checkpoints.")
 
-class PretrainingTrainer:
-    # ... (o __init__ permanece o mesmo) ...
+    # --- MODIFICAÇÃO: Argumento para controlar os snapshots de época ---
+    parser.add_argument("--save_epoch_checkpoints", action='store_true',
+                        help="Se especificado, salva um checkpoint separado no final de cada época global.")
 
-    def _run_epoch(self, epoch_num, is_training):
-        self.model.train(is_training)
-        dl = self.train_dl if is_training else self.val_dl
-        if not dl: return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
-        
-        total_loss_ep = 0.0
-        # --- MODIFICAÇÃO: Listas para agregar rótulos e predições ---
-        all_labels, all_preds = [], []
-        
-        mode = "Train" if is_training else "Val"
-        desc = f"Epoch {epoch_num+1} [{mode}]"
-        data_iter = tqdm(dl, desc=desc, file=sys.stdout)
+    # ... (resto dos argumentos) ...
+    
+    args = parser.parse_args()
+    if args.device is None:
+        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    return args
+Nota: action='store_true' cria uma flag booleana. Se você incluir --save_epoch_checkpoints no seu comando, o valor será True. Se não incluir, será False.
 
-        for i_batch, data in enumerate(data_iter):
-            data = {k: v.to(self.dev) for k, v in data.items()}
-            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
-            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
-            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
-            loss = loss_nsp + loss_mlm
+2. save_checkpoint() - Modificada para Salvar Snapshots de Época
 
-            if is_training:
-                self.opt_schedule.zero_grad()
-                loss.backward()
-                self.opt_schedule.step_and_update_lr()
-            
-            total_loss_ep += loss.item()
-            
-            # --- MODIFICAÇÃO: Coletar dados para cálculo de métricas ---
-            nsp_preds = nsp_out.argmax(dim=-1)
-            all_labels.extend(data["is_next"].cpu().numpy())
-            all_preds.extend(nsp_preds.cpu().numpy())
+A função agora terá um parâmetro extra, save_epoch_snapshot, para decidir se deve ou não criar o arquivo de versão da época.
 
-            # O reporting por batch é muito volátil, mas podemos mostrar a acurácia do batch
-            if (i_batch + 1) % self.log_freq == 0:
-                batch_acc = accuracy_score(
-                    data["is_next"].cpu().numpy(), 
-                    nsp_preds.cpu().numpy()
-                )
-                lr = self.opt_schedule._optimizer.param_groups[0]['lr']
-                data_iter.set_postfix({"L":f"{loss.item():.3f}", "Batch_Acc":f"{batch_acc*100:.2f}%", "LR":f"{lr:.2e}"})
-        
-        # --- MODIFICAÇÃO: Calcular métricas agregadas para o shard/época inteiro ---
-        avg_total_l = total_loss_ep / len(dl) if len(dl) > 0 else 0
-        
-        # Usamos o scikit-learn para as métricas finais
-        # 'pos_label=1' assume que "IsNext" é a classe positiva
-        # 'zero_division=0' evita erros se não houver exemplos de uma classe
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels, all_preds, average='binary', pos_label=1, zero_division=0
-        )
-        accuracy = accuracy_score(all_labels, all_preds)
-        
-        metrics = {
-            "loss": avg_total_l,
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
-        }
-        
-        self.logger.info(
-            f"{desc} - "
-            f"AvgLoss: {metrics['loss']:.4f}, "
-            f"NSP Acc: {metrics['accuracy']*100:.2f}%, "
-            f"Precision: {metrics['precision']:.3f}, "
-            f"Recall: {metrics['recall']:.3f}, "
-            f"F1-Score: {metrics['f1']:.3f}"
-        )
-        return metrics
+Python
 
-    def train(self, num_epochs):
-        self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
-        best_val_metrics = {"loss": float('inf')}
-        for epoch in range(num_epochs):
-            self._run_epoch(epoch, is_training=True)
-            val_metrics = {"loss": float('inf')}
-            if self.val_dl:
-                with torch.no_grad():
-                    val_metrics = self._run_epoch(epoch, is_training=False)
-            if val_metrics["loss"] < best_val_metrics["loss"]:
-                best_val_metrics = val_metrics
-        return best_val_metrics
-3. run_pretraining_on_shards() - Orquestrando o Log e o Relatório Final
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
+    """
+    Salva um checkpoint. Sempre salva 'latest_checkpoint.pth'.
+    Opcionalmente, salva um snapshot versionado da época.
+    """
+    checkpoint_dir_str = args.checkpoint_dir
+    is_s3 = checkpoint_dir_str.startswith("s3://")
+    s3 = s3fs.S3FileSystem() if is_s3 else None
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+    }
+
+    # 1. Salva o estado em um buffer na memória
+    buffer = io.BytesIO()
+    torch.save(state, buffer)
+
+    # 2. Sempre salva/sobrescreve o 'latest_checkpoint.pth' para resumo
+    buffer.seek(0) # Rebobina o buffer para o início
+    if is_s3:
+        latest_path = f"{checkpoint_dir_str.rstrip('/')}/latest_checkpoint.pth"
+        with s3.open(latest_path, 'wb') as f:
+            f.write(buffer.read())
+    else:
+        latest_path = Path(checkpoint_dir_str) / "latest_checkpoint.pth"
+        with open(latest_path, 'wb') as f:
+            f.write(buffer.read())
+    logging.info(f"Checkpoint de resumo salvo em: {latest_path}")
+
+    # --- MODIFICAÇÃO: Lógica para salvar o snapshot da época ---
+    # 3. Se solicitado, salva um novo arquivo de checkpoint para a época
+    if save_epoch_snapshot:
+        buffer.seek(0) # Rebobina o buffer novamente
+        epoch_filename = f"epoch_{global_epoch + 1:02d}_checkpoint.pth"
+        
+        if is_s3:
+            epoch_path = f"{checkpoint_dir_str.rstrip('/')}/{epoch_filename}"
+            with s3.open(epoch_path, 'wb') as f:
+                f.write(buffer.read())
+        else:
+            epoch_path = Path(checkpoint_dir_str) / epoch_filename
+            with open(epoch_path, 'wb') as f:
+                f.write(buffer.read())
+        logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo em: {epoch_path} ***")
+
+    # A lógica para salvar o melhor modelo continua a mesma...
+    if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
+        # ... (código para salvar best_model.pth)
+3. run_pretraining_on_shards() - Orquestrando Quando Salvar
+
+Esta função agora decide quando passar o sinalizador save_epoch_snapshot=True para a função save_checkpoint.
 
 Python
 
 def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
     logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
     
-    # --- MODIFICAÇÃO: Setup do logger CSV ---
-    csv_log_path = Path(args.output_dir) / "training_metrics.csv"
-    setup_csv_logger(csv_log_path)
-    logger.info(f"Métricas detalhadas serão salvas em: {csv_log_path}")
+    # ... (código para buscar a lista de arquivos `all_files_master_list`) ...
     
-    # --- MODIFICAÇÃO: Buscar informações dos arquivos para o relatório final ---
-    logger.info("Buscando a lista e metadados dos arquivos de dados...")
-    base_data_path = args.s3_data_path.rstrip('/')
-    glob_data_path = f"{base_data_path}/batch_*.jsonl" if "batch_*.jsonl" not in base_data_path else base_data_path
-    s3 = s3fs.S3FileSystem(); all_files = sorted(s3.glob(glob_data_path))
-    if not all_files: logger.error(f"Nenhum arquivo de dados encontrado em '{glob_data_path}'."); return
-
-    total_bytes = sum(s3.info(f)['Size'] for f in all_files)
-    total_gb = total_bytes / (1024 ** 3)
-    logger.info(f"Encontrados {len(all_files)} arquivos de dados, tamanho total: {total_gb:.2f} GB.")
+    # Instancia modelo e otimizadores fora do loop
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
     
-    # ... (código para instanciar modelo, otimizador, scheduler e carregar checkpoint) ...
-
-    total_sentences_processed = 0
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
     # Loop de ÉPOCA GLOBAL
     for epoch_num in range(start_epoch, args.num_global_epochs):
-        # ... (código para embaralhar e criar os file_shards) ...
+        logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
+        
+        current_files = list(all_files_master_list)
+        if start_shard == 0:
+            random.shuffle(current_files)
+            logger.info("Ordem dos arquivos de dados foi embaralhada para esta época.")
+        
+        file_shards = [current_files[i:i + args.files_per_shard_training] for i in range(0, len(current_files), args.files_per_shard_training)]
         
         # Loop INTERNO sobre os shards
         for shard_num in range(start_shard, len(file_shards)):
             # ... (código para carregar o shard e criar DataLoaders) ...
-            total_sentences_processed += len(sentences_list)
             
             trainer = PretrainingTrainer(...)
-            # trainer.train() agora retorna um dicionário de métricas
-            best_metrics_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
             
-            # --- MODIFICAÇÃO: Logar métricas no CSV ---
-            log_entry = {
-                "timestamp": datetime.datetime.now().isoformat(),
-                "global_epoch": epoch_num + 1,
-                "shard_num": shard_num + 1,
-                "avg_loss": best_metrics_in_shard.get("loss"),
-                "nsp_accuracy": best_metrics_in_shard.get("accuracy"),
-                "nsp_precision": best_metrics_in_shard.get("precision"),
-                "nsp_recall": best_metrics_in_shard.get("recall"),
-                "nsp_f1": best_metrics_in_shard.get("f1")
-            }
-            log_metrics_to_csv(csv_log_path, log_entry)
+            # --- MODIFICAÇÃO: Lógica de chamada do save_checkpoint ---
+            # Verifica se este é o último shard da época atual
+            is_last_shard_of_epoch = (shard_num == len(file_shards) - 1)
+            
+            # Decide se o snapshot da época deve ser salvo
+            should_save_epoch_snapshot = is_last_shard_of_epoch and args.save_epoch_checkpoints
 
-            # Salva o checkpoint
-            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard['loss'])
-        
+            # Salva o checkpoint, passando a flag para o snapshot
+            save_checkpoint(
+                args,
+                global_epoch=epoch_num,
+                shard_num=shard_num,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_loss=best_loss_in_shard,
+                save_epoch_snapshot=should_save_epoch_snapshot
+            )
+            # --------------------------------------------------------
+
+        # Reseta o start_shard para 0 para a próxima época global
         start_shard = 0
 
-    # --- MODIFICAÇÃO: Relatório Final ---
-    logger.info("--- RELATÓRIO FINAL DE TREINAMENTO ---")
-    logger.info(f"Total de Épocas Globais Concluídas: {args.num_global_epochs}")
-    logger.info(f"Total de Arquivos Processados: {len(all_files)}")
-    # Como cada época reprocessa os arquivos, multiplicamos pelo número de épocas
-    logger.info(f"Total de Documentos/Sentenças Vistos pelo Modelo: {total_sentences_processed * args.num_global_epochs}")
-    # Estimativa de tokens (assumindo uma média, ajuste se souber um valor melhor)
-    avg_tokens_per_sent = 25 
-    total_tokens_estimate = total_sentences_processed * args.num_global_epochs * avg_tokens_per_sent
-    logger.info(f"Estimativa de Tokens Vistos: ~{total_tokens_estimate / 1e9:.2f} bilhões")
-    logger.info(f"Tamanho Total dos Dados (GB): {total_gb:.2f} GB")
-    logger.info("------------------------------------")
-Como Utilizar os Dados para Gerar Gráficos
-O arquivo training_metrics.csv que agora é gerado é a sua fonte de dados para qualquer tipo de visualização. Aqui está um exemplo de script Python que você pode rodar após o treinamento para visualizar os resultados.
+    logger.info(f"--- {args.num_global_epochs} ÉPOCAS GLOBAIS CONCLUÍDAS ---")
+Como Funciona na Prática
+Agora, ao rodar seu script com o novo argumento:
 
-Arquivo plot_results.py:
+Bash
 
-Python
+python train_bert_sharded.py \
+    --s3_data_path "s3://seu-bucket/dados/" \
+    --num_global_epochs 3 \
+    --files_per_shard_training 10 \
+    --save_epoch_checkpoints
+O conteúdo do seu diretório de checkpoints (--checkpoint_dir) será:
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+Durante o treinamento: latest_checkpoint.pth será constantemente atualizado a cada 10 arquivos processados.
 
-# Caminho para o seu arquivo de log CSV
-METRICS_FILE = './bert_outputs/training_metrics.csv'
+Ao final da Época 1: Um novo arquivo epoch_01_checkpoint.pth será criado e não será mais tocado. O latest_checkpoint.pth continuará a ser atualizado.
 
-# Carrega os dados com o pandas
-try:
-    df = pd.read_csv(METRICS_FILE)
-except FileNotFoundError:
-    print(f"Arquivo não encontrado: {METRICS_FILE}")
-    exit()
+Ao final da Época 2: Um novo arquivo epoch_02_checkpoint.pth será criado.
 
-# Cria um passo de tempo contínuo (ex: shard global)
-df['global_shard'] = df.index + 1
+Ao final da Época 3: Um novo arquivo epoch_03_checkpoint.pth será criado.
 
-# Configura o estilo dos gráficos
-sns.set_theme(style="whitegrid")
 
-# Cria uma figura com múltiplos subplots
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-fig.suptitle('Métricas de Treinamento ao Longo do Tempo', fontsize=16)
+Se o processo parar na Época 2, Shard 5, o latest_checkpoint.pth terá o estado exato daquele ponto. Ao reiniciar, o load_checkpoint lerá este arquivo e o treinamento continuará do Shard 6 da Época 2, preservando seu histórico intacto dos arquivos epoch_01_checkpoint.pth.
 
-# 1. Gráfico de Perda (Loss)
-sns.lineplot(ax=axes[0, 0], data=df, x='global_shard', y='avg_loss', color='r')
-axes[0, 0].set_title('Perda Média (Loss) por Shard')
-axes[0, 0].set_xlabel('Shard Global Processado')
-axes[0, 0].set_ylabel('Loss')
-
-# 2. Gráfico de Acurácia
-sns.lineplot(ax=axes[0, 1], data=df, x='global_shard', y='nsp_accuracy', color='g')
-axes[0, 1].set_title('Acurácia NSP por Shard')
-axes[0, 1].set_xlabel('Shard Global Processado')
-axes[0, 1].set_ylabel('Acurácia')
-axes[0, 1].set_ylim(0, 1) # Acurácia vai de 0 a 1
-
-# 3. Gráfico de F1-Score
-sns.lineplot(ax=axes[1, 0], data=df, x='global_shard', y='nsp_f1', color='b')
-axes[1, 0].set_title('F1-Score NSP por Shard')
-axes[1, 0].set_xlabel('Shard Global Processado')
-axes[1, 0].set_ylabel('F1-Score')
-axes[1, 0].set_ylim(0, 1)
-
-# 4. Gráfico de Precisão vs Recall
-sns.lineplot(ax=axes[1, 1], data=df, x='global_shard', y='nsp_precision', label='Precisão')
-sns.lineplot(ax=axes[1, 1], data=df, x='global_shard', y='nsp_recall', label='Recall')
-axes[1, 1].set_title('Precisão vs. Recall NSP por Shard')
-axes[1, 1].set_xlabel('Shard Global Processado')
-axes[1, 1].set_ylabel('Pontuação')
-axes[1, 1].set_ylim(0, 1)
-axes[1, 1].legend()
-
-# Ajusta o layout e salva a figura
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.savefig('training_analysis.png')
-
-print("Gráfico 'training_analysis.png' gerado com sucesso.")
-plt.show()
 //////////////////////////////////////////////////////////////
+///
+///
 ////////////////////////////////////////////////////////////////////////
 # --- CORREÇÃO: Função de salvar checkpoint usando Boto3 ---
 # --- CORREÇÃO FINAL: Função de salvar checkpoint usando Boto3 ---
