@@ -1,52 +1,3 @@
-            is_last_shard_of_epoch = (shard_num == len(file_shards) - 1)
-            should_save_epoch_snapshot = is_last_shard_of_epoch and args.save_epoch_checkpoints
-
-            # --- CORREÇÃO: Passar apenas o valor float da perda para a função de checkpoint ---
-            save_checkpoint(
-                args,
-                global_epoch=epoch_num,
-                shard_num=shard_num,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                best_val_loss=best_metrics_in_shard['loss'], # <-- AQUI ESTÁ A CORREÇÃO
-                save_epoch_snapshot=should_save_epoch_snapshot
-            )
-
-
-
-/////////////////////////////////////////////////////////////////4
-# Dentro da classe PretrainingTrainer:
-
-def train(self, num_epochs):
-    self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
-    
-    # Inicializamos com um dicionário para manter a consistência
-    best_val_metrics_for_shard = {"loss": float('inf')}
-
-    for epoch in range(num_epochs):
-        # Roda a época de treino (não precisamos do retorno aqui)
-        self._run_epoch(epoch, is_training=True)
-        
-        # Define um valor padrão para as métricas de validação
-        current_val_metrics = {"loss": float('inf')}
-        
-        if self.val_dl:
-            with torch.no_grad():
-                # --- CORREÇÃO AQUI ---
-                # A função agora retorna um único dicionário
-                current_val_metrics = self._run_epoch(epoch, is_training=False)
-        
-        # Compara a perda (loss) do dicionário atual com a melhor perda registrada
-        if current_val_metrics["loss"] < best_val_metrics_for_shard["loss"]:
-            best_val_metrics_for_shard = current_val_metrics
-            self.logger.info(f"Nova melhor perda de validação neste shard: {best_val_metrics_for_shard['loss']:.4f}")
-
-    # Retorna o dicionário completo com as melhores métricas encontradas neste shard
-    return best_val_metrics_for_shard
-
-
-//////////////////////////////////
 Com certeza. Esta é uma excelente adição para transformar o script de um simples executor para uma ferramenta de experimentação séria, onde você pode monitorar a performance e visualizar os resultados.
 
 Vamos dividir a sua solicitação em três partes e implementar cada uma delas:
@@ -254,8 +205,6 @@ def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
     logger.info(f"Estimativa de Tokens Vistos: ~{total_tokens_estimate / 1e9:.2f} bilhões")
     logger.info(f"Tamanho Total dos Dados (GB): {total_gb:.2f} GB")
     logger.info("------------------------------------")
-
-///// /////// /////// ////// //////   //////   ///////  ///////   ///////    //////
 Como Utilizar os Dados para Gerar Gráficos
 O arquivo training_metrics.csv que agora é gerado é a sua fonte de dados para qualquer tipo de visualização. Aqui está um exemplo de script Python que você pode rodar após o treinamento para visualizar os resultados.
 
