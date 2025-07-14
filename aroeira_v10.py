@@ -1,4 +1,21 @@
-4
+            is_last_shard_of_epoch = (shard_num == len(file_shards) - 1)
+            should_save_epoch_snapshot = is_last_shard_of_epoch and args.save_epoch_checkpoints
+
+            # --- CORREÇÃO: Passar apenas o valor float da perda para a função de checkpoint ---
+            save_checkpoint(
+                args,
+                global_epoch=epoch_num,
+                shard_num=shard_num,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_loss=best_metrics_in_shard['loss'], # <-- AQUI ESTÁ A CORREÇÃO
+                save_epoch_snapshot=should_save_epoch_snapshot
+            )
+
+
+
+/////////////////////////////////////////////////////////////////4
 # Dentro da classe PretrainingTrainer:
 
 def train(self, num_epochs):
