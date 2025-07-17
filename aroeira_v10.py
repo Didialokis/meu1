@@ -1,65 +1,206 @@
-import s3fs
-import os
+Passo 2: Modificações no Código Python
+Agora, vamos alterar o script train_standalone_bert.py. As mudanças são focadas em entregar o controle dos objetos (modelo, otimizador, dataloaders) para o accelerate.
 
-# --- 1. CONFIGURAÇÃO DO USUÁRIO ---
-# Substitua pelo caminho do DIRETÓRIO no S3 onde seus arquivos de lote estão.
-# Exemplo: "s3://meu-bucket/meus-dados/treinamento/"
-S3_DIRECTORY_PATH = "s3://itau-self-wkp-sa-east-1-250346683169/leixdie_treinamento_bert/output/checkpoints/"
-# ---------------------------------
+1. Importar e Inicializar o Accelerator
 
+A primeira mudança é na função main.
 
-def find_s3_files(s3_path):
-    """
-    Lista os arquivos em um diretório S3 que correspondem ao padrão 'batch_*.jsonl'.
-    """
-    # Constrói o padrão glob para encontrar todos os arquivos batch.jsonl
-    # O rstrip('/') garante que funcione com ou sem a barra no final do caminho
-    base_path = s3_path.rstrip('/')
-    glob_pattern = f"{base_path}/batch_*.jsonl"
+Python
+
+from accelerate import Accelerator # Adicione esta importação no topo
+
+def main():
+    # --- MODIFICAÇÃO: Inicializar o Accelerator no início ---
+    accelerator = Accelerator()
+
+    ARGS = parse_args()
     
-    print(f"Buscando arquivos no S3 com o padrão: {glob_pattern}\n")
+    # ... (código de criar diretórios) ...
+    log_file = Path(ARGS.output_dir) / f'training_log.log'
+    
+    # Apenas o processo principal deve configurar e escrever nos arquivos de log
+    if accelerator.is_main_process:
+        setup_logging(ARGS.log_level, str(log_file))
+    
+    logger = logging.getLogger(__name__)
 
-    try:
-        # Inicializa o sistema de arquivos S3
-        s3 = s3fs.S3FileSystem()
+    # --- MODIFICAÇÃO: O dispositivo é gerenciado pelo Accelerator ---
+    ARGS.device = accelerator.device
+    
+    if accelerator.is_main_process:
+        logger.info(f"Processo rodando sob controle do Accelerate em dispositivo: {ARGS.device}")
+        # ... (código de log das configurações) ...
+    
+    # Passa o accelerator para as funções principais
+    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger, accelerator) # <-- Passa o accelerator
+    
+    if accelerator.is_main_process:
+        logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
 
-        # Usa o glob para encontrar os arquivos. `refresh=True` força uma nova busca.
-        file_list = s3.glob(glob_pattern, refresh=True)
+2. PretrainingTrainer - Adaptado para o Accelerator
+
+A classe Trainer precisa ser levemente modificada para usar os métodos do accelerate.
+
+Python
+
+class PretrainingTrainer:
+    # --- MODIFICAÇÃO: Recebe o accelerator no __init__ ---
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator # Armazena o accelerator
         
-        # s3.glob retorna caminhos no formato 'bucket/key', vamos adicionar o protocolo
-        full_file_list = [f"s3://{f}" for f in file_list]
+        # O modelo, dataloaders e otimizador já virão "preparados" pelo accelerator
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule
+        
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
 
-        # Ordena a lista para garantir uma exibição lógica (batch_0, batch_1, ...)
-        sorted_files = sorted(full_file_list)
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl: return {"loss": float('inf'), "accuracy": 0}
+        
+        # --- MODIFICAÇÃO: Apenas o processo principal mostra a barra de progresso ---
+        data_iter = dl
+        if self.accelerator.is_main_process:
+            desc = f"Epoch {epoch_num+1} [{'Train' if is_training else 'Val'}]"
+            data_iter = tqdm(dl, desc=desc, file=sys.stdout)
 
-        if not sorted_files:
-            print("❌ Nenhum arquivo encontrado.")
-            print("Verifique se:")
-            print("  1. O caminho do diretório está correto.")
-            print("  2. Os arquivos realmente seguem o padrão 'batch_NUMERO.jsonl'.")
-            print("  3. As permissões de acesso ao bucket S3 estão configuradas neste ambiente.")
-        else:
-            print(f"✅ Sucesso! {len(sorted_files)} arquivos foram encontrados.")
-            print("-" * 40)
+        all_labels, all_preds, total_loss_ep = [], [], 0.0
+        for i_batch, data in enumerate(data_iter):
+            # NÃO é mais necessário mover 'data' para o device. O accelerator.prepare(dataloader) já faz isso.
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
 
-            # Mostra uma amostra dos primeiros arquivos
-            print("Amostra dos PRIMEIROS arquivos encontrados:")
-            for f in sorted_files[:10]:
-                print(f"  - {f}")
+            if is_training:
+                self.opt_schedule.zero_grad()
+                # --- MODIFICAÇÃO: Usar o backward do accelerator ---
+                self.accelerator.backward(loss)
+                self.opt_schedule.step_and_update_lr()
+            
+            # Reúne as predições de todos os processos para o cálculo de métricas
+            nsp_preds = nsp_out.argmax(dim=-1)
+            gathered_preds = self.accelerator.gather(nsp_preds)
+            gathered_labels = self.accelerator.gather(data["is_next"])
+            
+            all_labels.extend(gathered_labels.cpu().numpy())
+            all_preds.extend(gathered_preds.cpu().numpy())
+            total_loss_ep += loss.item() * data["bert_input"].size(0)
 
-            # Mostra uma amostra dos últimos arquivos para verificar se a lista está completa
-            if len(sorted_files) > 10:
-                print("\nAmostra dos ÚLTIMOS arquivos encontrados:")
-                for f in sorted_files[-10:]:
-                    print(f"  - {f}")
-            print("-" * 40)
+        # O cálculo de métricas agora é feito apenas no processo principal
+        metrics = {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+        if self.accelerator.is_main_process:
+            avg_total_l = total_loss_ep / len(dl.dataset)
+            precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+            accuracy = accuracy_score(all_labels, all_preds)
+            metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+            self.logger.info(f"Epoch {epoch_num+1} Stats - AvgLoss: {metrics['loss']:.4f}, NSP Acc: {metrics['accuracy']*100:.2f}%, F1: {metrics['f1']:.3f}")
+            
+        return metrics
+    
+    # A função train() permanece a mesma
+    def train(self, num_epochs):
+        # ...
+3. save_checkpoint e load_checkpoint - Adaptados para o Accelerator
 
-    except Exception as e:
-        print(f"❌ Ocorreu um erro ao tentar acessar o S3: {e}")
-        print("\nVerifique se suas credenciais da AWS (chaves de acesso, role) estão configuradas corretamente no ambiente do seu notebook.")
+O accelerate "envolve" seu modelo. Para salvar/carregar o estado corretamente, precisamos "desembrulhá-lo".
 
-# Executa a função de verificação
-find_s3_files(S3_DIRECTORY_PATH)
+Python
+
+def save_checkpoint(args, accelerator, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
+    # --- MODIFICAÇÃO: Apenas o processo principal salva o checkpoint ---
+    if not accelerator.is_main_process:
+        return
+
+    # Desembrulha o modelo para obter o state_dict original
+    unwrapped_model = accelerator.unwrap_model(model)
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        # Salva o estado do modelo desembrulhado
+        'model_state_dict': unwrapped_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+    }
+    # ... (o resto da lógica de salvar em S3/local com boto3 permanece a mesma) ...
+    # ... Lembre-se de salvar o unwrapped_model.state_dict() para o best_model.pth também
+
+def load_checkpoint(args, accelerator, model, optimizer, scheduler):
+    # ... (lógica para encontrar o checkpoint no S3/local com boto3) ...
+    
+    # Desembrulha o modelo antes de carregar o estado
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+    
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    # ... (resto da lógica de carregar o estado) ...
+    return start_epoch, start_shard
+4. run_pretraining_on_shards - O Orquestrador Principal
+
+Esta é a função onde a "mágica" do accelerate.prepare acontece.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger, accelerator):
+    # ... (código para listar arquivos e dividir em shards) ...
+    
+    # Instancia modelo e otimizadores FORA do loop
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(model.parameters(), ...)
+    scheduler = ScheduledOptim(optimizer, ...)
+    
+    # O load_checkpoint precisa do accelerator para desembrulhar o modelo
+    start_epoch, start_shard = load_checkpoint(args, accelerator, model, optimizer, scheduler)
+    
+    # Loop de ÉPOCA GLOBAL
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar os file_shards) ...
+        
+        # Loop INTERNO sobre os shards
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar o train_dataset e val_dataset) ...
+            
+            train_dl = DataLoader(...)
+            val_dl = DataLoader(...) if val_dataset else None
+
+            # --- MODIFICAÇÃO: Entregar tudo para o accelerator.prepare ---
+            # O accelerator irá cuidar de envolver o modelo (ex: DDP), o otimizador e os dataloaders
+            prepared_model, prepared_optimizer, prepared_train_dl, prepared_val_dl = accelerator.prepare(
+                model, optimizer, train_dl, val_dl
+            )
+            # O nosso scheduler customizado precisa usar o otimizador preparado pelo accelerator
+            prepared_scheduler = ScheduledOptim(prepared_optimizer, args.model_d_model, args.warmup_steps)
+            # Copia o estado do scheduler original
+            prepared_scheduler.load_state_dict(scheduler.state_dict())
+
+            # Instancia o Trainer com os objetos preparados
+            trainer = PretrainingTrainer(
+                prepared_model, prepared_train_dl, prepared_val_dl, prepared_scheduler, 
+                accelerator, pad_id, tokenizer.vocab_size, args.logging_steps
+            )
+            
+            best_metrics_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Atualiza o estado do scheduler original para o checkpoint
+            scheduler.load_state_dict(prepared_scheduler.state_dict())
+            
+            # Salva o checkpoint (a função agora recebe o accelerator)
+            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard['loss'])
+
+        start_shard = 0
+    # ...
 
 ///////////////////////////////////////////////////
 //////////////////////////////////////////////////Excelente pedido. Ter um histórico de checkpoints por época é uma prática muito valiosa, pois permite que você volte para um "estado dourado" do modelo, e não apenas para o último ponto de salvamento.
