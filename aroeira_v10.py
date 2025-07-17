@@ -1,3 +1,26 @@
+Como Executar
+Instale o Accelerate:
+
+Bash
+
+pip install accelerate
+(Opcional) Configure: Você já fez isso, mas para outros, o comando é accelerate config. Ele cria um arquivo de configuração com suas preferências (multi-gpu, mixed precision, etc.).
+
+Execute com accelerate launch:
+Em vez de python seu_script.py ..., você agora usará:
+
+Bash
+
+accelerate launch seu_script_modificado.py \
+    --s3_data_path "s3://seu-bucket/caminho/dados/" \
+    --num_global_epochs 50 \
+    --files_per_shard_training 10 \
+    --batch_size_pretrain 32 \
+    --output_dir "./bert_accelerate_output" \
+    --checkpoint_dir "./checkpoints_accelerate"
+
+
+
 Python
 
 # Adicione esta importação no topo do seu arquivo
