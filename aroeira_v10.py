@@ -1,4 +1,68 @@
-Excelente pedido. Ter um histórico de checkpoints por época é uma prática muito valiosa, pois permite que você volte para um "estado dourado" do modelo, e não apenas para o último ponto de salvamento.
+import s3fs
+import os
+
+# --- 1. CONFIGURAÇÃO DO USUÁRIO ---
+# Substitua pelo caminho do DIRETÓRIO no S3 onde seus arquivos de lote estão.
+# Exemplo: "s3://meu-bucket/meus-dados/treinamento/"
+S3_DIRECTORY_PATH = "s3://itau-self-wkp-sa-east-1-250346683169/leixdie_treinamento_bert/output/checkpoints/"
+# ---------------------------------
+
+
+def find_s3_files(s3_path):
+    """
+    Lista os arquivos em um diretório S3 que correspondem ao padrão 'batch_*.jsonl'.
+    """
+    # Constrói o padrão glob para encontrar todos os arquivos batch.jsonl
+    # O rstrip('/') garante que funcione com ou sem a barra no final do caminho
+    base_path = s3_path.rstrip('/')
+    glob_pattern = f"{base_path}/batch_*.jsonl"
+    
+    print(f"Buscando arquivos no S3 com o padrão: {glob_pattern}\n")
+
+    try:
+        # Inicializa o sistema de arquivos S3
+        s3 = s3fs.S3FileSystem()
+
+        # Usa o glob para encontrar os arquivos. `refresh=True` força uma nova busca.
+        file_list = s3.glob(glob_pattern, refresh=True)
+        
+        # s3.glob retorna caminhos no formato 'bucket/key', vamos adicionar o protocolo
+        full_file_list = [f"s3://{f}" for f in file_list]
+
+        # Ordena a lista para garantir uma exibição lógica (batch_0, batch_1, ...)
+        sorted_files = sorted(full_file_list)
+
+        if not sorted_files:
+            print("❌ Nenhum arquivo encontrado.")
+            print("Verifique se:")
+            print("  1. O caminho do diretório está correto.")
+            print("  2. Os arquivos realmente seguem o padrão 'batch_NUMERO.jsonl'.")
+            print("  3. As permissões de acesso ao bucket S3 estão configuradas neste ambiente.")
+        else:
+            print(f"✅ Sucesso! {len(sorted_files)} arquivos foram encontrados.")
+            print("-" * 40)
+
+            # Mostra uma amostra dos primeiros arquivos
+            print("Amostra dos PRIMEIROS arquivos encontrados:")
+            for f in sorted_files[:10]:
+                print(f"  - {f}")
+
+            # Mostra uma amostra dos últimos arquivos para verificar se a lista está completa
+            if len(sorted_files) > 10:
+                print("\nAmostra dos ÚLTIMOS arquivos encontrados:")
+                for f in sorted_files[-10:]:
+                    print(f"  - {f}")
+            print("-" * 40)
+
+    except Exception as e:
+        print(f"❌ Ocorreu um erro ao tentar acessar o S3: {e}")
+        print("\nVerifique se suas credenciais da AWS (chaves de acesso, role) estão configuradas corretamente no ambiente do seu notebook.")
+
+# Executa a função de verificação
+find_s3_files(S3_DIRECTORY_PATH)
+
+///////////////////////////////////////////////////
+//////////////////////////////////////////////////Excelente pedido. Ter um histórico de checkpoints por época é uma prática muito valiosa, pois permite que você volte para um "estado dourado" do modelo, e não apenas para o último ponto de salvamento.
 
 A solução ideal é implementar um sistema de dois níveis:
 
