@@ -1,3 +1,63 @@
+def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards (com Accelerate) ---")
+    
+    # ... (código para listar arquivos do S3) ...
+
+    # 1. Instancie o modelo e o otimizador base (Adam) na CPU
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(model.parameters(), lr=args.lr_pretrain, betas=(0.9, 0.999), weight_decay=0.01)
+    
+    # 2. Crie a sua classe customizada envolvendo o otimizador base
+    # Ela ainda aponta para o otimizador não preparado. Vamos corrigir isso depois.
+    scheduler = ScheduledOptim(optimizer, args.model_d_model, args.warmup_steps)
+    
+    # 3. Carregue o estado do checkpoint nos objetos AINDA NÃO PREPARADOS
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    # Loop de ÉPOCA GLOBAL
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar os file_shards) ...
+        
+        # Loop INTERNO sobre os shards
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar train_dataset e val_dataset) ...
+            
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size_pretrain, shuffle=True)
+            val_dl = DataLoader(val_dataset, batch_size=args.batch_size_pretrain, shuffle=False) if val_dataset else None
+
+            # --- CORREÇÃO E REFAÇÃO DA LÓGICA DO ACCELERATOR.PREPARE() ---
+            
+            # 4. Prepare os objetos que sempre existem (modelo, otimizador base, train_dl)
+            prepared_model, prepared_optimizer, prepared_train_dl = accelerator.prepare(
+                model, optimizer, train_dl
+            )
+            
+            # 5. Prepare o val_dl condicionalmente, apenas se ele não for None
+            prepared_val_dl = accelerator.prepare(val_dl) if val_dl else None
+            
+            # 6. ATUALIZE o agendador para que ele use o otimizador processado pelo Accelerate
+            # Isso garante que as atualizações de gradientes funcionem no modo distribuído
+            scheduler._optimizer = prepared_optimizer
+            
+            # --------------------------------------------------------------------
+
+            # 7. Instancie o Trainer com os objetos JÁ PREPARADOS
+            trainer = PretrainingTrainer(
+                prepared_model, prepared_train_dl, prepared_val_dl, scheduler, 
+                accelerator, pad_id, tokenizer.vocab_size, args.logging_steps
+            )
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Salva o checkpoint
+            save_checkpoint(args, accelerator, epoch_num, shard_num, prepared_model, prepared_optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+
+
+
+
+
+////////////////////////////////////////////////
 Como Executar
 Instale o Accelerate:
 
