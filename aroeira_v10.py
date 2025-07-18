@@ -1,3 +1,66 @@
+def main():
+    # 1. Inicialize o Accelerator no início de tudo
+    accelerator = Accelerator()
+    
+    # O device é gerenciado pelo accelerator
+    device = accelerator.device
+    
+    # O parse de argumentos não muda
+    ARGS = parse_args()
+    # Atribuímos o device correto aos argumentos para uso posterior
+    ARGS.device = device
+
+    # 2. Apenas o processo principal (rank 0) cria diretórios e configura o logging
+    if accelerator.is_main_process:
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        
+        log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+        setup_logging(ARGS.log_level, str(log_file))
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"Processo principal (rank 0) executando em: {device}")
+        logger.info("--- Configurações Utilizadas ---")
+        for arg_name, value in vars(ARGS).items():
+            logger.info(f"{arg_name}: {value}")
+        logger.info("---------------------------------")
+    else:
+        # Outros processos também precisam de um logger, mas sem a configuração de arquivo
+        logger = logging.getLogger(__name__)
+
+    # 3. Apenas o processo principal executa a preparação de dados e o treino do tokenizador
+    if accelerator.is_main_process:
+        logger.info("Processo principal está preparando o tokenizador...")
+        # A função setup_and_train_tokenizer em si não precisa de alterações
+        setup_and_train_tokenizer(ARGS, logger)
+        logger.info("Processo principal concluiu a preparação do tokenizador.")
+
+    # 4. BARREIRA: Todos os outros processos esperam aqui
+    # Esta linha é crucial. Garante que ninguém prossiga até que o processo principal
+    # tenha terminado de criar o diretório e salvar os arquivos do tokenizador.
+    accelerator.wait_for_everyone()
+
+    # 5. AGORA que os arquivos existem, todos os processos podem carregar o tokenizador
+    try:
+        logger.info(f"Processo {accelerator.process_index} carregando o tokenizador do disco...")
+        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
+        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+        pad_id = tokenizer.pad_token_id
+        logger.info(f"Processo {accelerator.process_index} carregou o tokenizador com sucesso.")
+    except Exception as e:
+        logger.error(f"Processo {accelerator.process_index} falhou ao carregar o tokenizador: {e}")
+        # Se um processo falhar aqui, é um erro fatal
+        raise e
+
+    # 6. Inicia o treinamento em shards, agora com o accelerator e o tokenizador prontos
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+
+    if accelerator.is_main_process:
+        logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+
+
+//////////////////////////////////////////
 def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
     logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards (com Accelerate) ---")
     
