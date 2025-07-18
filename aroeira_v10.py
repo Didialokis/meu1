@@ -1,13 +1,156 @@
+1. O Básico: Instanciando o Accelerator
+Primeiro, importamos o Accelerator e o instanciamos no início da nossa função main. Também removeremos o argumento --device, pois o accelerate gerenciará isso para nós.
+
+import e parse_args()
+Python
+
+# Adicione esta importação no topo do seu arquivo
+from accelerate import Accelerator
+import torch
+# ... outras importações
+
+def parse_args():
+    parser = argparse.ArgumentParser(...)
+    
+    # ... outros argumentos ...
+    # REMOVA o argumento --device, pois o Accelerate o gerencia
+    # parser.add_argument("--device", type=str, default=None)
+    # ...
+    
+    args = parser.parse_args()
+    # A lógica de auto-detecção de device também não é mais necessária aqui
+    return args
+main()
+Python
+
+def main():
+    # --- PASSO 1: Crie o objeto Accelerator no início ---
+    accelerator = Accelerator()
+    
+    ARGS = parse_args()
+
+    # O dispositivo agora é gerenciado pelo accelerator
+    # ARGS.device = accelerator.device # (Não precisamos mais passar isso via ARGS)
+    
+    # Use accelerator.is_main_process para ações que devem ocorrer apenas uma vez
+    if accelerator.is_main_process:
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        # ... (código de setup do logging) ...
+
+    # ...
+    
+    # Sincroniza os processos para garantir que o tokenizador esteja pronto
+    accelerator.wait_for_everyone()
+
+    # Passamos o objeto accelerator para a função principal de treinamento
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+2. accelerator.prepare() - O Coração da Integração
+Dentro da sua função de treinamento, antes de começar a treinar no shard, você usará accelerator.prepare() para preparar seu modelo, otimizador e dataloaders. O accelerate os adaptará para funcionar perfeitamente no seu ambiente (CPU, GPU única, multi-GPU, etc.).
+
+run_pretraining_on_shards()
+Python
+
+def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
+    logger.info(f"--- Treinando com o Accelerate no dispositivo: {accelerator.device} ---")
+    
+    # ... (código para listar arquivos do S3) ...
+
+    # Instancia modelo e otimizadores
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint ANTES de passar os objetos para o accelerator
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar os file_shards) ...
+        
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
+            
+            train_dl = DataLoader(...)
+            val_dl = DataLoader(...) if val_dataset else None
+
+            # --- PASSO 2: Prepare todos os objetos de treinamento ---
+            # O Accelerator move os objetos para o device correto e os envolve para paralelismo
+            model, optimizer, train_dl, val_dl, scheduler = accelerator.prepare(
+                model, optimizer, train_dl, val_dl, scheduler
+            )
+            # --------------------------------------------------------------------
+
+            # Instancia o Trainer com os objetos JÁ PREPARADOS
             trainer = PretrainingTrainer(
-                model=prepared_model,
-                train_dataloader=prepared_train_dl,
-                val_dataloader=prepared_val_dl,
-                optimizer_schedule=prepared_scheduler,
-                accelerator=accelerator,
-                # O parâmetro 'pad_idx_mlm_loss' recebe o inteiro 'pad_id'
-                pad_idx_mlm_loss=pad_id, 
-                vocab_size=tokenizer.vocab_size,
-                log_freq=args.logging_steps
+                model, train_dl, val_dl, scheduler, accelerator, 
+                pad_id, tokenizer.vocab_size, args.logging_steps
+            )
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Salva o checkpoint, passando o accelerator para a lógica de salvamento
+            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+3. Adaptando o Loop de Treinamento
+Finalmente, fazemos duas pequenas alterações no loop de treinamento dentro do PretrainingTrainer.
+
+Removemos a linha que move os dados para o dispositivo (data.to(device)), pois o DataLoader preparado pelo accelerate já faz isso.
+
+Substituímos loss.backward() por accelerator.backward(loss).
+
+PretrainingTrainer._run_epoch()
+Python
+
+class PretrainingTrainer:
+    # O __init__ precisa ser atualizado para receber o accelerator
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        # Os objetos já estão no dispositivo correto
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule
+        # ... resto do __init__ ...
+
+    def _run_epoch(self, epoch_num, is_training):
+        # ...
+        for i_batch, data in enumerate(data_iter):
+            # --- PASSO 3.1: REMOVA o .to(device) ---
+            # O DataLoader do Accelerate já coloca o batch na GPU correta
+            # data = {k: v.to(self.dev) for k, v in data.items()}
+            
+            nsp_out, mlm_out = self.model(...)
+            # ... (cálculo da loss) ...
+            loss = loss_nsp + loss_mlm
+
+            if is_training:
+                self.opt_schedule.zero_grad()
+                # --- PASSO 3.2: SUBSTITUA loss.backward() ---
+                self.accelerator.backward(loss)
+                self.opt_schedule.step_and_update_lr()
+        # ... (resto da função) ...
+4. Lógica Específica para Múltiplas GPUs (Bônus)
+O tutorial básico não cobre o salvamento, que é crucial. Ao usar múltiplas GPUs, o modelo é "embrulhado" em um container. Para salvar o estado correto, precisamos "desembrulhá-lo".
+
+save_checkpoint()
+Python
+
+def save_checkpoint(args, accelerator, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    # Apenas o processo principal deve realizar operações de escrita em disco/S3
+    if not accelerator.is_main_process:
+        return
+
+    # --- BÔNUS: Use accelerator.unwrap_model para obter o modelo original ---
+    unwrapped_model = accelerator.unwrap_model(model)
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': unwrapped_model.state_dict(), # Salva o estado do modelo original
+        # ... (resto do dicionário de estado) ...
+    }
+    
+    # ... (resto da lógica de salvamento) ...
 
 ///////////////////////////////////////////
 def main():
