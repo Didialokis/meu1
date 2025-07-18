@@ -1,3 +1,68 @@
+def setup_and_train_tokenizer(args, logger, accelerator):
+    """
+    Prepara e treina o tokenizador de forma segura para o ambiente distribuído.
+    """
+    logger.info("--- Fase: Preparação do Tokenizador ---")
+    TOKENIZER_ASSETS_DIR = Path(args.output_dir) / "tokenizer_assets"
+
+    # PASSO 1: Apenas o processo principal cria o diretório e salva os arquivos.
+    if accelerator.is_main_process:
+        # Cria o diretório de destino
+        TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        vocab_file_target = TOKENIZER_ASSETS_DIR / "vocab.txt"
+
+        # Se o tokenizador ainda não existe, ele é treinado e salvo.
+        if not vocab_file_target.exists():
+            logger.info("Treinando novo tokenizador com base no primeiro shard...")
+            # A lógica de carregar os dados para o tokenizador (load_data_shard ou similar) vai aqui.
+            # Exemplo:
+            # sentences_for_tokenizer = load_data_shard(...) 
+            # temp_file = Path(args.output_dir) / "temp_for_tokenizer.txt"
+            # with open(temp_file, "w", encoding="utf-8") as f:
+            #    for s_line in sentences_for_tokenizer: f.write(s_line + "\n")
+            
+            # wp_trainer = BertWordPieceTokenizer(...)
+            # wp_trainer.train(...)
+            # wp_trainer.save_model(str(TOKENIZER_ASSETS_DIR))
+            # logger.info(f"Tokenizador salvo pelo processo principal em: {TOKENIZER_ASSETS_DIR}")
+        else:
+            logger.info(f"Tokenizador já existe em '{TOKENIZER_ASSETS_DIR}'. Pulando treinamento.")
+
+    # PASSO 2: Todos os processos esperam aqui.
+    # Isso garante que, quando os processos não-principais continuarem,
+    # o processo principal já terá terminado de salvar o tokenizador.
+    logger.info(f"Processo {accelerator.process_index} esperando na barreira do tokenizador...")
+    accelerator.wait_for_everyone()
+
+    # PASSO 3: Agora que o tokenizador está salvo, TODOS os processos o carregam do mesmo local.
+    logger.info(f"Processo {accelerator.process_index} carregando o tokenizador de: {TOKENIZER_ASSETS_DIR}")
+    tokenizer = BertTokenizer.from_pretrained(
+        str(TOKENIZER_ASSETS_DIR), 
+        local_files_only=True
+    )
+    
+    logger.info("Tokenizador preparado com sucesso para todos os processos.")
+    return tokenizer, tokenizer.pad_token_id
+Como Integrar
+Você precisará garantir que sua função main chame esta função corretamente, passando o objeto accelerator. O fluxo em main deve ser simplificado para apenas uma chamada a esta função, em vez de ter lógicas if/else separadas para o processo principal.
+
+Exemplo em main():
+
+Python
+
+def main():
+    accelerator = Accelerator()
+    ARGS = parse_args()
+    # ... setup do logging no processo principal ...
+
+    # A função agora encapsula toda a lógica de distribuição para o tokenizador
+    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger, accelerator)
+    
+    # Continua com o resto do treinamento
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+
+
+////////////////////////////////////////////
 1. O Básico: Instanciando o Accelerator
 Primeiro, importamos o Accelerator e o instanciamos no início da nossa função main. Também removeremos o argumento --device, pois o accelerate gerenciará isso para nós.
 
