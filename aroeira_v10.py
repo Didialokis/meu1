@@ -1,3 +1,15 @@
+            trainer = PretrainingTrainer(
+                model=prepared_model,
+                train_dataloader=prepared_train_dl,
+                val_dataloader=prepared_val_dl,
+                optimizer_schedule=prepared_scheduler,
+                accelerator=accelerator,
+                # O parâmetro 'pad_idx_mlm_loss' recebe o inteiro 'pad_id'
+                pad_idx_mlm_loss=pad_id, 
+                vocab_size=tokenizer.vocab_size,
+                log_freq=args.logging_steps
+
+///////////////////////////////////////////
 def main():
     # 1. Inicialize o Accelerator no início de tudo
     accelerator = Accelerator()
