@@ -1,3 +1,45 @@
+# Dentro da classe ArticleStyleBERTDataset
+
+    def _get_sentence_pair_for_nsp(self, sent_a_idx):
+        sent_a = self.corpus_sents[sent_a_idx]
+        is_next = 0
+
+        # 50% de chance de pegar a sentença seguinte
+        if random.random() < 0.5 and sent_a_idx + 1 < self.corpus_len:
+            sent_b = self.corpus_sents[sent_a_idx + 1]
+            is_next = 1
+        # 50% de chance de pegar uma sentença aleatória que não seja a atual nem a próxima
+        else:
+            # --- MODIFICAÇÃO: Lógica robusta para encontrar uma sentença aleatória ---
+            # 1. Crie uma lista de todos os índices possíveis
+            possible_indices = list(range(self.corpus_len))
+            
+            # 2. Remova o índice da sentença A
+            possible_indices.remove(sent_a_idx)
+            
+            # 3. Remova o índice da próxima sentença, se ela existir
+            if sent_a_idx + 1 < self.corpus_len:
+                try:
+                    possible_indices.remove(sent_a_idx + 1)
+                except ValueError:
+                    # Isso pode acontecer se o corpus tiver apenas 2 elementos, não é um problema
+                    pass
+            
+            # 4. Se, após as remoções, ainda houver opções, escolha uma aleatoriamente.
+            #    Caso contrário (corpus muito pequeno), apenas pegue uma sentença aleatória
+            #    do corpus original como um fallback seguro.
+            if possible_indices:
+                rand_sent_b_idx = random.choice(possible_indices)
+            else:
+                # Failsafe: se não houver outras opções, apenas pegue uma que não seja a atual
+                rand_sent_b_idx = random.choice([i for i in range(self.corpus_len) if i != sent_a_idx])
+
+            sent_b = self.corpus_sents[rand_sent_b_idx]
+            # --------------------------------------------------------------------
+        
+        return sent_a, sent_b, is_next
+
+///////////////////////////////////
 # Dentro da classe PretrainingTrainer
 
 def _run_epoch(self, epoch_num, is_training):
