@@ -1,3 +1,89 @@
+import boto3 # Certifique-se de que esta importação está no topo do arquivo
+from pathlib import Path
+import shutil # Usado para remover a pasta temporária
+
+# --- CORREÇÃO: Função de setup do tokenizador com download isolado ---
+def setup_and_train_tokenizer(args, logger):
+    """
+    Prepara e treina o tokenizador de forma robusta para ambientes distribuídos.
+    1. Baixa os arquivos necessários do S3 para uma pasta local temporária.
+    2. Usa a biblioteca `datasets` para ler os arquivos LOCAIS.
+    3. Limpa os arquivos temporários.
+    """
+    logger.info("--- Fase: Preparação do Tokenizador (Modo Robusto) ---")
+
+    TOKENIZER_ASSETS_DIR = Path(args.output_dir) / "tokenizer_assets"
+    # Se o tokenizador já existe, não precisamos fazer nada
+    if (TOKENIZER_ASSETS_DIR / "vocab.txt").exists():
+        logger.info(f"Tokenizador já existe em '{TOKENIZER_ASSETS_DIR}'. Pulando a criação.")
+        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+        return tokenizer, tokenizer.pad_token_id
+
+    # --- ETAPA 1: Download Controlado dos Arquivos do S3 ---
+    logger.info("Iniciando download controlado dos arquivos para treinamento do tokenizador...")
+    s3 = boto3.client('s3')
+    
+    # Parse do bucket e prefixo a partir do caminho S3
+    parsed_url = urlparse(args.s3_data_path)
+    bucket_name = parsed_url.netloc
+    prefix = parsed_url.path.lstrip('/')
+
+    # Lista de objetos no S3
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket_name, Prefix=f"{prefix.rstrip('/')}/batch_")
+        all_files_keys = sorted([obj['Key'] for page in pages for obj in page.get('Contents', []) if obj['Key'].endswith('.jsonl')])
+    except Exception as e:
+        logger.error(f"Não foi possível listar arquivos no S3: {e}")
+        raise
+        
+    if not all_files_keys:
+        raise RuntimeError(f"Nenhum arquivo batch_*.jsonl encontrado em s3://{bucket_name}/{prefix}")
+
+    # Seleciona os primeiros N arquivos para o tokenizador
+    files_to_download = all_files_keys[:args.files_per_shard_tokenizer]
+    
+    # Cria um diretório local temporário para os arquivos
+    temp_data_dir = Path(args.output_dir) / "temp_tokenizer_data"
+    temp_data_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Baixando {len(files_to_download)} arquivos para '{temp_data_dir}'...")
+    local_file_paths = []
+    for s3_key in tqdm(files_to_download, desc="Baixando arquivos do S3"):
+        local_path = temp_data_dir / Path(s3_key).name
+        try:
+            s3.download_file(bucket_name, s3_key, str(local_path))
+            local_file_paths.append(str(local_path))
+        except ClientError as e:
+            logger.error(f"Falha ao baixar {s3_key}: {e}")
+            raise
+
+    # --- ETAPA 2: Processar os arquivos que agora estão LOCAIS ---
+    logger.info("Processando arquivos locais com a biblioteca `datasets`...")
+    # data_files agora aponta para os arquivos baixados localmente
+    tokenizer_ds = datasets.load_dataset("json", data_files=local_file_paths, split="train")
+    sentences_for_tokenizer = [ex['text'] for ex in tokenizer_ds if ex and ex.get('text')]
+
+    # --- ETAPA 3: Treinar o tokenizador e limpar ---
+    temp_file = Path(args.output_dir) / "temp_for_tokenizer.txt"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        for s_line in sentences_for_tokenizer: f.write(s_line + "\n")
+
+    TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Treinando novo tokenizador com base nos arquivos baixados...")
+    wp_trainer = BertWordPieceTokenizer(clean_text=True, lowercase=True)
+    wp_trainer.train(files=[str(temp_file)], vocab_size=args.vocab_size, min_frequency=args.min_frequency_tokenizer, special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"])
+    wp_trainer.save_model(str(TOKENIZER_ASSETS_DIR))
+    
+    logger.info("Limpando arquivos temporários...")
+    shutil.rmtree(temp_data_dir) # Remove a pasta com os .jsonl baixados
+    temp_file.unlink() # Remove o arquivo .txt consolidado
+
+    tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+    logger.info("Tokenizador preparado com sucesso.")
+    return tokenizer, tokenizer.pad_token_id
+
+//////////////////////////////////////////////////
 Passo 1: Reverter as Importações e parse_args
 Primeiro, removemos a importação do Accelerator e adicionamos as importações necessárias para o DDP. O parse_args será simplificado, pois os ranks dos processos serão lidos de variáveis de ambiente.
 
