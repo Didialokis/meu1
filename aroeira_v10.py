@@ -1,3 +1,109 @@
+class ArticleStyleBERTDataset(Dataset):
+    def __init__(self, corpus_sents_list, tokenizer_instance, seq_len_config):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.tokenizer = tokenizer_instance
+        self.seq_len = seq_len_config
+        self.corpus_sents = [s for s in corpus_sents_list if s and s.strip()]
+        self.corpus_len = len(self.corpus_sents)
+        
+        # --- SANITY CHECK ADICIONADO ---
+        # Adicionamos uma verificação para evitar que este problema ocorra silenciosamente no futuro.
+        # A lógica NSP precisa de pelo menos 2 sentenças para funcionar de forma robusta.
+        if self.corpus_len < 2:
+            # Em vez de um erro, podemos apenas registrar um aviso e retornar um dataset vazio
+            # para que o shard seja pulado de forma limpa.
+            self.logger.warning(f"O shard tem menos de 2 sentenças ({self.corpus_len}). Ele será pulado.")
+            self.corpus_sents = [] # Esvazia a lista para que __len__ retorne 0
+            self.corpus_len = 0
+        
+        if self.corpus_len > 0:
+            self.cls_id = self.tokenizer.cls_token_id
+            self.sep_id = self.tokenizer.sep_token_id
+            self.pad_id = self.tokenizer.pad_token_id
+            self.mask_id = self.tokenizer.mask_token_id
+            self.vocab_size = self.tokenizer.vocab_size
+
+    def __len__(self):
+        return self.corpus_len
+
+    # --- FUNÇÃO CORRIGIDA ---
+    def _get_sentence_pair_for_nsp(self, sent_a_idx):
+        """
+        Gera um par de sentenças para a tarefa NSP.
+        A lógica do while foi corrigida para evitar loops infinitos.
+        """
+        sent_a = self.corpus_sents[sent_a_idx]
+        is_next = 0
+
+        # 50% de chance de pegar a próxima sentença real
+        if random.random() < 0.5 and sent_a_idx + 1 < self.corpus_len:
+            sent_b = self.corpus_sents[sent_a_idx + 1]
+            is_next = 1
+        # 50% de chance de pegar uma sentença aleatória (que não seja a mesma)
+        else:
+            rand_sent_b_idx = random.randrange(self.corpus_len)
+            # CORREÇÃO: O loop agora apenas garante que não estamos pegando a mesma sentença.
+            # Isso evita o loop infinito quando corpus_len é 2.
+            while rand_sent_b_idx == sent_a_idx:
+                rand_sent_b_idx = random.randrange(self.corpus_len)
+            
+            sent_b = self.corpus_sents[rand_sent_b_idx]
+            # Nota: is_next permanece 0, mesmo que por acaso tenhamos pego a próxima sentença.
+            # Isso é um exemplo negativo válido e correto.
+
+        return sent_a, sent_b, is_next
+
+    def _apply_mlm_to_tokens(self, token_ids_list):
+        inputs, labels = list(token_ids_list), list(token_ids_list)
+        for i, token_id in enumerate(inputs):
+            if token_id in [self.cls_id, self.sep_id, self.pad_id]:
+                labels[i] = self.pad_id
+                continue
+            if random.random() < 0.15:
+                action_prob = random.random()
+                if action_prob < 0.8:
+                    inputs[i] = self.mask_id
+                elif action_prob < 0.9:
+                    inputs[i] = random.randrange(self.vocab_size)
+            else:
+                labels[i] = self.pad_id
+        return inputs, labels
+
+    def __getitem__(self, idx):
+        # Esta função agora funcionará corretamente porque _get_sentence_pair_for_nsp foi corrigida.
+        sent_a_str, sent_b_str, nsp_label = self._get_sentence_pair_for_nsp(idx)
+        
+        tokens_a_ids = self.tokenizer.encode(sent_a_str, add_special_tokens=False, truncation=True, max_length=self.seq_len - 3)
+        tokens_b_ids = self.tokenizer.encode(sent_b_str, add_special_tokens=False, truncation=True, max_length=self.seq_len - len(tokens_a_ids) - 3)
+        
+        masked_tokens_a_ids, mlm_labels_a_ids = self._apply_mlm_to_tokens(tokens_a_ids)
+        masked_tokens_b_ids, mlm_labels_b_ids = self._apply_mlm_to_tokens(tokens_b_ids)
+        
+        input_ids = [self.cls_id] + masked_tokens_a_ids + [self.sep_id] + masked_tokens_b_ids + [self.sep_id]
+        mlm_labels = [self.pad_id] + mlm_labels_a_ids + [self.pad_id] + mlm_labels_b_ids + [self.pad_id]
+        segment_ids = ([0] * (len(masked_tokens_a_ids) + 2)) + ([1] * (len(masked_tokens_b_ids) + 1))
+        
+        current_len = len(input_ids)
+        if current_len > self.seq_len:
+            input_ids = input_ids[:self.seq_len]
+            mlm_labels = mlm_labels[:self.seq_len]
+            segment_ids = segment_ids[:self.seq_len]
+            
+        padding_len = self.seq_len - len(input_ids)
+        attention_mask = [1] * len(input_ids) + [0] * padding_len
+        
+        input_ids.extend([self.pad_id] * padding_len)
+        mlm_labels.extend([self.pad_id] * padding_len)
+        segment_ids.extend([0] * padding_len)
+        
+        return {
+            "bert_input": torch.tensor(input_ids),
+            "bert_label": torch.tensor(mlm_labels),
+            "segment_label": torch.tensor(segment_ids),
+            "is_next": torch.tensor(nsp_label),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long)
+        }
+///////////////////////////////////////]
 # Dentro da classe ArticleStyleBERTDataset
 
     def _get_sentence_pair_for_nsp(self, sent_a_idx):
