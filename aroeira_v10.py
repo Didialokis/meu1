@@ -1,3 +1,75 @@
+# Dentro da classe PretrainingTrainer
+
+def _run_epoch(self, epoch_num, is_training):
+    self.model.train(is_training)
+    dl = self.train_dl if is_training else self.val_dl
+    if not dl: 
+        # Retorna o dicionário de métricas com valores padrão
+        return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+    
+    # --- LOG DE DIAGNÓSTICO 1: Verificar se o DataLoader tem dados ---
+    self.logger.info(f"Iniciando _run_epoch. Tamanho do DataLoader: {len(dl)} batches.")
+
+    total_loss_ep = 0.0
+    all_labels, all_preds = [], []
+    
+    mode = "Train" if is_training else "Val"
+    desc = f"Epoch {epoch_num+1} [{mode}]"
+    
+    # --- MODIFICAÇÃO: Usar o padrão de atualização manual do tqdm ---
+    # 1. Crie a barra de progresso antes do loop
+    progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+    for i_batch, data in enumerate(dl):
+        # --- LOG DE DIAGNÓSTICO 2: Verificar se o loop de batch está rodando ---
+        # Descomente a linha abaixo para um log muito verboso, se necessário
+        # self.logger.info(f"Processando batch {i_batch + 1}/{len(dl)}...")
+        
+        data = {k: v.to(self.dev, non_blocking=True) for k, v in data.items()}
+        nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+        loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+        loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+        loss = loss_nsp + loss_mlm
+
+        if is_training:
+            self.opt_schedule.zero_grad()
+            loss.backward()
+            self.opt_schedule.step_and_update_lr()
+        
+        total_loss_ep += loss.item()
+        
+        nsp_preds = nsp_out.argmax(dim=-1)
+        all_labels.extend(data["is_next"].cpu().numpy())
+        all_preds.extend(nsp_preds.cpu().numpy())
+
+        # Atualiza a barra de progresso e as métricas
+        if (i_batch + 1) % self.log_freq == 0:
+            lr = self.opt_schedule._optimizer.param_groups[0]['lr']
+            # 2. Use .set_postfix() na barra criada manualmente
+            progress_bar.set_postfix({
+                "L":f"{loss.item():.3f}", 
+                "LR":f"{lr:.2e}"
+            })
+        
+        # 3. Atualize a barra de progresso a cada batch
+        progress_bar.update(1)
+
+    # 4. Feche a barra de progresso no final do loop
+    progress_bar.close()
+    
+    # O resto do cálculo de métricas agregadas permanece o mesmo
+    avg_total_l = total_loss_ep / len(dl) if len(dl) > 0 else 0
+    # ... (código para calcular precision, recall, f1, etc.) ...
+
+    self.logger.info(
+        f"{desc} - "
+        f"AvgLoss: {metrics['loss']:.4f}, "
+        f"NSP Acc: {metrics['accuracy']*100:.2f}%, "
+        # ... (resto do log de métricas)
+    )
+    return metrics
+
+///////////////////////////////////////////////
 Código Completo das Funções Modificadas
 A seguir estão as funções que precisam ser alteradas para reverter o DDP e implementar o DataParallel.
 
