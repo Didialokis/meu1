@@ -1,88 +1,159 @@
-import boto3 # Certifique-se de que esta importação está no topo do arquivo
-from pathlib import Path
-import shutil # Usado para remover a pasta temporária
+Código Completo das Funções Modificadas
+A seguir estão as funções que precisam ser alteradas para reverter o DDP e implementar o DataParallel.
 
-# --- CORREÇÃO: Função de setup do tokenizador com download isolado ---
-def setup_and_train_tokenizer(args, logger):
-    """
-    Prepara e treina o tokenizador de forma robusta para ambientes distribuídos.
-    1. Baixa os arquivos necessários do S3 para uma pasta local temporária.
-    2. Usa a biblioteca `datasets` para ler os arquivos LOCAIS.
-    3. Limpa os arquivos temporários.
-    """
-    logger.info("--- Fase: Preparação do Tokenizador (Modo Robusto) ---")
+1. main() - Simplificada, Sem Lógica de Distribuição
 
-    TOKENIZER_ASSETS_DIR = Path(args.output_dir) / "tokenizer_assets"
-    # Se o tokenizador já existe, não precisamos fazer nada
-    if (TOKENIZER_ASSETS_DIR / "vocab.txt").exists():
-        logger.info(f"Tokenizador já existe em '{TOKENIZER_ASSETS_DIR}'. Pulando a criação.")
-        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
-        return tokenizer, tokenizer.pad_token_id
+A função main volta a ser um orquestrador simples, pois toda a complexidade de inicialização de processos é removida.
 
-    # --- ETAPA 1: Download Controlado dos Arquivos do S3 ---
-    logger.info("Iniciando download controlado dos arquivos para treinamento do tokenizador...")
-    s3 = boto3.client('s3')
+Python
+
+def main():
+    ARGS = parse_args()
     
-    # Parse do bucket e prefixo a partir do caminho S3
-    parsed_url = urlparse(args.s3_data_path)
-    bucket_name = parsed_url.netloc
-    prefix = parsed_url.path.lstrip('/')
+    # --- MODIFICAÇÃO: Lógica de DDP totalmente removida ---
+    # Não há mais ranks ou inicialização de processo.
+    
+    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    setup_logging(ARGS.log_level, str(log_file))
+    logger = logging.getLogger(__name__)
 
-    # Lista de objetos no S3
-    try:
-        paginator = s3.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=bucket_name, Prefix=f"{prefix.rstrip('/')}/batch_")
-        all_files_keys = sorted([obj['Key'] for page in pages for obj in page.get('Contents', []) if obj['Key'].endswith('.jsonl')])
-    except Exception as e:
-        logger.error(f"Não foi possível listar arquivos no S3: {e}")
-        raise
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    logger.info(f"GPUs disponíveis detectadas: {torch.cuda.device_count()}")
+    logger.info("--- Configurações Utilizadas ---")
+    for arg_name, value in vars(ARGS).items():
+        logger.info(f"{arg_name}: {value}")
+    logger.info("---------------------------------")
+    
+    # O fluxo volta a ser sequencial e simples
+    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
+    
+    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+if __name__ == "__main__":
+    main()
+2. save_checkpoint e load_checkpoint - Ajustadas para DataParallel
+
+A lógica é muito parecida com a do DDP (ainda precisamos acessar .module), mas removemos as verificações de rank.
+
+Python
+
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    # A verificação de rank não é mais necessária
+    
+    # --- MODIFICAÇÃO: Acessar .module se o modelo for uma instância de DataParallel ---
+    is_parallel = isinstance(model, nn.DataParallel)
+    model_state = model.module.state_dict() if is_parallel else model.state_dict()
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+    }
+    # ... (o resto da lógica de salvar em S3 ou localmente permanece a mesma) ...
+
+def load_checkpoint(args, model, optimizer, scheduler):
+    # ... (lógica para encontrar o checkpoint) ...
+    
+    # A localização do mapa é simplificada
+    checkpoint = torch.load(buffer_or_path, map_location=args.device)
+    
+    # --- MODIFICAÇÃO: Carrega o estado no modelo base (sem .module) ---
+    # O modelo ainda não foi envolvido pelo DataParallel nesta fase.
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    # ... (resto da lógica de carregar o estado)
+    
+    return start_epoch, start_shard
+3. PretrainingTrainer - Sem Mudanças Significativas
+
+A classe Trainer que tínhamos na versão DDP já está quase perfeita. Apenas garantimos que ela não tenha mais referências a samplers ou ranks.
+
+Python
+
+class PretrainingTrainer:
+    # Removido is_main_process do __init__
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, device, ...):
+        # ...
+    
+    def _run_epoch(self, epoch_num, is_training):
+        # REMOVER a linha abaixo, pois não há mais sampler distribuído
+        # if isinstance(dl.sampler, DistributedSampler): dl.sampler.set_epoch(epoch_num)
+
+        # O resto da função (incluindo data.to(device) e loss.backward()) está correto
+        # e funciona perfeitamente com DataParallel.
+        # ...
+4. run_pretraining_on_shards() - Onde a Mágica Acontece
+
+Esta é a função com a mudança mais visível: removemos o DistributedSampler e adicionamos o wrapper nn.DataParallel.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Shards (com nn.DataParallel) ---")
+    
+    # ... (código para listar arquivos do S3) ...
+
+    # Instancia modelo e otimizadores
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint no modelo base ANTES de envolvê-lo
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    # --- MODIFICAÇÃO PRINCIPAL: Usando nn.DataParallel ---
+    # Verifica se há múltiplas GPUs disponíveis e se o dispositivo é CUDA
+    if torch.cuda.device_count() > 1 and 'cuda' in args.device:
+        logger.info(f"Utilizando {torch.cuda.device_count()} GPUs com nn.DataParallel.")
+        model = nn.DataParallel(model)
+    
+    # Move o modelo (agora possivelmente envolvido) para o dispositivo principal
+    model.to(args.device)
+    # --------------------------------------------------------
+    
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar file_shards) ...
         
-    if not all_files_keys:
-        raise RuntimeError(f"Nenhum arquivo batch_*.jsonl encontrado em s3://{bucket_name}/{prefix}")
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
 
-    # Seleciona os primeiros N arquivos para o tokenizador
-    files_to_download = all_files_keys[:args.files_per_shard_tokenizer]
-    
-    # Cria um diretório local temporário para os arquivos
-    temp_data_dir = Path(args.output_dir) / "temp_tokenizer_data"
-    temp_data_dir.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Baixando {len(files_to_download)} arquivos para '{temp_data_dir}'...")
-    local_file_paths = []
-    for s3_key in tqdm(files_to_download, desc="Baixando arquivos do S3"):
-        local_path = temp_data_dir / Path(s3_key).name
-        try:
-            s3.download_file(bucket_name, s3_key, str(local_path))
-            local_file_paths.append(str(local_path))
-        except ClientError as e:
-            logger.error(f"Falha ao baixar {s3_key}: {e}")
-            raise
+            # --- MODIFICAÇÃO: DataLoader volta ao normal, sem sampler ---
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size_pretrain, shuffle=True, 
+                                  num_workers=args.num_workers, pin_memory=True)
+            
+            val_dl = None
+            if val_dataset:
+                val_dl = DataLoader(val_dataset, batch_size=args.batch_size_pretrain, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True)
+            # -------------------------------------------------------------
 
-    # --- ETAPA 2: Processar os arquivos que agora estão LOCAIS ---
-    logger.info("Processando arquivos locais com a biblioteca `datasets`...")
-    # data_files agora aponta para os arquivos baixados localmente
-    tokenizer_ds = datasets.load_dataset("json", data_files=local_file_paths, split="train")
-    sentences_for_tokenizer = [ex['text'] for ex in tokenizer_ds if ex and ex.get('text')]
+            trainer = PretrainingTrainer(...)
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+Como Executar
+A execução agora é muito mais simples. Você não usa mais torchrun. Basta usar o comando python padrão. O PyTorch, através do torch.cuda.device_count(), detectará automaticamente todas as GPUs disponíveis e o nn.DataParallel as utilizará.
 
-    # --- ETAPA 3: Treinar o tokenizador e limpar ---
-    temp_file = Path(args.output_dir) / "temp_for_tokenizer.txt"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        for s_line in sentences_for_tokenizer: f.write(s_line + "\n")
+Bash
 
-    TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Treinando novo tokenizador com base nos arquivos baixados...")
-    wp_trainer = BertWordPieceTokenizer(clean_text=True, lowercase=True)
-    wp_trainer.train(files=[str(temp_file)], vocab_size=args.vocab_size, min_frequency=args.min_frequency_tokenizer, special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"])
-    wp_trainer.save_model(str(TOKENIZER_ASSETS_DIR))
-    
-    logger.info("Limpando arquivos temporários...")
-    shutil.rmtree(temp_data_dir) # Remove a pasta com os .jsonl baixados
-    temp_file.unlink() # Remove o arquivo .txt consolidado
-
-    tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
-    logger.info("Tokenizador preparado com sucesso.")
-    return tokenizer, tokenizer.pad_token_id
-
+python seu_script.py \
+    --s3_data_path "s3://seu-bucket/caminho/dados/" \
+    --num_global_epochs 50 \
+    --batch_size_pretrain 64 \
+    --output_dir "./bert_dataparallel_output" \
+    --checkpoint_dir "./checkpoints_dataparallel"
+Com estas alterações, seu script foi revertido para uma abordagem de paralelismo mais simples, mas ainda eficaz para uma única máquina com múltiplas GPUs.
 //////////////////////////////////////////////////
 Passo 1: Reverter as Importações e parse_args
 Primeiro, removemos a importação do Accelerator e adicionamos as importações necessárias para o DDP. O parse_args será simplificado, pois os ranks dos processos serão lidos de variáveis de ambiente.
