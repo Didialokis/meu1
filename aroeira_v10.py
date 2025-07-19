@@ -205,6 +205,15 @@ def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
             
         start_shard = 0
 
+
+
+torchrun --standalone --nproc_per_node=8 seu_script.py \
+    --s3_data_path "s3://seu-bucket/caminho/dados/" \
+    --num_global_epochs 50 \
+    --files_per_shard_training 10 \
+    --batch_size_pretrain 32 \
+    --output_dir "./bert_ddp_output" \
+    --checkpoint_dir "./checkpoints_ddp"
 /////////////////////////////////////////////////
 
 def setup_and_train_tokenizer(args, logger, accelerator):
