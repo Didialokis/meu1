@@ -1,3 +1,212 @@
+Passo 1: Reverter as Importações e parse_args
+Primeiro, removemos a importação do Accelerator e adicionamos as importações necessárias para o DDP. O parse_args será simplificado, pois os ranks dos processos serão lidos de variáveis de ambiente.
+
+Python
+
+# Remova esta linha
+# from accelerate import Accelerator
+
+# Adicione estas importações no topo do seu arquivo
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
+
+# ... outras importações ...
+
+def parse_args():
+    # A função parse_args permanece a mesma da última versão, 
+    # sem o argumento --device e sem argumentos do accelerate.
+    # O --num_workers ainda é útil.
+    parser = argparse.ArgumentParser(...)
+    # ...
+    return parser.parse_args()
+Passo 2: Modificar a Função main para Inicializar o Ambiente Distribuído
+A função main agora é responsável por inicializar o grupo de processos que irão se comunicar.
+
+Python
+
+def main():
+    # --- MODIFICAÇÃO: Inicialização do Processo Distribuído (DDP) ---
+    # torchrun irá definir estas variáveis de ambiente automaticamente
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    torch.cuda.set_device(local_rank)
+    
+    ARGS = parse_args()
+    # Adicionamos os ranks aos argumentos para fácil acesso
+    ARGS.local_rank = local_rank
+    ARGS.global_rank = global_rank
+    ARGS.device = local_rank # O device de cada processo é sua GPU local
+
+    # Apenas o processo principal (rank 0) deve configurar logging e diretórios
+    if ARGS.global_rank == 0:
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+        setup_logging(ARGS.log_level, str(log_file))
+    
+    logger = logging.getLogger(__name__)
+
+    if ARGS.global_rank == 0:
+        logger.info(f"Treinamento distribuído iniciado com {dist.get_world_size()} GPUs.")
+        # ... (código de log das configurações) ...
+    
+    # Sincroniza os processos para garantir que o rank 0 criou os diretórios
+    dist.barrier()
+    
+    # Apenas o processo principal treina o tokenizador e o salva
+    if ARGS.global_rank == 0:
+        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    
+    # Sincroniza novamente para garantir que o tokenizador foi salvo antes que os outros o leiam
+    dist.barrier()
+    
+    if ARGS.global_rank != 0:
+        # Outros processos carregam o tokenizador que o processo principal salvou
+        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
+        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+        pad_id = tokenizer.pad_token_id
+
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
+    
+    dist.destroy_process_group()
+    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+if __name__ == "__main__":
+    main()
+Passo 3: Modificar o Trainer e as Funções de Checkpoint
+O Trainer volta a mover os dados para o dispositivo, e o loss.backward() original é restaurado. As funções de checkpoint precisam acessar o .module do modelo DDP e usar o rank para salvar apenas uma vez.
+
+Python
+
+class PretrainingTrainer:
+    # O __init__ é simplificado, não precisa mais do accelerator
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, device, pad_idx_mlm_loss, vocab_size, log_freq=100, is_main_process=False):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.dev = device
+        self.model = model
+        # ... (resto do __init__ é o mesmo, mas adicionamos is_main_process)
+        self.is_main_process = is_main_process
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl
+        # --- MODIFICAÇÃO: O sampler precisa saber a época para embaralhar corretamente ---
+        if isinstance(dl.sampler, DistributedSampler):
+            dl.sampler.set_epoch(epoch_num)
+        # ...
+        
+        # Apenas o processo principal mostra a barra de progresso
+        data_iter = dl
+        if self.is_main_process:
+            data_iter = tqdm(dl, desc=desc, file=sys.stdout)
+        
+        for i_batch, data in enumerate(data_iter):
+            # --- MODIFICAÇÃO: Voltamos a mover os dados para o device manualmente ---
+            data = {k: v.to(self.dev, non_blocking=True) for k, v in data.items()}
+            
+            nsp_out, mlm_out = self.model(...)
+            loss = ... # (cálculo da loss)
+            
+            if is_training:
+                self.opt_schedule.zero_grad()
+                # --- MODIFICAÇÃO: Voltamos a usar o loss.backward() padrão ---
+                loss.backward()
+                self.opt_schedule.step_and_update_lr()
+        # ...
+        
+# --- MODIFICAÇÃO: Funções de Checkpoint cientes do DDP ---
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    # Apenas o processo principal (rank 0) deve salvar
+    if args.global_rank != 0:
+        return
+
+    # Ao usar DDP, precisamos acessar o modelo original através do atributo .module
+    model_state = model.module.state_dict()
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model_state,
+        # ... (resto do dicionário de estado)
+    }
+    # ... (resto da lógica de salvar, que já é ciente de S3)
+
+def load_checkpoint(args, model, optimizer, scheduler):
+    # Apenas o processo principal precisa ler o arquivo e depois o estado é sincronizado
+    start_epoch, start_shard = 0, 0
+    checkpoint_path_str = ... # (caminho para o checkpoint)
+    
+    # ... (lógica para verificar se o arquivo existe em S3 ou local)
+    
+    # Carrega o checkpoint mapeando para a GPU correta do processo atual
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % args.local_rank}
+    checkpoint = torch.load(buffer_or_path, map_location=map_location)
+    
+    # Carrega o estado no modelo. O DDP cuidará da sincronização.
+    model.load_state_dict(checkpoint['model_state_dict'])
+    # ... (carrega o resto do estado)
+    
+    return start_epoch, start_shard
+Passo 4: Orquestração Principal em run_pretraining_on_shards
+Esta é a parte mais importante. Aqui nós adicionamos o DistributedSampler e envolvemos o modelo com DDP.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards (com DDP Nativo) ---")
+    
+    # ... (código para listar arquivos do S3) ...
+
+    # Instancia modelo e otimizadores
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint ANTES de envolver o modelo com DDP
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    # --- MODIFICAÇÃO: Mover modelo para a GPU correta e envolvê-lo com DDP ---
+    model.to(args.local_rank)
+    model = DDP(model, device_ids=[args.local_rank])
+    
+    is_main_process = (args.global_rank == 0)
+
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar file_shards) ...
+        
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard `sentences_list`) ...
+            
+            train_dataset = ArticleStyleBERTDataset(train_sents, tokenizer, args.max_len)
+            
+            # --- MODIFICAÇÃO: Usar o DistributedSampler ---
+            train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            # Ao usar um sampler, o shuffle do DataLoader deve ser False
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size_pretrain, shuffle=False, 
+                                  num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
+            
+            val_dl = None
+            if val_dataset:
+                val_sampler = DistributedSampler(val_dataset, shuffle=False)
+                val_dl = DataLoader(val_dataset, batch_size=args.batch_size_pretrain, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True, sampler=val_sampler)
+
+            # Instancia o Trainer
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, args.device, 
+                                         pad_id, tokenizer.vocab_size, args.logging_steps, 
+                                         is_main_process=is_main_process)
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Salva o checkpoint (a função já sabe que deve ser executada apenas no rank 0)
+            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+
+/////////////////////////////////////////////////
+
 def setup_and_train_tokenizer(args, logger, accelerator):
     """
     Prepara e treina o tokenizador de forma segura para o ambiente distribuído.
