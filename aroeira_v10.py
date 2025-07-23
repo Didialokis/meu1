@@ -1,235 +1,98 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import Adam
-import datasets
-import tokenizers
-from tokenizers import BertWordPieceTokenizer
-from transformers import BertTokenizerFast as BertTokenizer
-from tqdm.auto import tqdm
-import random
-from pathlib import Path
-import sys
-import math
-import numpy as np
-import argparse
-import os
-import logging
-import datetime
-import s3fs
-import io
 from accelerate import Accelerator
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from tqdm.auto import tqdm
 
-# --- Funções e Classes do Modelo (Inalteradas) ---
-# setup_logging, ArticleStyleBERTDataset, e todas as classes do modelo Article...
-# permanecem como na sua última versão funcional.
-# ... (cole aqui as definições de classe inalteradas) ...
+# ... (suas outras classes e funções) ...
 
-# --- CORREÇÃO: Trainer simplificado para focar apenas no loop ---
+# --- CORREÇÃO: Substitua sua classe PretrainingTrainer inteira por esta ---
 class PretrainingTrainer:
-    def __init__(self, accelerator, model, optimizer_schedule, log_freq=100):
-        self.accelerator = accelerator
-        self.model = model
-        self.opt_schedule = optimizer_schedule
-        self.log_freq = log_freq
-        self.logger = logging.getLogger(self.__class__.__name__)
-        # Os critérios de perda são simples e podem ser definidos aqui
-        self.crit_mlm = nn.NLLLoss()
-        self.crit_nsp = nn.NLLLoss()
-
-    def train_shard(self, train_dataloader, val_dataloader, global_epoch_num):
-        self.logger.info(f"Iniciando treinamento no shard da época {global_epoch_num}.")
+    """
+    Trainer adaptado para funcionar com Hugging Face Accelerate.
+    Recebe os objetos já "preparados" pelo accelerator.
+    """
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, 
+                 pad_idx_mlm_loss, vocab_size, log_freq=100):
         
-        # Loop de treinamento para uma única passagem (época) no shard
-        self.model.train()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        
+        # Os objetos já foram movidos para o device correto pelo accelerator.prepare()
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule
+        
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl:
+            return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+        
         total_loss_ep = 0.0
+        all_labels, all_preds = [], []
+        
+        mode = "Train" if is_training else "Val"
+        desc = f"Epoch {epoch_num+1} [{mode}]"
         
         progress_bar = None
         if self.accelerator.is_main_process:
-            progress_bar = tqdm(total=len(train_dataloader), desc=f"Train Epoch {global_epoch_num}", file=sys.stdout)
+            progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
 
-        for i_batch, data in enumerate(train_dataloader):
-            with self.accelerator.accumulate(self.model):
-                nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
-                loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
-                loss_mlm = self.crit_mlm(mlm_out.view(-1, self.model.module.bert.emb.tok.num_embeddings), data["bert_label"].view(-1))
-                loss = loss_nsp + loss_mlm
-                
+        for i_batch, data in enumerate(dl):
+            # O DataLoader do Accelerate já move 'data' para a GPU
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
+
+            if is_training:
+                self.opt_schedule.zero_grad()
                 self.accelerator.backward(loss)
                 self.opt_schedule.step_and_update_lr()
-                self.opt_schedule.zero_grad()
             
+            total_loss_ep += self.accelerator.gather(loss).sum().item()
+            
+            nsp_preds = nsp_out.argmax(dim=-1)
+            all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+            all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
             if self.accelerator.is_main_process:
                 progress_bar.update(1)
-                progress_bar.set_postfix({"Loss": loss.item()})
+                if (i_batch + 1) % self.log_freq == 0:
+                    optimizer_unwrapped = self.accelerator.unwrap_model(self.opt_schedule._optimizer)
+                    lr = optimizer_unwrapped.param_groups[0]['lr']
+                    progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
 
         if self.accelerator.is_main_process:
             progress_bar.close()
-
-        # Validação (opcional, mas bom para monitoramento)
-        val_metrics = self.evaluate_shard(val_dataloader, global_epoch_num)
-        return val_metrics
-
-    def evaluate_shard(self, val_dataloader, global_epoch_num):
-        if val_dataloader is None:
-            return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
-            
-        self.model.eval()
-        all_labels, all_preds = [], []
-        total_val_loss = 0
         
-        progress_bar = None
-        if self.accelerator.is_main_process:
-            progress_bar = tqdm(total=len(val_dataloader), desc=f"Eval Epoch {global_epoch_num}", file=sys.stdout)
-
-        with torch.no_grad():
-            for data in val_dataloader:
-                nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
-                loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
-                loss_mlm = self.crit_mlm(mlm_out.view(-1, self.model.module.bert.emb.tok.num_embeddings), data["bert_label"].view(-1))
-                loss = loss_nsp + loss_mlm
-                
-                total_val_loss += loss.item()
-                
-                nsp_preds = nsp_out.argmax(dim=-1)
-                all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
-                all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
-                
-                if self.accelerator.is_main_process:
-                    progress_bar.update(1)
-
-        if self.accelerator.is_main_process:
-            progress_bar.close()
-            
+        avg_total_l = total_loss_ep / (len(all_labels) if all_labels else 1)
         precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
         accuracy = accuracy_score(all_labels, all_preds)
-        avg_loss = total_val_loss / len(val_dataloader)
+        metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
         
-        metrics = {"loss": avg_loss, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
-        self.logger.info(f"Validation Epoch {global_epoch_num} - Loss: {avg_loss:.4f}, Acc: {accuracy:.4f}")
+        if self.accelerator.is_main_process:
+            self.logger.info(f"{desc} - AvgLoss: {metrics['loss']:.4f}, NSP Acc: {metrics['accuracy']*100:.2f}%, F1: {metrics['f1']:.3f}")
+            
         return metrics
 
-# --- Funções de I/O e Pipeline (com Sincronização Explícita) ---
-
-def save_checkpoint(accelerator, args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
-    if not accelerator.is_main_process:
-        return
-    # ... (código da função save_checkpoint da versão accelerate, usando accelerator.unwrap_model)
-
-def load_checkpoint(args, model, optimizer, scheduler):
-    # ... (código da função load_checkpoint, carregando para CPU)
-
-def setup_and_train_tokenizer(args, logger):
-    # ... (código da função setup_and_train_tokenizer)
-
-def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
-    logger.info("--- Fase: Pré-Treinamento em Shards com Accelerate ---")
-    
-    # 1. Obter a lista de arquivos (APENAS NO PROCESSO PRINCIPAL)
-    all_files_master_list = []
-    if accelerator.is_main_process:
-        logger.info("Processo principal buscando a lista de arquivos de dados...")
-        base_data_path = args.s3_data_path.rstrip('/')
-        glob_data_path = f"{base_data_path}/batch_*.jsonl"
-        s3 = s3fs.S3FileSystem()
-        all_files_master_list = sorted(s3.glob(glob_data_path))
-        if not all_files_master_list:
-            logger.error(f"Nenhum arquivo de dados encontrado em '{glob_data_path}'. Encerrando.")
-            # É importante ter uma forma de encerrar todos os processos se algo der errado
-            # Aqui, simplesmente retornamos, mas em produção, um sinal de erro seria melhor.
-            return
-    
-    # --- CORREÇÃO: Sincronizar e transmitir a lista de arquivos ---
-    # O processo principal transmite a lista de arquivos para todos os outros processos.
-    # Isso garante que todos tenham a mesma lista na mesma ordem.
-    file_list_container = [all_files_master_list]
-    accelerator.wait_for_everyone()
-    dist.broadcast_object_list(file_list_container, src=0)
-    accelerator.wait_for_everyone()
-    all_files_master_list = file_list_container[0]
-    
-    if accelerator.is_main_process:
-        logger.info(f"Encontrados e distribuídos {len(all_files_master_list)} arquivos de dados para todos os processos.")
-
-    # 2. Instanciar modelo e otimizadores
-    model = ArticleBERTLMWithHeads(...)
-    optimizer = Adam(...)
-    scheduler = ScheduledOptim(...)
-    
-    # 3. Carregar checkpoint (lógica já é segura, pois só o rank 0 lê)
-    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
-    
-    # --- CORREÇÃO: Preparar os objetos com o Accelerator UMA VEZ ---
-    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
-    
-    trainer = PretrainingTrainer(accelerator, model, scheduler)
-
-    # 4. Loop de Época Global
-    for epoch_num in range(start_epoch, args.num_global_epochs):
-        if accelerator.is_main_process:
-            logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
-        
-        current_files = list(all_files_master_list)
-        if start_shard == 0:
-            random.shuffle(current_files) # Todos os processos embaralham com o mesmo seed
-        
-        file_shards = [current_files[i:i + args.files_per_shard_training] for i in range(0, len(current_files), args.files_per_shard_training)]
-        
-        # 5. Loop INTERNO sobre os shards
-        for shard_num in range(start_shard, len(file_shards)):
-            if accelerator.is_main_process:
-                logger.info(f"--- Processando Shard {shard_num + 1}/{len(file_shards)} (Época {epoch_num + 1}) ---")
-            
-            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
-            
-            # O DataLoader precisa ser preparado a cada novo shard
-            train_dl, val_dl = accelerator.prepare(
-                DataLoader(train_dataset, ...),
-                DataLoader(val_dataset, ...) if val_dataset else None
-            )
-
-            # O trainer agora usa os dataloaders preparados
-            val_metrics = trainer.train_shard(train_dl, val_dl, epoch_num + 1)
-            
-            # --- CORREÇÃO: Sincronizar antes de salvar o checkpoint ---
-            accelerator.wait_for_everyone()
-            save_checkpoint(accelerator, args, epoch_num, shard_num, model, optimizer, scheduler, val_metrics['loss'])
-        
-        start_shard = 0
-
-def main():
-    # --- CORREÇÃO: Inicialização do Accelerator e logging seguro ---
-    # `gradient_accumulation_steps` pode ser útil para aumentar o batch size efetivo
-    accelerator = Accelerator(gradient_accumulation_steps=2)
-    
-    ARGS = parse_args()
-    
-    # Apenas o processo principal configura o logging
-    if accelerator.is_main_process:
-        # ... (código de setup de logging) ...
-    
-    logger = logging.getLogger(__name__)
-    
-    # Transmite as configurações para todos os processos
-    if accelerator.is_main_process:
-        logger.info(f"Treinando com Accelerate em {accelerator.num_processes} processos.")
-        # ... (log das configurações) ...
-    
-    # --- CORREÇÃO: Sincronização explícita após a criação do tokenizador ---
-    if accelerator.is_main_process:
-        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
-    
-    accelerator.wait_for_everyone() # Garante que o tokenizador foi salvo
-    
-    if not accelerator.is_main_process:
-        # Outros processos carregam o tokenizador que o processo principal salvou
-        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
-        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
-        pad_id = tokenizer.pad_token_id
-    
-    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+    def train(self, num_epochs):
+        best_val_metrics = {"loss": float('inf')}
+        for epoch in range(num_epochs):
+            self.train_dl.sampler.set_epoch(epoch) if hasattr(self.train_dl, 'sampler') and hasattr(self.train_dl.sampler, 'set_epoch') else None
+            self._run_epoch(epoch, is_training=True)
+            val_metrics = {"loss": float('inf')}
+            if self.val_dl:
+                with torch.no_grad():
+                    val_metrics = self._run_epoch(epoch, is_training=False)
+            if val_metrics["loss"] < best_val_metrics["loss"]:
+                best_val_metrics = val_metrics
+        return best_val_metrics
 //////////////////////////////////////
 # Dentro da classe PretrainingTrainer
 
