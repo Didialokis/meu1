@@ -1,3 +1,30 @@
+
+    def train(self, num_epochs):
+        """
+        Orquestra o loop de treinamento e validação para as épocas dentro de um shard.
+        """
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
+        
+        best_val_metrics = {"loss": float('inf')}
+        for epoch in range(num_epochs):
+            # Fase de Treino
+            self._run_epoch(epoch, is_training=True)
+            
+            # Fase de Validação
+            val_metrics = {"loss": float('inf')}
+            if self.val_dl:
+                # torch.no_grad é seguro para usar com accelerate na validação
+                with torch.no_grad():
+                    val_metrics = self._run_epoch(epoch, is_training=False)
+            
+            # Apenas o processo principal compara e armazena as melhores métricas
+            if self.accelerator.is_main_process:
+                if val_metrics["loss"] < best_val_metrics["loss"]:
+                    best_val_metrics = val_metrics
+        
+        return best_val_metrics
+//////////////////////////////////////
 # Dentro da classe PretrainingTrainer
 
 def _run_epoch(self, epoch_num, is_training):
