@@ -1,28 +1,102 @@
 
+    # Substitua sua classe PretrainingTrainer inteira por esta versão
+
+class PretrainingTrainer:
+    """
+    Gerencia o loop de treinamento para um único shard de dados,
+    integrado com a biblioteca Accelerate para treinamento distribuído.
+    """
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        
+        # Os objetos já foram "preparados" pelo accelerator antes de chegar aqui
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule
+        
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
+
+    def _run_epoch(self, epoch_num, is_training):
+        """Executa uma única época de treinamento ou validação em um shard."""
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl:
+            return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+        
+        total_loss_ep = 0.0
+        all_labels, all_preds = [], []
+        
+        mode = "Train" if is_training else "Val"
+        desc = f"Epoch {epoch_num+1} [{mode}]"
+        
+        progress_bar = None
+        if self.accelerator.is_main_process:
+            progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+        for i_batch, data in enumerate(dl):
+            with self.accelerator.autocast(): # Para mixed precision, se habilitado
+                nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+                loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+                loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+                loss = loss_nsp + loss_mlm
+
+            if is_training:
+                self.opt_schedule.zero_grad()
+                self.accelerator.backward(loss)
+                self.opt_schedule.step_and_update_lr()
+            
+            total_loss_ep += self.accelerator.gather(loss).sum().item()
+            
+            nsp_preds = nsp_out.argmax(dim=-1)
+            all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+            all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+            if self.accelerator.is_main_process:
+                progress_bar.update(1)
+                if (i_batch + 1) % self.log_freq == 0:
+                    optimizer_for_lr = self.opt_schedule._optimizer
+                    # Se o otimizador foi preparado pelo accelerate, ele pode ser um wrapper
+                    if hasattr(optimizer_for_lr, 'optimizer'):
+                        optimizer_for_lr = optimizer_for_lr.optimizer
+                    lr = optimizer_for_lr.param_groups[0]['lr']
+                    progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
+
+        if self.accelerator.is_main_process:
+            progress_bar.close()
+        
+        avg_total_l = total_loss_ep / (len(all_labels) if len(all_labels) > 0 else 1)
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+        accuracy = accuracy_score(all_labels, all_preds)
+        
+        metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+        
+        if self.accelerator.is_main_process:
+            self.logger.info(
+                f"{desc} - "
+                f"AvgLoss: {metrics['loss']:.4f}, NSP Acc: {metrics['accuracy']*100:.2f}%, "
+                f"Precision: {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}, F1-Score: {metrics['f1']:.3f}"
+            )
+        return metrics
+
     def train(self, num_epochs):
         """
-        Orquestra o loop de treinamento e validação para as épocas dentro de um shard.
+        Método principal que executa o loop de treinamento e validação para um shard.
         """
-        if self.accelerator.is_main_process:
-            self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
-        
+        self.logger.info(f"Iniciando treinamento neste shard por {num_epochs} época(s).")
         best_val_metrics = {"loss": float('inf')}
         for epoch in range(num_epochs):
-            # Fase de Treino
-            self._run_epoch(epoch, is_training=True)
-            
-            # Fase de Validação
+            self.train_metrics = self._run_epoch(epoch, is_training=True)
             val_metrics = {"loss": float('inf')}
             if self.val_dl:
-                # torch.no_grad é seguro para usar com accelerate na validação
                 with torch.no_grad():
                     val_metrics = self._run_epoch(epoch, is_training=False)
-            
-            # Apenas o processo principal compara e armazena as melhores métricas
-            if self.accelerator.is_main_process:
-                if val_metrics["loss"] < best_val_metrics["loss"]:
-                    best_val_metrics = val_metrics
-        
+            if val_metrics["loss"] < best_val_metrics["loss"]:
+                best_val_metrics = val_metrics
         return best_val_metrics
 //////////////////////////////////////
 # Dentro da classe PretrainingTrainer
