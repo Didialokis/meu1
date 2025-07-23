@@ -1,3 +1,73 @@
+
+# Dentro da classe PretrainingTrainer
+# (O __init__ e a função train() permanecem os mesmos da versão anterior do accelerate)
+
+def _run_epoch(self, epoch_num, is_training):
+    self.model.train(is_training)
+    dl = self.train_dl if is_training else self.val_dl
+    if not dl: 
+        return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+    
+    total_loss_ep = 0.0
+    all_labels, all_preds = [], []
+    
+    mode = "Train" if is_training else "Val"
+    desc = f"Epoch {epoch_num+1} [{mode}]"
+    
+    # --- CORREÇÃO: Padrão de atualização manual do tqdm ---
+    # 1. Crie a barra de progresso manualmente, apenas no processo principal.
+    progress_bar = None
+    if self.accelerator.is_main_process:
+        progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+    # 2. TODOS os processos iteram sobre o MESMO objeto DataLoader (dl).
+    for i_batch, data in enumerate(dl):
+        # A lógica de treinamento permanece a mesma
+        nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+        loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+        loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+        loss = loss_nsp + loss_mlm
+
+        if is_training:
+            self.opt_schedule.zero_grad()
+            self.accelerator.backward(loss)
+            self.opt_schedule.step_and_update_lr()
+        
+        total_loss_ep += loss.item()
+        
+        nsp_preds = nsp_out.argmax(dim=-1)
+        # accelerator.gather() é a forma correta de coletar tensores de todas as GPUs
+        all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+        all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+        # 3. Apenas o processo principal atualiza a barra de progresso.
+        if self.accelerator.is_main_process:
+            progress_bar.update(1)
+            if (i_batch + 1) % self.log_freq == 0:
+                lr = self.opt_schedule._optimizer.param_groups[0]['lr']
+                progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
+
+    # 4. Apenas o processo principal fecha a barra.
+    if self.accelerator.is_main_process:
+        progress_bar.close()
+    
+    # O cálculo de métricas agora usa os dados agregados de TODAS as GPUs
+    avg_total_l = total_loss_ep / len(dl)
+    # ... (código para calcular precision, recall, f1 a partir de all_labels e all_preds) ...
+    
+    # Apenas o processo principal deve logar o resultado final da época
+    if self.accelerator.is_main_process:
+        self.logger.info(
+            f"{desc} - "
+            f"AvgLoss: {metrics['loss']:.4f}, "
+            f"NSP Acc: {metrics['accuracy']*100:.2f}%, "
+            f"Precision: {metrics['precision']:.3f}, "
+            f"Recall: {metrics['recall']:.3f}, "
+            f"F1-Score: {metrics['f1']:.3f}"
+        )
+    return metrics
+////////////////////////////////////////////////////
+
 class ArticleStyleBERTDataset(Dataset):
     def __init__(self, corpus_sents_list, tokenizer_instance, seq_len_config):
         self.logger = logging.getLogger(self.__class__.__name__)
