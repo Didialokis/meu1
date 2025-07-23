@@ -1,4 +1,80 @@
+# Dentro da classe PretrainingTrainer
 
+def _run_epoch(self, epoch_num, is_training):
+    self.model.train(is_training)
+    # O train_dl/val_dl aqui já foi "preparado" pelo accelerator
+    dl = self.train_dl if is_training else self.val_dl
+    if not dl:
+        return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+    
+    total_loss_ep = 0.0
+    all_labels, all_preds = [], []
+    
+    mode = "Train" if is_training else "Val"
+    desc = f"Epoch {epoch_num+1} [{mode}]"
+    
+    # --- MODIFICAÇÃO: Usar o padrão de atualização manual do tqdm ---
+    # Apenas o processo principal (main process) cria e gerencia a barra de progresso
+    progress_bar = None
+    if self.accelerator.is_main_process:
+        progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+    for i_batch, data in enumerate(dl):
+        # A lógica de treinamento permanece a mesma
+        nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+        loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+        loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+        loss = loss_nsp + loss_mlm
+
+        if is_training:
+            self.opt_schedule.zero_grad()
+            self.accelerator.backward(loss)
+            self.opt_schedule.step_and_update_lr()
+        
+        # O accelerator cuida de agregar as perdas entre os processos
+        total_loss_ep += self.accelerator.gather(loss).sum().item()
+        
+        # Agrega predições e rótulos de todos os processos para o cálculo de métricas
+        nsp_preds = nsp_out.argmax(dim=-1)
+        all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+        all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+        # Apenas o processo principal atualiza a barra
+        if self.accelerator.is_main_process:
+            progress_bar.update(1)
+            if (i_batch + 1) % self.log_freq == 0:
+                # O otimizador pode ser um wrapper, acessamos o original para o LR
+                optimizer = self.accelerator.unwrap_model(self.opt_schedule._optimizer)
+                lr = optimizer.param_groups[0]['lr']
+                progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
+
+    # Fecha a barra de progresso no processo principal
+    if self.accelerator.is_main_process:
+        progress_bar.close()
+    
+    # O cálculo de métricas agregadas agora usa os dados de todas as GPUs
+    avg_total_l = total_loss_ep / (len(all_labels) if len(all_labels) > 0 else 1)
+    
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary', pos_label=1, zero_division=0
+    )
+    accuracy = accuracy_score(all_labels, all_preds)
+    
+    metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+    
+    # Apenas o processo principal exibe o log final da época/shard
+    if self.accelerator.is_main_process:
+        self.logger.info(
+            f"{desc} - "
+            f"AvgLoss: {metrics['loss']:.4f}, "
+            f"NSP Acc: {metrics['accuracy']*100:.2f}%, "
+            f"Precision: {metrics['precision']:.3f}, "
+            f"Recall: {metrics['recall']:.3f}, "
+            f"F1-Score: {metrics['f1']:.3f}"
+        )
+    return metrics
+
+////////////////////////////////////////////////
 # Dentro da classe PretrainingTrainer
 # (O __init__ e a função train() permanecem os mesmos da versão anterior do accelerate)
 
