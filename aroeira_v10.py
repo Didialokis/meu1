@@ -1,98 +1,195 @@
-from accelerate import Accelerator
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
-from tqdm.auto import tqdm
+1. Importações e parse_args
 
-# ... (suas outras classes e funções) ...
+Adicione as importações necessárias no topo do seu arquivo. A função parse_args não precisa de grandes mudanças.
 
-# --- CORREÇÃO: Substitua sua classe PretrainingTrainer inteira por esta ---
+Python
+
+# Adicione estas importações no topo do arquivo
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
+
+# A função parse_args permanece a mesma da última versão standalone
+def parse_args():
+    # ...
+2. Função main() - Orquestração da Inicialização Distribuída
+
+Esta função muda significativamente para configurar o ambiente DDP.
+
+Python
+
+def main():
+    # --- MODIFICAÇÃO: Inicialização do ambiente DistributedDataParallel ---
+    # `torchrun` define estas variáveis de ambiente automaticamente.
+    # O backend 'nccl' é otimizado para comunicação entre GPUs NVIDIA.
+    dist.init_process_group(backend='nccl')
+    
+    # Cada processo é associado a uma GPU específica.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_rank = int(os.environ["RANK"])
+    torch.cuda.set_device(local_rank)
+    
+    ARGS = parse_args()
+    # Adicionamos os ranks aos argumentos para fácil acesso em outras funções
+    ARGS.local_rank = local_rank
+    ARGS.global_rank = global_rank
+    ARGS.device = local_rank # O dispositivo de cada processo é sua GPU local
+
+    # Apenas o processo principal (rank 0) deve configurar logs e criar diretórios.
+    if ARGS.global_rank == 0:
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+        setup_logging(ARGS.log_level, str(log_file))
+    
+    logger = logging.getLogger(__name__)
+
+    if ARGS.global_rank == 0:
+        logger.info(f"Treinamento distribuído DDP iniciado com {dist.get_world_size()} GPUs.")
+        logger.info("--- Configurações Utilizadas ---")
+        for arg_name, value in vars(ARGS).items(): logger.info(f"{arg_name}: {value}")
+        logger.info("---------------------------------")
+    
+    # dist.barrier() força todos os processos a esperarem neste ponto.
+    # Garante que o rank 0 criou os diretórios antes que os outros prossigam.
+    dist.barrier()
+    
+    # Apenas o processo principal prepara o tokenizador
+    if ARGS.global_rank == 0:
+        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    
+    # Sincroniza novamente: garante que o tokenizador foi salvo antes que outros processos o leiam
+    dist.barrier()
+    
+    if ARGS.global_rank != 0:
+        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
+        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+        pad_id = tokenizer.pad_token_id
+
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
+    
+    # Limpa o grupo de processos ao final
+    dist.destroy_process_group()
+3. run_pretraining_on_shards() - Adaptada para DDP
+
+Esta função agora cria o DistributedSampler e envolve o modelo com DDP.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info(f"--- [GPU {args.global_rank}] Iniciando Fase de Pré-Treinamento em Shards ---")
+    
+    # ... (código para listar arquivos do S3) ...
+
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint ANTES de envolver o modelo com DDP
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    # --- MODIFICAÇÃO: Mover o modelo para sua GPU designada e envolvê-lo com DDP ---
+    model.to(args.local_rank)
+    model = DDP(model, device_ids=[args.local_rank])
+    
+    is_main_process = (args.global_rank == 0)
+
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar file_shards) ...
+        
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
+
+            # --- MODIFICAÇÃO: Usar o DistributedSampler ---
+            # O sampler garante que cada GPU receba uma porção diferente dos dados.
+            train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            # Ao usar um sampler, o shuffle do DataLoader DEVE ser False.
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size_pretrain, shuffle=False, 
+                                  num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
+            
+            val_dl = None
+            if val_dataset:
+                val_sampler = DistributedSampler(val_dataset, shuffle=False)
+                val_dl = DataLoader(val_dataset, batch_size=args.batch_size_pretrain, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True, sampler=val_sampler)
+            
+            # Passa o is_main_process para o Trainer para controlar o tqdm
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, args.device, 
+                                         pad_id, tokenizer.vocab_size, args.logging_steps, 
+                                         is_main_process=is_main_process)
+            
+            # --- MODIFICAÇÃO: O Trainer precisa saber a época para o sampler ---
+            # O trainer.train agora deve receber a época atual
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard, current_global_epoch=epoch_num)
+            
+            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+4. PretrainingTrainer e Checkpoints - Ajustes Finais
+
+O Trainer precisa chamar sampler.set_epoch() para garantir um embaralhamento diferente a cada época. As funções de checkpoint precisam usar o .module e o rank.
+
+Python
+
 class PretrainingTrainer:
-    """
-    Trainer adaptado para funcionar com Hugging Face Accelerate.
-    Recebe os objetos já "preparados" pelo accelerator.
-    """
-    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, 
-                 pad_idx_mlm_loss, vocab_size, log_freq=100):
-        
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.accelerator = accelerator
-        
-        # Os objetos já foram movidos para o device correto pelo accelerator.prepare()
-        self.model = model
-        self.train_dl = train_dataloader
-        self.val_dl = val_dataloader
-        self.opt_schedule = optimizer_schedule
-        
-        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
-        self.crit_nsp = nn.NLLLoss()
-        self.log_freq = log_freq
-        self.vocab_size = vocab_size
+    # Adiciona is_main_process
+    def __init__(self, model, train_dataloader, val_dataloader, ..., is_main_process=False):
+        # ...
+        self.is_main_process = is_main_process
 
-    def _run_epoch(self, epoch_num, is_training):
-        self.model.train(is_training)
-        dl = self.train_dl if is_training else self.val_dl
-        if not dl:
-            return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
-        
-        total_loss_ep = 0.0
-        all_labels, all_preds = [], []
-        
-        mode = "Train" if is_training else "Val"
-        desc = f"Epoch {epoch_num+1} [{mode}]"
-        
-        progress_bar = None
-        if self.accelerator.is_main_process:
-            progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
-
-        for i_batch, data in enumerate(dl):
-            # O DataLoader do Accelerate já move 'data' para a GPU
-            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
-            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
-            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
-            loss = loss_nsp + loss_mlm
-
-            if is_training:
-                self.opt_schedule.zero_grad()
-                self.accelerator.backward(loss)
-                self.opt_schedule.step_and_update_lr()
-            
-            total_loss_ep += self.accelerator.gather(loss).sum().item()
-            
-            nsp_preds = nsp_out.argmax(dim=-1)
-            all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
-            all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
-
-            if self.accelerator.is_main_process:
-                progress_bar.update(1)
-                if (i_batch + 1) % self.log_freq == 0:
-                    optimizer_unwrapped = self.accelerator.unwrap_model(self.opt_schedule._optimizer)
-                    lr = optimizer_unwrapped.param_groups[0]['lr']
-                    progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
-
-        if self.accelerator.is_main_process:
-            progress_bar.close()
-        
-        avg_total_l = total_loss_ep / (len(all_labels) if all_labels else 1)
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
-        accuracy = accuracy_score(all_labels, all_preds)
-        metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
-        
-        if self.accelerator.is_main_process:
-            self.logger.info(f"{desc} - AvgLoss: {metrics['loss']:.4f}, NSP Acc: {metrics['accuracy']*100:.2f}%, F1: {metrics['f1']:.3f}")
-            
-        return metrics
-
-    def train(self, num_epochs):
-        best_val_metrics = {"loss": float('inf')}
+    # Recebe a época global atual
+    def train(self, num_epochs, current_global_epoch=0):
+        # ...
         for epoch in range(num_epochs):
-            self.train_dl.sampler.set_epoch(epoch) if hasattr(self.train_dl, 'sampler') and hasattr(self.train_dl.sampler, 'set_epoch') else None
+            # --- MODIFICAÇÃO CRUCIAL: Informar ao sampler a época atual ---
+            # Isso garante que o embaralhamento seja diferente a cada passagem.
+            if isinstance(self.train_dl.sampler, DistributedSampler):
+                # Usamos a época global para garantir um embaralhamento único
+                self.train_dl.sampler.set_epoch(current_global_epoch)
+            
+            # Passa a época local para _run_epoch
             self._run_epoch(epoch, is_training=True)
-            val_metrics = {"loss": float('inf')}
-            if self.val_dl:
-                with torch.no_grad():
-                    val_metrics = self._run_epoch(epoch, is_training=False)
-            if val_metrics["loss"] < best_val_metrics["loss"]:
-                best_val_metrics = val_metrics
-        return best_val_metrics
+            # ...
+
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    # Apenas o processo principal salva
+    if args.global_rank != 0:
+        return
+
+    # Com DDP, o modelo original está em .module
+    model_state = model.module.state_dict()
+    # ... (resto da função de salvar)
+
+def load_checkpoint(args, model, optimizer, scheduler):
+    # ... (lógica para encontrar o checkpoint)
+    
+    # Mapeia o checkpoint para a GPU correta de cada processo
+    map_location = f'cuda:{args.local_rank}'
+    checkpoint = torch.load(buffer_or_path, map_location=map_location)
+    
+    # Carrega o estado no modelo base (ainda não envolvido por DDP)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    # ... (resto da função de carregar)
+Como Executar (com torchrun)
+Você não usará mais python seu_script.py. O comando correto para lançar 8 processos (um para cada GPU) em uma única máquina é:
+
+Bash
+
+torchrun --standalone --nproc_per_node=8 seu_script.py \
+    --s3_data_path "s3://seu-bucket/caminho/para/os/batches/" \
+    --num_global_epochs 50 \
+    --files_per_shard_training 10 \
+    --batch_size_pretrain 32 \
+    --output_dir "./bert_ddp_output" \
+    --checkpoint_dir "./checkpoints_ddp"
+O que este comando faz:
+
+torchrun: O lançador de processos do PyTorch.
+
+--standalone: Indica que todos os processos estão na mesma máquina.
+
+--nproc_per_node=8: Especifica para criar 8 processos, um para cada uma das suas 8 GPUs.
 //////////////////////////////////////
 # Dentro da classe PretrainingTrainer
 
