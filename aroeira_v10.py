@@ -1,3 +1,36 @@
+# Adicione esta importação no topo do seu arquivo, junto com as outras
+from accelerate.utils import DistributedDataParallelKwargs
+
+def main():
+    # --- MODIFICAÇÃO: Configurar o Accelerator para encontrar parâmetros não utilizados ---
+    # 1. Crie um handler de kwargs para o DistributedDataParallel
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    
+    # 2. Passe o handler para o construtor do Accelerator
+    # O timeout maior também pode ajudar em redes mais lentas ou modelos grandes.
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], log_with="tensorboard", project_dir=os.path.join(os.getcwd(), "logs")) # Adicionado log_with para TensorBoard
+    # ----------------------------------------------------------------------------------
+    
+    ARGS = parse_args()
+    
+    # Apenas o processo principal (rank 0) deve configurar logs e criar diretórios
+    if accelerator.is_main_process:
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+        setup_logging(ARGS.log_level, str(log_file))
+    
+    logger = logging.getLogger(__name__)
+
+    # O resto da sua função main permanece o mesmo...
+    # ...
+    # ... (código para carregar/treinar tokenizador e chamar run_pretraining_on_shards) ...
+    # ...
+
+///////////
+
+
+
 1. run_pretraining_on_shards() - Ordem dos Argumentos Corrigida
 
 A mudança principal é na ordem dos objetos retornados por accelerator.prepare() e na subsequente chamada para PretrainingTrainer.
