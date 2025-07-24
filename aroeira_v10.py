@@ -1,3 +1,93 @@
+1. run_pretraining_on_shards() - Ordem dos Argumentos Corrigida
+
+A mudança principal é na ordem dos objetos retornados por accelerator.prepare() e na subsequente chamada para PretrainingTrainer.
+
+Python
+
+def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
+    logger.info(f"--- Treinando com o Accelerate no dispositivo: {accelerator.device} ---")
+    
+    # ... (código para listar arquivos e criar file_shards) ...
+
+    # Instancia modelo e otimizadores na CPU primeiro
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint nos modelos brutos (na CPU)
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ... (código para embaralhar e criar file_shards) ...
+        
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
+            
+            train_dl = DataLoader(...)
+            val_dl = DataLoader(...) if val_dataset else None
+
+            # --- CORREÇÃO: Alinhar a ordem dos objetos aqui ---
+            # A ordem em que você passa os objetos para .prepare() é a ordem em que eles são retornados.
+            # Vamos garantir que seja consistente.
+            prepared_model, prepared_optimizer, prepared_train_dl, prepared_val_dl = accelerator.prepare(
+                model, optimizer, train_dl, val_dl
+            )
+            # Nota: O scheduler customizado `ScheduledOptim` não é passado para `prepare`.
+            # Ele continuará a funcionar corretamente com o `prepared_optimizer`.
+            
+            # --- CORREÇÃO: Alinhar a chamada do Trainer com a definição do __init__ ---
+            trainer = PretrainingTrainer(
+                model=prepared_model,
+                train_dataloader=prepared_train_dl,
+                val_dataloader=prepared_val_dl,
+                optimizer_schedule=scheduler,  # Passamos o scheduler original, que controla o optimizer preparado
+                accelerator=accelerator,
+                pad_idx_mlm_loss=pad_id,
+                vocab_size=tokenizer.vocab_size,
+                log_freq=args.logging_steps
+            )
+
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Salva o checkpoint
+            save_checkpoint(args, accelerator, epoch_num, shard_num, prepared_model, prepared_optimizer, scheduler, best_loss_in_shard)
+            
+        start_shard = 0
+2. PretrainingTrainer.__init__() - Assinatura Clara
+
+Vamos garantir que a definição do __init__ use argumentos nomeados (keyword arguments) para evitar qualquer ambiguidade futura.
+
+Python
+
+class PretrainingTrainer:
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, 
+                 pad_idx_mlm_loss, vocab_size, log_freq=100):
+        
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        
+        # Objetos já estão preparados e no dispositivo correto
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule # Este é o nosso wrapper customizado
+        
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
+
+    # A função _run_epoch e train permanecem as mesmas da última versão do accelerate
+    # que já incluía a correção do tqdm e do accelerator.gather().
+    # ...
+Resumo da Correção
+O erro foi causado por uma simples troca na ordem dos argumentos ao chamar PretrainingTrainer. A solução é:
+
+Ser explícito na ordem dos objetos retornados por accelerator.prepare().
+
+Ser explícito na chamada para PretrainingTrainer, usando argumentos nomeados (model=..., train_dataloader=...) para garantir que cada objeto vá para o parâmetro correto.
+
+//////////////////////////////////////////////////////////////
 1. Importações e parse_args
 
 Adicione as importações necessárias no topo do seu arquivo. A função parse_args não precisa de grandes mudanças.
