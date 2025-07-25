@@ -1,131 +1,92 @@
-def main():
-    # Instancia o Accelerator no início
-    accelerator = Accelerator()
-    
-    ARGS = parse_args()
+2. Modifique a função run_pretraining_on_shards:
 
-    # --- MODIFICAÇÃO: Apenas o processo principal configura logs e cria diretórios ---
-    if accelerator.is_main_process:
-        # Garante que os diretórios de output existam
-        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
-        Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Configura o logging
-        log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
-        setup_logging(ARGS.log_level, str(log_file))
-    
-    logger = logging.getLogger(__name__)
-
-    # Apenas o processo principal exibe os logs de configuração
-    if accelerator.is_main_process:
-        logger.info(f"Treinamento distribuído com Accelerate iniciado em {accelerator.num_processes} processos.")
-        logger.info(f"Dispositivo do processo principal: {accelerator.device}")
-        logger.info("--- Configurações Utilizadas ---")
-        for arg_name, value in vars(ARGS).items():
-            logger.info(f"{arg_name}: {value}")
-        logger.info("---------------------------------")
-    
-    # Apenas o processo principal executa o setup do tokenizador
-    if accelerator.is_main_process:
-        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
-    
-    # accelerator.wait_for_everyone() garante que os outros processos esperem
-    # o processo principal terminar de criar o tokenizador antes de continuarem.
-    accelerator.wait_for_everyone()
-    
-    if not accelerator.is_main_process:
-        # Outros processos carregam o tokenizador que o principal salvou
-        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
-        tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
-        pad_id = tokenizer.pad_token_id
-
-    # A função de treinamento principal recebe o accelerator para gerenciar seus próprios logs
-    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
-2. load_data_shard - Controlando a Barra de Progresso do Carregamento
-
-A barra de progresso do tqdm também é uma saída de texto e deve ser controlada.
-
-Python
-
-def load_data_shard(streamed_ds, args, logger, shard_num: int, is_main_process: bool):
-    # ... (código para pular registros) ...
-    shard_iterator = streamed_ds.skip(records_to_skip).take(args.shard_size)
-    
-    # --- MODIFICAÇÃO: Apenas o processo principal deve mostrar a barra de progresso ---
-    # Para os outros, `shard_iterator` continua sendo o iterador puro.
-    if is_main_process:
-        shard_iterator = tqdm(shard_iterator, desc=f"Processando Shard {shard_num + 1}", total=args.shard_size)
-        
-    shard_sents_list = []
-    text_col = "text"
-    for ex in shard_iterator:
-        # ... (lógica para adicionar sentenças) ...
-    
-    return shard_sents_list
-3. run_pretraining_on_shards - Passando o Sinalizador e Controlando Logs
-
-Esta função precisa passar o sinalizador is_main_process para as funções que ela chama.
+Nesta função, vamos comentar a criação do seu ScheduledOptim e criar os otimizadores padrão.
 
 Python
 
 def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
-    is_main_process = accelerator.is_main_process # Armazena o estado para fácil acesso
+    # ... (código para listar arquivos do S3) ...
 
-    if is_main_process:
-        logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
+    # Instancia o modelo
+    model = ArticleBERTLMWithHeads(...)
     
-    # ... (código para instanciar modelo, otimizador, scheduler e carregar checkpoint) ...
+    # --- MODIFICAÇÃO DE DIAGNÓSTICO: Use AdamW e um scheduler padrão ---
+    # Comente seu otimizador customizado
+    # optimizer = Adam(...)
+    # scheduler = ScheduledOptim(optimizer, args.model_d_model, args.warmup_steps)
+    
+    # Crie o otimizador padrão
+    optimizer = AdamW(model.parameters(), lr=args.lr_pretrain)
 
+    # Calcule o número total de passos de treinamento para o scheduler
+    # (Isso é uma estimativa, mas suficiente para o diagnóstico)
+    s3 = s3fs.S3FileSystem(); all_files = sorted(s3.glob(...))
+    num_files_per_shard = args.files_per_shard_training
+    file_shards = [all_files[i:i + num_files_per_shard] for i in range(0, len(all_files), num_files_per_shard)]
+    # Estimativa do total de batches
+    num_training_steps = len(file_shards) * (args.shard_size // args.batch_size_pretrain) * args.num_global_epochs
+    
+    # Crie o scheduler padrão
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=num_training_steps
+    )
+    # --------------------------------------------------------------------
+    
+    # Carrega o checkpoint. NOTA: Se você tiver um checkpoint salvo com o otimizador antigo,
+    # ele pode dar erro aqui. Talvez seja necessário apagar a pasta de checkpoints para este teste.
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
     for epoch_num in range(start_epoch, args.num_global_epochs):
-        if is_main_process:
-            logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
-        
-        # ... (código para embaralhar e criar os file_shards) ...
-        
+        # ... (loop de shards) ...
         for shard_num in range(start_shard, len(file_shards)):
-            if is_main_process:
-                logger.info(f"--- Processando Shard {shard_num + 1}/{len(file_shards)} ---")
+            # ... (criação de dataloaders) ...
             
-            # Passa o sinalizador para a função de carregamento
-            sentences_list = load_data_shard(streamed_ds, args, logger, shard_num, is_main_process)
+            # O accelerator.prepare() funciona perfeitamente com os objetos padrão
+            prepared_model, prepared_optimizer, prepared_train_dl, prepared_val_dl, prepared_scheduler = accelerator.prepare(
+                model, optimizer, train_dl, val_dl, scheduler
+            )
             
-            # ... (código para criar DataLoaders e passar para accelerator.prepare) ...
-            
-            trainer = PretrainingTrainer(...) # O Trainer já foi adaptado para receber o accelerator
-            best_loss_in_shard = trainer.train(...)
-            
-            # A função save_checkpoint já é segura, pois usa accelerator.is_main_process
-            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
-            
-        start_shard = 0
-4. PretrainingTrainer._run_epoch - Barra de Progresso do Treinamento
+            # Instancia o Trainer com os objetos preparados
+            trainer = PretrainingTrainer(
+                prepared_model, prepared_train_dl, prepared_val_dl, 
+                prepared_optimizer,  # Passe o otimizador diretamente
+                prepared_scheduler,  # Passe o scheduler diretamente
+                accelerator, pad_id, tokenizer.vocab_size, args.logging_steps
+            )
+            # ...
+3. Modifique a classe PretrainingTrainer para usar o scheduler padrão:
 
-Como já fizemos na correção do "deadlock", a barra de progresso aqui já deve estar protegida. Vamos apenas confirmar.
+O Trainer agora receberá o otimizador e o scheduler separadamente e chamará scheduler.step() após optimizer.step().
 
 Python
 
 class PretrainingTrainer:
+    # --- MODIFICAÇÃO DE DIAGNÓSTICO: __init__ e _run_epoch ---
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer, scheduler, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        # Recebe o otimizador e scheduler separadamente
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        # ... resto do __init__ ...
+
     def _run_epoch(self, epoch_num, is_training):
         # ...
-        progress_bar = None
-        # --- CONFIRMAÇÃO: A barra só é criada no processo principal ---
-        if self.accelerator.is_main_process:
-            progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
-
         for i_batch, data in enumerate(dl):
-            # ... (lógica de treinamento) ...
-
-            # Apenas o processo principal atualiza a barra
-            if self.accelerator.is_main_process:
-                progress_bar.update(1)
-                # ... (lógica de set_postfix) ...
-
-        if self.accelerator.is_main_process:
-            progress_bar.close()
-            # Apenas o processo principal exibe o log final
-            self.logger.info(f"{desc} - AvgLoss: {metrics['loss']:.4f}, ...")
-        
-        return metrics
+            # ... (forward pass e cálculo da loss)
+            if is_training:
+                # Otimizador e scheduler padrão não têm o método zero_grad() combinado
+                self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                self.optimizer.step()
+                self.scheduler.step() # O scheduler é chamado a cada passo
+        # ...
+Diagnóstico e Solução Final
 
 ///////////
 
