@@ -1,3 +1,113 @@
+1. load_checkpoint() - A Nova Lógica Inteligente
+
+Esta função agora recebe o número total de shards por época para poder tomar a decisão correta.
+
+Python
+
+# A função save_checkpoint permanece a mesma da versão anterior.
+
+# --- CORREÇÃO: Função de carregar checkpoint com lógica de resumo explícita ---
+def load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch):
+    """
+    Carrega o último checkpoint.
+    Calcula explicitamente se deve continuar a época atual ou iniciar a próxima.
+    """
+    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
+    start_epoch = 0
+    start_shard = 0
+    
+    if not checkpoint_path.exists(): # Assumindo que a verificação de S3/local já foi feita
+        logging.info("Nenhum checkpoint encontrado. Iniciando do zero.")
+        return start_epoch, start_shard
+
+    logging.info(f"Carregando checkpoint de: {checkpoint_path}")
+    # A lógica de carregar de S3 (boto3) ou local permanece a mesma
+    # ... (código para carregar o `checkpoint` em um dicionário)
+    
+    # Aplica o estado aos objetos
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    save_checkpoint.global_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    
+    if 'rng_state' in checkpoint:
+        random.setstate(checkpoint['rng_state'])
+    
+    # --- NOVA LÓGICA DE RESUMO ---
+    last_completed_epoch = checkpoint.get('global_epoch', 0)
+    last_completed_shard = checkpoint.get('shard_num', -1)
+    
+    # Verifica se o último shard salvo foi o final da época
+    if last_completed_shard == total_shards_per_epoch - 1:
+        # Se sim, a época inteira foi concluída. Comece da PRÓXIMA época, shard 0.
+        start_epoch = last_completed_epoch + 1
+        start_shard = 0
+        logging.info(f"Época {last_completed_epoch + 1} foi totalmente concluída.")
+    else:
+        # Se não, a época foi interrompida. Continue da MESMA época, próximo shard.
+        start_epoch = last_completed_epoch
+        start_shard = last_completed_shard + 1
+
+    logging.info(f"Checkpoint carregado. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
+    return start_epoch, start_shard
+2. run_pretraining_on_shards() - Orquestrando a Correção
+
+Esta função agora passa o número total de shards para load_checkpoint e usa a lógica de reinício de start_shard de forma mais segura.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
+    
+    # 1. Obter a lista de todos os arquivos de dados e calcular o número de shards
+    logger.info("Buscando a lista completa de arquivos de dados...")
+    # ... (código para obter all_files_master_list)
+    
+    num_files_per_shard = args.files_per_shard_training
+    file_shards = [all_files_master_list[i:i + num_files_per_shard] for i in range(0, len(all_files_master_list), num_files_per_shard)]
+    total_shards_in_epoch = len(file_shards)
+    logger.info(f"Encontrados {len(all_files_master_list)} arquivos, divididos em {total_shards_in_epoch} shards.")
+
+    # 2. Instanciar modelo e otimizadores
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # --- MODIFICAÇÃO: Passar o total de shards para a função de carregamento ---
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler, total_shards_in_epoch)
+    
+    # Loop de ÉPOCA GLOBAL
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
+        
+        current_files = list(all_files_master_list)
+        # Apenas embaralha se estivermos começando uma época do zero.
+        # Se estivermos resumindo, usamos a ordem de arquivos salva no checkpoint.
+        if start_shard == 0:
+            random.shuffle(current_files)
+            logger.info("Ordem dos arquivos de dados foi embaralhada para esta época.")
+        
+        # Recria os shards com a ordem de arquivos correta para a época
+        current_file_shards = [current_files[i:i + num_files_per_shard] for i in range(0, len(current_files), num_files_per_shard)]
+        
+        # Loop INTERNO sobre os shards
+        for shard_num in range(start_shard, len(current_file_shards)):
+            # ... (código para carregar o shard e criar DataLoaders) ...
+            
+            trainer = PretrainingTrainer(...)
+            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            # Salva o checkpoint no final de cada shard
+            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            
+        # --- MODIFICAÇÃO: Reseta o start_shard para 0 para a PRÓXIMA época ---
+        # Esta linha agora é segura, pois só é executada após uma época inteira ser concluída.
+        start_shard = 0
+
+    logger.info(f"--- {args.num_global_epochs} ÉPOCAS GLOBAIS CONCLUÍDAS ---")
+Resumo da Correção
+
+/////////////////////////////////////////
 2. Modifique a função run_pretraining_on_shards:
 
 Nesta função, vamos comentar a criação do seu ScheduledOptim e criar os otimizadores padrão.
