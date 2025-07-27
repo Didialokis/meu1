@@ -1,3 +1,8 @@
+ogger.info(f"Limpando arquivos de cache para o Shard {shard_num + 1}...")
+            freed_bytes = shard_ds.cleanup_cache_files()
+            logger.info(f"Liberado aproximadamente {freed_bytes / (1024**2):.2f} MB do cache.")
+
+/////////////////////////////////////////
 1. load_checkpoint() - A Nova Lógica Inteligente
 
 Esta função agora recebe o número total de shards por época para poder tomar a decisão correta.
