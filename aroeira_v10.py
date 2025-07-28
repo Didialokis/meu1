@@ -1,77 +1,816 @@
-Com certeza. O erro 'No space left on device' é um dos problemas mais comuns e frustrantes ao trabalhar com datasets grandes, e sua análise está correta: a causa é o sistema de cache da biblioteca datasets do Hugging Face.
-
-A Causa Raiz do Problema
-Mesmo que seu código processe os dados em "shards" que cabem na RAM, a função datasets.load_dataset, por padrão, tenta ser "inteligente". Ao receber um caminho (especialmente do S3), ela primeiro baixa e processa os arquivos para um diretório de cache local (./.cache ou ~/.cache/huggingface/datasets). Isso é feito para acelerar execuções futuras, mas se os arquivos do seu shard forem maiores que o espaço em disco disponível, o processo falha antes mesmo de começar o treinamento no shard.
-
-A função cleanup_cache_files() não ajuda nesse caso porque ela só é chamada depois que o objeto do dataset é criado, mas o erro acontece durante a criação, quando o cache está sendo escrito.
-
-A Solução: Redirecionar ou Desabilitar o Cache
-Temos duas soluções principais, sendo a primeira a mais recomendada.
-
-Solução 1 (Altamente Recomendada): Mudar o Local do Cache
-Esta é a melhor abordagem se você tiver outro disco ou partição com mais espaço disponível. Em vez de deixar a biblioteca usar o diretório padrão, nós a instruímos a usar uma pasta de sua escolha.
-
-Isso é feito através de uma variável de ambiente que deve ser definida antes da primeira importação da biblioteca datasets.
-
-Solução 2 (Alternativa): Desabilitar o Cache Completamente
-Se você não tiver outro local com mais espaço, mas tiver bastante memória RAM, pode desabilitar o cache. Isso forçará a biblioteca datasets a fazer todo o processamento em memória, evitando o uso do disco. A desvantagem é que pode ser um pouco mais lento a cada execução, pois nada é reaproveitado.
-
-Código Completo com a Correção (Usando a Solução 1)
-A alteração é mínima e deve ser feita no topo da sua função main(). Esta abordagem é a mais robusta.
-
-1. main() - Modificada para Redirecionar o Cache
-
-Adicione as linhas para definir a variável de ambiente logo no início da função main.
-
-Python
-
-def main():
-    ARGS = parse_args()
-
-    # --- CORREÇÃO: Redirecionar o Cache do Hugging Face ---
-    # Defina um caminho para um diretório em um disco com bastante espaço.
-    # Esta variável de ambiente DEVE ser definida ANTES de 'import datasets' ser efetivamente usado.
-    # Como as importações estão no topo do arquivo, colocamos isso no início da execução.
-    cache_dir = Path(ARGS.output_dir) / ".cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ['HF_HOME'] = str(cache_dir)
-    os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
-    logging.info(f"Cache do Hugging Face redirecionado para: {cache_dir}")
-    # -----------------------------------------------------------
-    
-    # O resto da sua função main continua como antes...
-    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    
-    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
-    setup_logging(ARGS.log_level, str(log_file))
-    logger = logging.getLogger(__name__)
-
-    logger.info(f"Dispositivo selecionado: {ARGS.device}")
-    logger.info("--- Configurações Utilizadas ---")
-    for arg_name, value in vars(ARGS).items():
-        logger.info(f"{arg_name}: {value}")
-    logger.info("---------------------------------")
-    
-    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
-    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
-    
-    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
-
-Se Você Preferir a Solução 2 (Desabilitar o Cache)
-Se você preferir desabilitar completamente o cache, a alteração seria diferente. Você adicionaria uma linha após suas importações.
-
-Python
+# --- Imports ---
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam
 
 import datasets
-# ... outras importações
+import tokenizers
+from tokenizers import BertWordPieceTokenizer
+from transformers import BertTokenizerFast as BertTokenizer, BertConfig
 
-# --- SOLUÇÃO ALTERNATIVA: Desabilitar o cache globalmente ---
-datasets.disable_caching()
-logging.info("Cache da biblioteca 'datasets' foi desabilitado. O processamento será feito em memória.")
-# -----------------------------------------------------------
+from tqdm.auto import tqdm
+import random
+from pathlib import Path
+import sys
+import math
+import numpy as np
+import argparse
+import os
+import logging
+import datetime
+import csv
 
-# ... resto do seu código ...
+# Imports para S3 e Checkpointing
+import boto3
+import io
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+import s3fs
+
+# Imports para Métricas e Accelerate
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from accelerate import Accelerator, DistributedDataParallelKwargs
+
+
+# --- S3 Utility Functions ---
+def s3_upload_file(local_path, s3_uri):
+    s3_client = boto3.client('s3')
+    parsed_s3_uri = urlparse(s3_uri)
+    bucket_name = parsed_s3_uri.netloc
+    s3_key = parsed_s3_uri.path.lstrip('/')
+    try:
+        s3_client.upload_file(str(local_path), bucket_name, s3_key)
+        logging.getLogger(__name__).info(f"Uploaded {local_path} to s3://{bucket_name}/{s3_key}")
+    except ClientError as e:
+        logging.getLogger(__name__).error(f"Failed to upload {local_path} to S3: {e}")
+        raise
+
+def s3_download_file(s3_uri, local_path):
+    s3_client = boto3.client('s3')
+    parsed_s3_uri = urlparse(s3_uri)
+    bucket_name = parsed_s3_uri.netloc
+    s3_key = parsed_s3_uri.path.lstrip('/')
+    try:
+        s3_client.download_file(bucket_name, s3_key, str(local_path))
+        logging.getLogger(__name__).info(f"Downloaded s3://{bucket_name}/{s3_key} to {local_path}")
+    except ClientError as e:
+        logging.getLogger(__name__).error(f"Failed to download s3://{bucket_name}/{s3_key}: {e}")
+        raise
+
+def s3_list_files(s3_uri, suffixes=None):
+    s3 = s3fs.S3FileSystem()
+    parsed_s3_uri = urlparse(s3_uri)
+    bucket_name = parsed_s3_uri.netloc
+    prefix = parsed_s3_uri.path.lstrip('/')
+    
+    try:
+        all_paths = s3.ls(f"{bucket_name}/{prefix}", detail=False)
+        if suffixes:
+            filtered_paths = [f"s3://{p}" for p in all_paths if any(p.endswith(s) for s in suffixes)]
+        else:
+            filtered_paths = [f"s3://{p}" for p in all_paths]
+        logging.getLogger(__name__).info(f"Listed {len(filtered_paths)} files from {s3_uri}")
+        return filtered_paths
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed to list files from S3: {e}")
+        raise
+
+# --- Funções de Logging (CSV e Texto) ---
+def setup_logging(output_dir, log_level_str="INFO"):
+    log_file_name = f"training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    local_log_path = Path(output_dir) / log_file_name
+    
+    numeric_level = getattr(logging, log_level_str.upper(), None)
+    if not isinstance(numeric_level, int): 
+        raise ValueError(f'Nível de log inválido: {log_level_str}')
+    
+    Path(output_dir).mkdir(parents=True, exist_ok=True) # Ensure local directory exists for logs
+    
+    logging.basicConfig(
+        level=numeric_level, 
+        format="%(asctime)s [%(name)s:%(levelname)s] %(message)s", 
+        handlers=[
+            logging.FileHandler(local_log_path), 
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return local_log_path # Return path for potential S3 upload
+
+def setup_csv_logger(output_dir):
+    csv_file_name = "training_history.csv"
+    csv_path = Path(output_dir) / csv_file_name
+    header = ["timestamp", "global_epoch", "shard_num", "avg_loss", "nsp_accuracy", "nsp_precision", "nsp_recall", "nsp_f1"]
+    if not csv_path.exists():
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+    return csv_path
+
+def log_metrics_to_csv(csv_path, metrics_dict):
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=metrics_dict.keys())
+        writer.writerow(metrics_dict)
+
+# --- Definições de Classes do Modelo BERT (Placeholders - Preencha com sua implementação) ---
+# Você deve colar suas classes reais aqui. Estas são apenas para o código ser executável.
+class ArticleStyleBERTDataset(Dataset):
+    def __init__(self, sentences, tokenizer, seq_len, mask_prob=0.15, pad_id=0):
+        self.sentences = sentences
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.mask_prob = mask_prob
+        self.pad_id = pad_id
+        self.vocab_list = list(tokenizer.get_vocab().keys())
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, i):
+        t1, t2, is_next_label = self.random_sent(i)
+        
+        # Tokenize e prepare para MLM
+        t1_tokens = self.tokenizer.encode(t1, add_special_tokens=False).ids
+        t2_tokens = self.tokenizer.encode(t2, add_special_tokens=False).ids
+
+        # [CLS] A [SEP] B [SEP]
+        tokens = [self.tokenizer.cls_token_id] + t1_tokens + [self.tokenizer.sep_token_id] + t2_tokens + [self.tokenizer.sep_token_id]
+        segment_ids = [0] * (len(t1_tokens) + 2) + [1] * (len(t2_tokens) + 1)
+        
+        # Máscara para MLM
+        bert_input, bert_label = self.random_masking(tokens)
+
+        # Pad ou Truncate
+        padding = [self.pad_id] * (self.seq_len - len(bert_input))
+        bert_input.extend(padding)
+        bert_label.extend(padding)
+        segment_ids.extend(padding)
+        attention_mask = [1] * len(tokens) + [0] * (self.seq_len - len(tokens))
+
+        return {
+            "bert_input": torch.tensor(bert_input[:self.seq_len], dtype=torch.long),
+            "bert_label": torch.tensor(bert_label[:self.seq_len], dtype=torch.long),
+            "segment_label": torch.tensor(segment_ids[:self.seq_len], dtype=torch.long),
+            "is_next": torch.tensor(is_next_label, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask[:self.seq_len], dtype=torch.long)
+        }
+
+    def random_sent(self, index):
+        t1 = self.sentences[index]
+        rand = random.random()
+        if rand > 0.5:
+            # Next sentence
+            t2 = self.sentences[(index + 1) % len(self.sentences)]
+            is_next_label = 0  # 0 for IsNext, 1 for NotNext
+        else:
+            # Not next sentence
+            t2 = self.sentences[random.randrange(len(self.sentences))]
+            is_next_label = 1
+        return t1, t2, is_next_label
+
+    def random_masking(self, token_ids):
+        bert_input = [tok for tok in token_ids]
+        bert_label = [self.pad_id] * len(token_ids)
+
+        for i, token_id in enumerate(token_ids):
+            if token_id in [self.tokenizer.cls_token_id, self.tokenizer.sep_token_id]:
+                continue
+            
+            prob = random.random()
+            if prob < self.mask_prob:
+                bert_label[i] = token_id # Guardar o token original para o loss
+                
+                prob /= self.mask_prob
+                if prob < 0.8: # 80% de chance de substituir por [MASK]
+                    bert_input[i] = self.tokenizer.mask_token_id
+                elif prob < 0.9: # 10% de chance de substituir por um token aleatório
+                    bert_input[i] = random.choice(self.vocab_list)
+                # else: 10% de chance de manter o token original (para fins de ruído)
+        return bert_input, bert_label
+
+class ArticlePositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model).float()
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[:x.size(1)]
+
+class ArticleBERTEmbedding(nn.Module):
+    def __init__(self, vocab_size, d_model, max_len, n_segments, dropout):
+        super().__init__()
+        self.tok_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = ArticlePositionalEmbedding(d_model, max_len)
+        self.seg_embed = nn.Embedding(n_segments, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, seg):
+        return self.dropout(self.norm(self.tok_embed(x) + self.pos_embed(x) + self.seg_embed(seg)))
+
+class ArticleMultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        super().__init__()
+        assert d_model % h == 0
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(4)])
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        if mask is not None: mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+                             for l, x in zip(self.linears, (query, key, value))]
+        
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None: scores = scores.masked_fill(mask == 0, -1e9)
+        p_attn = F.softmax(scores, dim=-1)
+        p_attn = self.dropout(p_attn)
+        return torch.matmul(p_attn, value).transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k), p_attn
+
+class ArticleFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.w_2(F.gelu(self.w_1(x))))
+
+class ArticleEncoderLayer(nn.Module):
+    def __init__(self, d_model, h, d_ff, dropout):
+        super().__init__()
+        self.self_attn = ArticleMultiHeadedAttention(h, d_model, dropout)
+        self.feed_forward = ArticleFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x, mask):
+        x = x + self.dropout1(self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x), mask)[0])
+        x = x + self.dropout2(self.feed_forward(self.norm2(x)))
+        return x
+
+class ArticleBERT(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, h, d_ff, max_len, n_segments, dropout):
+        super().__init__()
+        self.embed = ArticleBERTEmbedding(vocab_size, d_model, max_len, n_segments, dropout)
+        self.encoder_layers = nn.ModuleList([ArticleEncoderLayer(d_model, h, d_ff, dropout) for _ in range(n_layers)])
+        
+    def forward(self, x, segment_label, attention_mask):
+        x = self.embed(x, segment_label)
+        for layer in self.encoder_layers:
+            x = layer(x, attention_mask.unsqueeze(1).unsqueeze(2)) # Add dims for attention mask
+        return x
+
+class ArticleNSPHead(nn.Module):
+    def __init__(self, d_model, n_segments):
+        super().__init__()
+        self.linear = nn.Linear(d_model, n_segments)
+        self.softmax = nn.LogSoftmax(dim=-1)
+
+    def forward(self, x):
+        return self.softmax(self.linear(x[:, 0])) # Take [CLS] token output
+
+class ArticleBERTLMWithHeads(nn.Module):
+    def __init__(self, config: BertConfig):
+        super().__init__()
+        self.bert = ArticleBERT(
+            vocab_size=config.vocab_size,
+            d_model=config.hidden_size,
+            n_layers=config.num_hidden_layers,
+            h=config.num_attention_heads,
+            d_ff=config.intermediate_size,
+            max_len=config.max_position_embeddings,
+            n_segments=config.type_vocab_size,
+            dropout=config.hidden_dropout_prob
+        )
+        self.nsp_head = ArticleNSPHead(config.hidden_size, config.type_vocab_size)
+        self.mlm_head = nn.Linear(config.hidden_size, config.vocab_size)
+        self.mlm_bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.softmax_mlm = nn.LogSoftmax(dim=-1)
+
+    def forward(self, x, segment_label, attention_mask):
+        bert_output = self.bert(x, segment_label, attention_mask)
+        nsp_output = self.nsp_head(bert_output)
+        mlm_output = self.softmax_mlm(self.mlm_head(bert_output) + self.mlm_bias)
+        return nsp_output, mlm_output
+
+class ScheduledOptim():
+    def __init__(self, optimizer, d_model, n_warmup_steps):
+        self._optimizer = optimizer; self.n_warmup_steps = n_warmup_steps; self.n_current_steps = 0
+        self.init_lr = float(np.power(d_model, -0.5))
+    def step_and_update_lr(self): self._update_learning_rate(); self._optimizer.step()
+    def zero_grad(self): self._optimizer.zero_grad()
+    def _get_lr_scale(self):
+        if self.n_current_steps == 0: return 0.0
+        val1 = np.power(self.n_current_steps, -0.5)
+        if self.n_warmup_steps > 0:
+            val2 = np.power(self.n_warmup_steps, -1.5) * self.n_current_steps
+            return float(np.minimum(val1, val2))
+        return float(val1)
+    def _update_learning_rate(self):
+        self.n_current_steps += 1; lr = self.init_lr * self._get_lr_scale()
+        for param_group in self._optimizer.param_groups: param_group['lr'] = lr
+    def state_dict(self): return {'n_current_steps': self.n_current_steps}
+    def load_state_dict(self, state_dict): 
+        self.n_current_steps = state_dict['n_current_steps']
+        self._update_learning_rate() # Apply the loaded step to update LR
+
+# --- Trainer Adaptado para Accelerate ---
+class PretrainingTrainer:
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        self.model, self.train_dl, self.val_dl, self.opt_schedule = model, train_dataloader, val_dataloader, optimizer_schedule
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl: 
+            if self.accelerator.is_main_process:
+                self.logger.warning(f"No {'training' if is_training else 'validation'} dataloader provided for epoch {epoch_num+1}.")
+            return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+
+        total_loss_ep = 0.0
+        all_labels, all_preds = [], []
+        
+        progress_bar = None
+        if self.accelerator.is_main_process:
+            progress_bar = tqdm(total=len(dl), desc=f"Epoch {epoch_num+1} [{'Train' if is_training else 'Val'}]", file=sys.stdout)
+
+        for i_batch, data in enumerate(dl):
+            # Ensure data is on the correct device for the model
+            data = {k: v.to(self.accelerator.device) for k, v in data.items()}
+
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
+
+            if is_training:
+                self.opt_schedule.zero_grad()
+                self.accelerator.backward(loss)
+                self.opt_schedule.step_and_update_lr()
+            
+            # Agrega perdas e predições de todas as GPUs
+            total_loss_ep += self.accelerator.gather(loss.detach()).sum().item()
+            nsp_preds = nsp_out.argmax(dim=-1)
+            all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+            all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+            if self.accelerator.is_main_process and progress_bar: 
+                progress_bar.update(1)
+                if (i_batch + 1) % self.log_freq == 0:
+                    current_loss = total_loss_ep / (i_batch + 1)
+                    progress_bar.set_postfix({'current_loss': f'{current_loss:.4f}'})
+
+        if self.accelerator.is_main_process and progress_bar: progress_bar.close()
+        
+        # Calculate metrics globally
+        gathered_labels = np.concatenate(self.accelerator.gather_for_metrics(all_labels))
+        gathered_preds = np.concatenate(self.accelerator.gather_for_metrics(all_preds))
+
+        avg_total_l = total_loss_ep / self.accelerator.num_processes # Correct average loss calculation across all processes
+        
+        # Only calculate sklearn metrics on the main process to avoid redundant computation and potential issues with empty arrays on other processes
+        precision, recall, f1, accuracy = 0, 0, 0, 0
+        if self.accelerator.is_main_process:
+            if len(gathered_labels) > 0:
+                precision, recall, f1, _ = precision_recall_fscore_support(gathered_labels, gathered_preds, average='binary', pos_label=0, zero_division=0) # assuming 0 for IsNext
+                accuracy = accuracy_score(gathered_labels, gathered_preds)
+            
+            self.logger.info(f"Epoch {epoch_num+1} [{'Train' if is_training else 'Val'}] - AvgLoss: {avg_total_l:.4f}, NSP Acc: {accuracy*100:.2f}%, F1: {f1:.3f}")
+        
+        metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+        return metrics
+
+    def train(self, num_epochs, csv_logger_path, global_epoch_offset=0, shard_num_offset=0):
+        best_val_loss = float('inf')
+        for epoch in range(global_epoch_offset, num_epochs):
+            self.logger.info(f"Starting Global Epoch {epoch+1}/{num_epochs}")
+            train_metrics = self._run_epoch(epoch, is_training=True)
+            
+            val_metrics = {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+            if self.val_dl:
+                with torch.no_grad():
+                    val_metrics = self._run_epoch(epoch, is_training=False)
+            
+            if self.accelerator.is_main_process:
+                current_timestamp = datetime.datetime.now().isoformat()
+                log_metrics_to_csv(csv_logger_path, {
+                    "timestamp": current_timestamp,
+                    "global_epoch": epoch + 1,
+                    "shard_num": -1, # -1 indicates aggregated epoch metrics
+                    "avg_loss": train_metrics["loss"],
+                    "nsp_accuracy": train_metrics["accuracy"],
+                    "nsp_precision": train_metrics["precision"],
+                    "nsp_recall": train_metrics["recall"],
+                    "nsp_f1": train_metrics["f1"]
+                })
+                # For validation metrics
+                log_metrics_to_csv(csv_logger_path, {
+                    "timestamp": current_timestamp,
+                    "global_epoch": epoch + 1,
+                    "shard_num": -2, # -2 indicates validation metrics
+                    "avg_loss": val_metrics["loss"],
+                    "nsp_accuracy": val_metrics["accuracy"],
+                    "nsp_precision": val_metrics["precision"],
+                    "nsp_recall": val_metrics["recall"],
+                    "nsp_f1": val_metrics["f1"]
+                })
+
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+            
+        return best_val_loss
+
+# --- Funções de Checkpoint Adaptadas para Accelerate ---
+def save_checkpoint(args, accelerator, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    if not accelerator.is_main_process: return
+    
+    checkpoint_name = f"checkpoint_epoch_{global_epoch:03d}_shard_{shard_num:03d}.pt"
+    local_checkpoint_path = Path(args.output_dir) / checkpoint_name
+    
+    unwrapped_model = accelerator.unwrap_model(model)
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': unwrapped_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+        'torch_rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    }
+    
+    # Save locally
+    torch.save(state, local_checkpoint_path)
+    logging.getLogger(__name__).info(f"Checkpoint saved locally to {local_checkpoint_path}")
+    
+    # Upload to S3 if output_dir is an S3 path
+    if args.output_dir.startswith("s3://"):
+        s3_checkpoint_uri = f"{args.output_dir}/{checkpoint_name}"
+        s3_upload_file(local_checkpoint_path, s3_checkpoint_uri)
+    
+def load_checkpoint(args, model, optimizer, scheduler, accelerator):
+    start_epoch = 0
+    start_shard = 0
+    best_val_loss = float('inf')
+    
+    if args.resume_from_checkpoint:
+        logging.getLogger(__name__).info(f"Attempting to load checkpoint from {args.resume_from_checkpoint}")
+        local_checkpoint_path = Path(args.output_dir) / Path(args.resume_from_checkpoint).name
+        
+        # If resume_from_checkpoint is an S3 URI, download it first
+        if args.resume_from_checkpoint.startswith("s3://"):
+            s3_download_file(args.resume_from_checkpoint, local_checkpoint_path)
+        
+        if local_checkpoint_path.exists():
+            # Load the state dictionary on CPU first
+            state = torch.load(local_checkpoint_path, map_location='cpu')
+            
+            # Load state to the model, optimizer, scheduler *before* accelerator.prepare
+            # Only main process does this or you get DDP errors
+            if accelerator.is_main_process:
+                model.load_state_dict(state['model_state_dict'])
+                optimizer.load_state_dict(state['optimizer_state_dict'])
+                scheduler.load_state_dict(state['scheduler_state_dict'])
+            
+            start_epoch = state['global_epoch']
+            start_shard = state['shard_num'] + 1 # Start from the next shard
+            best_val_loss = state['best_val_loss']
+            
+            random.setstate(state['rng_state'])
+            torch.set_rng_state(state['torch_rng_state'])
+            if torch.cuda.is_available() and 'cuda_rng_state' in state and state['cuda_rng_state']:
+                torch.cuda.set_rng_state_all(state['cuda_rng_state'])
+            
+            logging.getLogger(__name__).info(f"Resumed from checkpoint: Epoch {start_epoch}, Shard {start_shard}, Best Val Loss: {best_val_loss:.4f}")
+        else:
+            logging.getLogger(__name__).warning(f"Checkpoint not found at {local_checkpoint_path}. Starting training from scratch.")
+            
+    return start_epoch, start_shard, best_val_loss
+
+# --- Funções do Pipeline ---
+def setup_and_train_tokenizer(args, logger):
+    logger.info("--- Fase: Setup e Treinamento do Tokenizador ---")
+    
+    TOKENIZER_ASSETS_DIR = Path(args.output_dir) / "tokenizer_assets"
+    TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True) # Ensure local dir exists
+    
+    vocab_file = TOKENIZER_ASSETS_DIR / "vocab.txt"
+    tokenizer_config_file = TOKENIZER_ASSETS_DIR / "tokenizer_config.json"
+
+    if args.output_dir.startswith("s3://"):
+        s3_vocab_path = f"{args.output_dir}/tokenizer_assets/vocab.txt"
+        s3_tokenizer_config_path = f"{args.output_dir}/tokenizer_assets/tokenizer_config.json"
+        try:
+            # Check if tokenizer files exist in S3
+            s3_fs = s3fs.S3FileSystem()
+            if s3_fs.exists(s3_vocab_path.replace("s3://", "")) and s3_fs.exists(s3_tokenizer_config_path.replace("s3://", "")):
+                logger.info("Tokenizer assets found in S3. Downloading them.")
+                s3_download_file(s3_vocab_path, vocab_file)
+                s3_download_file(s3_tokenizer_config_path, tokenizer_config_file)
+                tokenizer = BertTokenizer.from_pretrained(str(TOKENIZER_ASSETS_DIR))
+                logger.info("Tokenizer loaded from S3.")
+                return tokenizer, tokenizer.pad_token_id
+            else:
+                logger.info("Tokenizer assets not found in S3. Training a new tokenizer.")
+        except Exception as e:
+            logger.warning(f"Could not check or download tokenizer from S3 ({e}). Proceeding to train tokenizer locally.")
+
+    # Fallback to local training if not found/downloaded from S3
+    if not (vocab_file.exists() and tokenizer_config_file.exists()):
+        logger.info("Training new BertWordPieceTokenizer.")
+        if not args.input_data_path.startswith("s3://"):
+            raise ValueError("For tokenizer training, input_data_path must be a local file or S3 path accessible by the main process for reading.")
+
+        # Temporarily download a sample of data for tokenizer training if from S3
+        temp_tokenizer_data_path = Path(args.output_dir) / "temp_tokenizer_data.txt"
+        # Assuming args.input_data_path can be a directory or a single file for tokenizer training.
+        # For simplicity, we'll try to download one file if it's an S3 directory.
+        if args.input_data_path.endswith('/'):
+            s3_files = s3_list_files(args.input_data_path, suffixes=['.txt'])
+            if not s3_files:
+                raise ValueError(f"No text files found in {args.input_data_path} for tokenizer training.")
+            s3_download_file(s3_files[0], temp_tokenizer_data_path) # Download one file for tokenizer training
+            train_files = [str(temp_tokenizer_data_path)]
+        else: # Assume it's a single S3 file
+            s3_download_file(args.input_data_path, temp_tokenizer_data_path)
+            train_files = [str(temp_tokenizer_data_path)]
+            
+        tokenizer = BertWordPieceTokenizer(
+            clean_text=True,
+            handle_chinese_chars=False,
+            strip_accents=True,
+            lowercase=True,
+        )
+        tokenizer.train(
+            files=train_files,
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_freq,
+            show_progress=True,
+            special_tokens=["[PAD]", "[CLS]", "[SEP]", "[MASK]", "[UNK]"],
+        )
+        tokenizer.save_model(str(TOKENIZER_ASSETS_DIR))
+        
+        # Clean up temporary file
+        os.remove(temp_tokenizer_data_path)
+    
+    tokenizer_fast = BertTokenizerFast.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+    
+    if args.output_dir.startswith("s3://"):
+        logger.info("Uploading tokenizer assets to S3.")
+        s3_upload_file(vocab_file, f"{args.output_dir}/tokenizer_assets/{vocab_file.name}")
+        s3_upload_file(tokenizer_config_file, f"{args.output_dir}/tokenizer_assets/{tokenizer_config_file.name}")
+
+    logger.info("Tokenizer setup complete.")
+    return tokenizer_fast, tokenizer_fast.pad_token_id
+
+def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger, csv_logger_path):
+    logger.info("--- Fase: Pré-Treinamento com Accelerate ---")
+    
+    # List all input files (shards)
+    all_files_master_list = s3_list_files(args.input_data_path, suffixes=['.txt'])
+    if not all_files_master_list:
+        raise ValueError(f"No training data files found in {args.input_data_path}")
+
+    # Initialize model, optimizer, scheduler
+    config = BertConfig(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=args.d_model,
+        num_hidden_layers=args.n_layers,
+        num_attention_heads=args.n_heads,
+        intermediate_size=args.d_ff,
+        max_position_embeddings=args.max_seq_len,
+        type_vocab_size=2, # For NSP
+        hidden_dropout_prob=args.dropout
+    )
+    model = ArticleBERTLMWithHeads(config)
+    
+    # Using AdamW which is generally preferred for transformers
+    optimizer = Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-6, weight_decay=args.weight_decay)
+    scheduler = ScheduledOptim(optimizer, d_model=config.hidden_size, n_warmup_steps=args.n_warmup_steps)
+    
+    start_epoch, start_shard, best_val_loss = load_checkpoint(args, model, optimizer, scheduler, accelerator)
+    
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        logger.info(f"Processing Global Epoch {epoch_num + 1}/{args.num_global_epochs}")
+
+        # Shuffle shards at the start of each global epoch (main process only)
+        if accelerator.is_main_process:
+            random.shuffle(all_files_master_list)
+            # Distribute shards among processes - simple round-robin
+            num_processes = accelerator.num_processes
+            process_file_shards = [[] for _ in range(num_processes)]
+            for i, file_path in enumerate(all_files_master_list):
+                process_file_shards[i % num_processes].append(file_path)
+            
+            # Convert to a common format for sharing (e.g., list of lists of strings)
+            shards_for_all_processes = process_file_shards
+        else:
+            shards_for_all_processes = None
+        
+        # Broadcast the sharded file list to all processes
+        process_file_shards = accelerator.broadcast(shards_for_all_processes, from_process=0)
+        
+        # Each process gets its specific shard list
+        my_shards = process_file_shards[accelerator.process_index]
+        logger.info(f"Process {accelerator.process_index} will process {len(my_shards)} shards in this epoch, starting from shard {start_shard}.")
+
+        for shard_idx_in_my_list in range(start_shard if epoch_num == start_epoch else 0, len(my_shards)):
+            current_s3_shard_path = my_shards[shard_idx_in_my_list]
+            logger.info(f"Process {accelerator.process_index}: Loading data from shard {current_s3_shard_path} (Shard {shard_idx_in_my_list + 1} of {len(my_shards)})")
+
+            # Download shard locally
+            local_shard_path = Path(args.output_dir) / Path(current_s3_shard_path).name
+            s3_download_file(current_s3_shard_path, local_shard_path)
+            
+            # Read sentences from the downloaded shard
+            sentences_list = []
+            with open(local_shard_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line: sentences_list.append(line)
+            
+            os.remove(local_shard_path) # Clean up local shard file
+
+            if not sentences_list:
+                logger.warning(f"Shard {current_s3_shard_path} is empty. Skipping.")
+                continue
+
+            # Create Datasets and DataLoaders for the current shard
+            train_dataset = ArticleStyleBERTDataset(sentences_list, tokenizer, args.max_seq_len, pad_id=pad_id)
+            # For simplicity, using a small fraction of current shard for validation, or you can have dedicated val shards
+            val_sentences_count = max(1, len(sentences_list) // 100) # Use 1% of the shard for validation
+            train_sentences = sentences_list[val_sentences_count:]
+            val_sentences = sentences_list[:val_sentences_count]
+
+            train_dataset = ArticleStyleBERTDataset(train_sentences, tokenizer, args.max_seq_len, pad_id=pad_id)
+            val_dataset = ArticleStyleBERTDataset(val_sentences, tokenizer, args.max_seq_len, pad_id=pad_id)
+
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+            val_dl = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            
+            # Prepare with Accelerate
+            # Note: Model, optimizer, scheduler are prepared once and then reused across shards within an epoch.
+            # Dataloaders are prepared for each shard.
+            if not hasattr(accelerator, 'prepared_model'): # Prepare only once per training run
+                prepared_model, prepared_optimizer, prepared_scheduler = accelerator.prepare(model, optimizer, scheduler)
+                accelerator.prepared_model = prepared_model
+                accelerator.prepared_optimizer = prepared_optimizer
+                accelerator.prepared_scheduler = prepared_scheduler
+            else: # If already prepared, use the prepared versions
+                prepared_model = accelerator.prepared_model
+                prepared_optimizer = accelerator.prepared_optimizer
+                prepared_scheduler = accelerator.prepared_scheduler
+
+            prepared_train_dl, prepared_val_dl = accelerator.prepare(train_dl, val_dl)
+            
+            trainer = PretrainingTrainer(
+                model=prepared_model,
+                train_dataloader=prepared_train_dl,
+                val_dataloader=prepared_val_dl,
+                optimizer_schedule=prepared_scheduler,
+                accelerator=accelerator,
+                pad_idx_mlm_loss=pad_id,
+                vocab_size=tokenizer.vocab_size,
+                log_freq=args.log_freq
+            )
+            
+            # Run training for the current shard
+            shard_best_val_loss = trainer.train(num_epochs=1) # Train for 1 "shard-epoch"
+            
+            # Only main process logs and saves checkpoint
+            if accelerator.is_main_process:
+                # Log metrics for this shard to CSV
+                current_timestamp = datetime.datetime.now().isoformat()
+                log_metrics_to_csv(csv_logger_path, {
+                    "timestamp": current_timestamp,
+                    "global_epoch": epoch_num + 1,
+                    "shard_num": shard_idx_in_my_list + 1,
+                    "avg_loss": shard_best_val_loss, # Placeholder for shard-level validation loss
+                    "nsp_accuracy": 0, "nsp_precision": 0, "nsp_recall": 0, "nsp_f1": 0 # Not directly available per-shard from trainer
+                })
+                # Update overall best_val_loss if this shard's performance is better
+                if shard_best_val_loss < best_val_loss:
+                    best_val_loss = shard_best_val_loss
+
+                save_checkpoint(args, accelerator, epoch_num, shard_idx_in_my_my_list, prepared_model, prepared_optimizer, prepared_scheduler, best_val_loss)
+            
+            # Ensure all processes finish processing the current shard before moving to the next
+            accelerator.wait_for_everyone()
+
+        # Reset start_shard for subsequent epochs
+        start_shard = 0
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Script de Pré-treino BERT com Accelerate, Shards e Checkpoints.")
+    parser.add_argument("--input_data_path", type=str, required=True, help="Caminho para o diretório de shards de dados de treinamento (pode ser S3).")
+    parser.add_argument("--output_dir", type=str, required=True, help="Caminho para o diretório de saída (pode ser S3).")
+    parser.add_argument("--max_seq_len", type=int, default=128, help="Comprimento máximo da sequência.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Tamanho do batch.")
+    parser.add_argument("--num_global_epochs", type=int, default=10, help="Número de épocas globais (passagens por todos os shards).")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Taxa de aprendizado inicial.")
+    parser.add_argument("--n_warmup_steps", type=int, default=10000, help="Número de passos de warmup para o scheduler.")
+    parser.add_argument("--d_model", type=int, default=768, help="Dimensão do modelo (BERT hidden size).")
+    parser.add_argument("--n_layers", type=int, default=12, help="Número de camadas do encoder BERT.")
+    parser.add_argument("--n_heads", type=int, default=12, help="Número de cabeças de atenção.")
+    parser.add_argument("--d_ff", type=int, default=3072, help="Dimensão da camada feed-forward.")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Taxa de dropout.")
+    parser.add_argument("--vocab_size", type=int, default=30000, help="Tamanho do vocabulário para o tokenizador.")
+    parser.add_argument("--min_freq", type=int, default=5, help="Frequência mínima para tokens no vocabulário do tokenizador.")
+    parser.add_argument("--num_workers", type=int, default=os.cpu_count() // 2, help="Número de workers para DataLoader.")
+    parser.add_argument("--log_freq", type=int, default=100, help="Frequência de log para o progresso do treinamento.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Caminho (local ou S3 URI) para um checkpoint para retomar o treinamento.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Peso de decaimento para o otimizador.")
+    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Nível de log.")
+
+    return parser.parse_args()
+
+def main():
+    # Primeira coisa: inicializar o accelerator
+    # ddp_kwargs needed for handling non-contiguous tensors in some cases for DDP
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    
+    ARGS = parse_args()
+    
+    # Only the main process sets up logging and directories
+    local_log_file_path = None
+    csv_logger_path = None
+
+    if accelerator.is_main_process:
+        # Create local output directory if it doesn't exist
+        Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+        local_log_file_path = setup_logging(ARGS.output_dir, ARGS.log_level)
+        csv_logger_path = setup_csv_logger(ARGS.output_dir)
+    
+    # After main process sets up logging, all processes can get the logger
+    logger = logging.getLogger(__name__)
+    
+    # Apenas o processo principal prepara o tokenizador
+    tokenizer = None
+    pad_id = None
+    if accelerator.is_main_process:
+        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    
+    # Sincroniza todos os processos
+    accelerator.wait_for_everyone()
+    
+    # Outros processos carregam o tokenizador que o principal salvou
+    # The output_dir must be accessible locally for all processes to load the tokenizer.
+    # If output_dir is an S3 path, the main process will have uploaded it.
+    # Other processes should then download from that S3 path to their local output_dir.
+    if not accelerator.is_main_process:
+        TOKENIZER_ASSETS_DIR = Path(ARGS.output_dir) / "tokenizer_assets"
+        TOKENIZER_ASSETS_DIR.mkdir(parents=True, exist_ok=True) # Ensure local dir exists for assets
+        
+        # If output_dir is S3, download tokenizer assets
+        if ARGS.output_dir.startswith("s3://"):
+            s3_vocab_path = f"{ARGS.output_dir}/tokenizer_assets/vocab.txt"
+            s3_tokenizer_config_path = f"{ARGS.output_dir}/tokenizer_assets/tokenizer_config.json"
+            s3_download_file(s3_vocab_path, TOKENIZER_ASSETS_DIR / "vocab.txt")
+            s3_download_file(s3_tokenizer_config_path, TOKENIZER_ASSETS_DIR / "tokenizer_config.json")
+        
+        tokenizer = BertTokenizerFast.from_pretrained(str(TOKENIZER_ASSETS_DIR), local_files_only=True)
+        pad_id = tokenizer.pad_token_id
+
+    # Ensure CSV logger path is valid for all processes, though only main process writes
+    if not accelerator.is_main_process:
+        csv_logger_path = Path(ARGS.output_dir) / "training_history.csv" # Create the path object for other processes
+
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger, csv_logger_path)
+    
+    if accelerator.is_main_process:
+        logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+        # Upload final log file to S3 if output_dir is S3
+        if ARGS.output_dir.startswith("s3://") and local_log_file_path:
+            s3_upload_file(local_log_file_path, f"{ARGS.output_dir}/{local_log_file_path.name}")
+        
+        # Upload final CSV history to S3
+        if ARGS.output_dir.startswith("s3://") and csv_logger_path:
+            s3_upload_file(csv_logger_path, f"{ARGS.output_dir}/{csv_logger_path.name}")
+
+
+if __name__ == "__main__":
+    main()
 
 /////////////////////////////////////////
 1. load_checkpoint() - A Nova Lógica Inteligente
