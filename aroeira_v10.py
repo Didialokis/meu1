@@ -1,6 +1,77 @@
-ogger.info(f"Limpando arquivos de cache para o Shard {shard_num + 1}...")
-            freed_bytes = shard_ds.cleanup_cache_files()
-            logger.info(f"Liberado aproximadamente {freed_bytes / (1024**2):.2f} MB do cache.")
+Com certeza. O erro 'No space left on device' é um dos problemas mais comuns e frustrantes ao trabalhar com datasets grandes, e sua análise está correta: a causa é o sistema de cache da biblioteca datasets do Hugging Face.
+
+A Causa Raiz do Problema
+Mesmo que seu código processe os dados em "shards" que cabem na RAM, a função datasets.load_dataset, por padrão, tenta ser "inteligente". Ao receber um caminho (especialmente do S3), ela primeiro baixa e processa os arquivos para um diretório de cache local (./.cache ou ~/.cache/huggingface/datasets). Isso é feito para acelerar execuções futuras, mas se os arquivos do seu shard forem maiores que o espaço em disco disponível, o processo falha antes mesmo de começar o treinamento no shard.
+
+A função cleanup_cache_files() não ajuda nesse caso porque ela só é chamada depois que o objeto do dataset é criado, mas o erro acontece durante a criação, quando o cache está sendo escrito.
+
+A Solução: Redirecionar ou Desabilitar o Cache
+Temos duas soluções principais, sendo a primeira a mais recomendada.
+
+Solução 1 (Altamente Recomendada): Mudar o Local do Cache
+Esta é a melhor abordagem se você tiver outro disco ou partição com mais espaço disponível. Em vez de deixar a biblioteca usar o diretório padrão, nós a instruímos a usar uma pasta de sua escolha.
+
+Isso é feito através de uma variável de ambiente que deve ser definida antes da primeira importação da biblioteca datasets.
+
+Solução 2 (Alternativa): Desabilitar o Cache Completamente
+Se você não tiver outro local com mais espaço, mas tiver bastante memória RAM, pode desabilitar o cache. Isso forçará a biblioteca datasets a fazer todo o processamento em memória, evitando o uso do disco. A desvantagem é que pode ser um pouco mais lento a cada execução, pois nada é reaproveitado.
+
+Código Completo com a Correção (Usando a Solução 1)
+A alteração é mínima e deve ser feita no topo da sua função main(). Esta abordagem é a mais robusta.
+
+1. main() - Modificada para Redirecionar o Cache
+
+Adicione as linhas para definir a variável de ambiente logo no início da função main.
+
+Python
+
+def main():
+    ARGS = parse_args()
+
+    # --- CORREÇÃO: Redirecionar o Cache do Hugging Face ---
+    # Defina um caminho para um diretório em um disco com bastante espaço.
+    # Esta variável de ambiente DEVE ser definida ANTES de 'import datasets' ser efetivamente usado.
+    # Como as importações estão no topo do arquivo, colocamos isso no início da execução.
+    cache_dir = Path(ARGS.output_dir) / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ['HF_HOME'] = str(cache_dir)
+    os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
+    logging.info(f"Cache do Hugging Face redirecionado para: {cache_dir}")
+    # -----------------------------------------------------------
+    
+    # O resto da sua função main continua como antes...
+    Path(ARGS.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(ARGS.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_file = Path(ARGS.output_dir) / f'training_log_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    setup_logging(ARGS.log_level, str(log_file))
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Dispositivo selecionado: {ARGS.device}")
+    logger.info("--- Configurações Utilizadas ---")
+    for arg_name, value in vars(ARGS).items():
+        logger.info(f"{arg_name}: {value}")
+    logger.info("---------------------------------")
+    
+    tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    run_pretraining_on_shards(ARGS, tokenizer, pad_id, logger)
+    
+    logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+Se Você Preferir a Solução 2 (Desabilitar o Cache)
+Se você preferir desabilitar completamente o cache, a alteração seria diferente. Você adicionaria uma linha após suas importações.
+
+Python
+
+import datasets
+# ... outras importações
+
+# --- SOLUÇÃO ALTERNATIVA: Desabilitar o cache globalmente ---
+datasets.disable_caching()
+logging.info("Cache da biblioteca 'datasets' foi desabilitado. O processamento será feito em memória.")
+# -----------------------------------------------------------
+
+# ... resto do seu código ...
 
 /////////////////////////////////////////
 1. load_checkpoint() - A Nova Lógica Inteligente
