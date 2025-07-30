@@ -1,3 +1,163 @@
+1. save_checkpoint() e load_checkpoint() - Simplificadas e Corrigidas
+
+Vamos simplificar e garantir que elas salvem e carreguem a global_epoch corretamente.
+
+Python
+
+# --- CORREÇÃO: Funções de Checkpoint focadas na Época Global ---
+
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss):
+    """ Salva o checkpoint. Apenas o processo principal (rank 0) executa. """
+    if args.global_rank != 0:
+        return
+
+    # Com DDP, o modelo original está no atributo .module
+    model_state = model.module.state_dict()
+    
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate()
+    }
+
+    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
+    logging.info(f"Salvando checkpoint para Época Global {global_epoch + 1}, Shard {shard_num + 1} em {checkpoint_path}")
+    torch.save(state, checkpoint_path)
+    
+    # ... (lógica para salvar o best_model.pth se necessário) ...
+
+def load_checkpoint(args, model, optimizer, scheduler):
+    """ Carrega o checkpoint. Retorna a próxima época e shard a serem processados. """
+    start_epoch = 0
+    start_shard = 0
+    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
+
+    if not checkpoint_path.exists():
+        logging.info("Nenhum checkpoint encontrado. Iniciando do zero.")
+        return start_epoch, start_shard
+
+    # Mapeia o checkpoint para a GPU correta de cada processo
+    map_location = f'cuda:{args.local_rank}'
+    logging.info(f"Carregando checkpoint de {checkpoint_path} para o dispositivo {map_location}")
+    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    if 'rng_state' in checkpoint:
+        random.setstate(checkpoint['rng_state'])
+    
+    # CORREÇÃO: Garante que estamos lendo as variáveis corretas do checkpoint
+    # Retorna a época e o shard onde o treinamento deve continuar
+    last_completed_epoch = checkpoint.get('global_epoch', 0)
+    last_completed_shard = checkpoint.get('shard_num', -1)
+    
+    # A lógica de resumo é gerenciada no loop principal
+    start_epoch = last_completed_epoch
+    start_shard = last_completed_shard + 1
+    
+    logging.info(f"Checkpoint carregado. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
+    return start_epoch, start_shard
+2. PretrainingTrainer.train() - Simplificada
+
+O Trainer agora não precisa mais saber sobre a "época global". Sua única responsabilidade é treinar no shard que recebe.
+
+Python
+
+# Dentro da classe PretrainingTrainer
+
+def train(self, num_epochs_per_shard, sampler_epoch):
+    """
+    Função de treino simplificada. `num_epochs_per_shard` é geralmente 1.
+    `sampler_epoch` é a época global, usada para garantir o embaralhamento correto.
+    """
+    self.logger.info(f"Iniciando treinamento neste shard por {num_epochs_per_shard} época(s).")
+    best_val_metrics = {"loss": float('inf')}
+    
+    for local_epoch_idx in range(num_epochs_per_shard):
+        # Informa ao sampler a época GLOBAL para garantir um embaralhamento diferente
+        if isinstance(self.train_dl.sampler, DistributedSampler):
+            self.train_dl.sampler.set_epoch(sampler_epoch)
+        
+        # A época passada para _run_epoch é a local (geralmente sempre 1)
+        self._run_epoch(local_epoch_idx, is_training=True)
+        
+        val_metrics = {"loss": float('inf')}
+        if self.val_dl:
+            if isinstance(self.val_dl.sampler, DistributedSampler):
+                self.val_dl.sampler.set_epoch(sampler_epoch)
+            with torch.no_grad():
+                val_metrics = self._run_epoch(local_epoch_idx, is_training=False)
+        
+        if val_metrics["loss"] < best_val_metrics["loss"]:
+            best_val_metrics = val_metrics
+            
+    return best_val_metrics
+3. run_pretraining_on_shards() - Orquestração Corrigida
+
+Esta função agora gerencia corretamente o estado e passa as variáveis corretas para as outras funções.
+
+Python
+
+def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
+    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards (com DDP Nativo) ---")
+    
+    # ... (código para listar arquivos do S3 e criar `all_files`) ...
+
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(...)
+    
+    # Carrega o checkpoint e obtém o ponto de partida correto
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
+    
+    model.to(args.local_rank)
+    model = DDP(model, device_ids=[args.local_rank])
+    is_main_process = (args.global_rank == 0)
+
+    # Loop de ÉPOCA GLOBAL
+    for global_epoch_idx in range(start_epoch, args.num_global_epochs):
+        logger.info(f"--- INICIANDO ÉPOCA GLOBAL {global_epoch_idx + 1}/{args.num_global_epochs} ---")
+        
+        # ... (código para embaralhar e criar `file_shards`) ...
+        
+        # Se estamos resumindo, o loop de shard começa de onde parou.
+        # Para épocas subsequentes, ele começa do zero.
+        for shard_num in range(start_shard, len(file_shards)):
+            # ... (código para carregar o shard e criar DataLoaders com DistributedSampler) ...
+
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, args.device, 
+                                         pad_id, tokenizer.vocab_size, args.logging_steps, 
+                                         is_main_process=is_main_process)
+            
+            # --- CORREÇÃO: Passa a ÉPOCA GLOBAL para o sampler ---
+            best_metrics_in_shard = trainer.train(
+                num_epochs_per_shard=args.epochs_per_shard,
+                sampler_epoch=global_epoch_idx
+            )
+            
+            # --- CORREÇÃO: Passa a ÉPOCA GLOBAL correta para salvar ---
+            save_checkpoint(
+                args,
+                global_epoch=global_epoch_idx,
+                shard_num=shard_num,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_loss=best_metrics_in_shard['loss']
+            )
+            
+        # Após a primeira época (que pode ter sido retomada), as próximas começam do shard 0
+        start_shard = 0
+
+    logger.info(f"--- {args.num_global_epochs} ÉPOCAS GLOBAIS CONCLUÍDAS ---")
+Resumo da Correção
+/////////////////////////////////////
 # --- Imports ---
 import torch
 import torch.nn as nn
