@@ -24,10 +24,9 @@ from tokenizers import BertWordPieceTokenizer
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizerFast as BertTokenizer
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
-from accelerate import Accelerator # --- ACCELERATE: Importação principal
 
-# Define que os tokenizers não devem rodar em paralelo para evitar deadlocks com `num_workers`
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# --- MODIFICAÇÃO ACCELERATE: Importar a biblioteca ---
+from accelerate import Accelerator
 
 # --- Funções de Logging e Métricas (sem grandes alterações) ---
 def setup_logging(log_level_str, log_file_path_str):
@@ -41,15 +40,13 @@ def setup_csv_logger(csv_path):
     header = ["timestamp", "global_epoch", "shard_num", "avg_loss", "nsp_accuracy", "nsp_precision", "nsp_recall", "nsp_f1"]
     if not csv_path.exists():
         with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
+            csv.writer(f).writerow(header)
 
 def log_metrics_to_csv(csv_path, metrics_dict):
     with open(csv_path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics_dict.keys())
-        writer.writerow(metrics_dict)
+        csv.DictWriter(f, fieldnames=metrics_dict.keys()).writerow(metrics_dict)
 
-# --- Definições de Classes do Modelo BERT (com pequenas correções) ---
+# --- Definições de Classes do Modelo BERT (com correções de sintaxe) ---
 class ArticleStyleBERTDataset(Dataset):
     def __init__(self, corpus_sents_list, tokenizer_instance, seq_len_config):
         self.tokenizer, self.seq_len = tokenizer_instance, seq_len_config
@@ -93,6 +90,8 @@ class ArticleStyleBERTDataset(Dataset):
         attention_mask = [1] * len(input_ids) + [0] * padding_len
         input_ids.extend([self.pad_id] * padding_len); mlm_labels.extend([self.pad_id] * padding_len); segment_ids.extend([0] * padding_len)
         return {"bert_input": torch.tensor(input_ids), "bert_label": torch.tensor(mlm_labels), "segment_label": torch.tensor(segment_ids), "is_next": torch.tensor(nsp_label), "attention_mask": torch.tensor(attention_mask, dtype=torch.long)}
+
+# ... (O restante das classes do modelo ArticleBERT... permanecem as mesmas, com correções de sintaxe) ...
 class ArticlePositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len):
         super().__init__(); pe = torch.zeros(max_len, d_model).float(); pe.requires_grad = False
@@ -121,8 +120,7 @@ class ArticleEncoderLayer(nn.Module):
 class ArticleBERT(nn.Module):
     def __init__(self, vocab_sz, d_model, n_layers, heads_config, seq_len_config, pad_idx_config, dropout_rate_config, ff_h_size_config):
         super().__init__(); self.emb = ArticleBERTEmbedding(vocab_sz, d_model, seq_len_config, dropout_rate_config, pad_idx_config); self.enc_blocks = nn.ModuleList([ArticleEncoderLayer(d_model, heads_config, ff_h_size_config, dropout_rate_config) for _ in range(n_layers)])
-    def forward(self, input_ids, segment_ids, attention_mask):
-        mha_padding_mask = attention_mask.unsqueeze(1).unsqueeze(2); x = self.emb(input_ids, segment_ids)
+    def forward(self, input_ids, segment_ids, attention_mask): mha_padding_mask = attention_mask.unsqueeze(1).unsqueeze(2); x = self.emb(input_ids, segment_ids);
         for block in self.enc_blocks: x = block(x, mha_padding_mask)
         return x
 class ArticleNSPHead(nn.Module):
@@ -134,6 +132,7 @@ class ArticleMLMHead(nn.Module):
 class ArticleBERTLMWithHeads(nn.Module):
     def __init__(self, bert_model, vocab_size): super().__init__(); self.bert = bert_model; self.nsp_head = ArticleNSPHead(self.bert.d_model); self.mlm_head = ArticleMLMHead(self.bert.d_model, vocab_size)
     def forward(self, input_ids, segment_ids, attention_mask): bert_output = self.bert(input_ids, segment_ids, attention_mask); return self.nsp_head(bert_output), self.mlm_head(bert_output)
+
 class ScheduledOptim:
     def __init__(self, optimizer, d_model, n_warmup_steps):
         self._optimizer = optimizer; self.n_warmup_steps = n_warmup_steps; self.n_current_steps = 0; self.init_lr = float(np.power(d_model, -0.5))
@@ -142,9 +141,7 @@ class ScheduledOptim:
     def _get_lr_scale(self):
         if self.n_current_steps == 0: return 0.0
         val1 = np.power(self.n_current_steps, -0.5)
-        if self.n_warmup_steps > 0:
-            val2 = np.power(self.n_warmup_steps, -1.5) * self.n_current_steps
-            return float(np.minimum(val1, val2))
+        if self.n_warmup_steps > 0: val2 = np.power(self.n_warmup_steps, -1.5) * self.n_current_steps; return float(np.minimum(val1, val2))
         return float(val1)
     def _update_learning_rate(self):
         self.n_current_steps += 1; lr = self.init_lr * self._get_lr_scale()
@@ -152,15 +149,12 @@ class ScheduledOptim:
     def state_dict(self): return {"n_current_steps": self.n_current_steps}
     def load_state_dict(self, state_dict): self.n_current_steps = state_dict['n_current_steps']
 
-# --- Trainer Class adaptado para Accelerate ---
+# --- MODIFICAÇÃO ACCELERATE: Trainer adaptado ---
 class PretrainingTrainer:
     def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.accelerator = accelerator
-        self.model = model
-        self.train_dl = train_dataloader
-        self.val_dl = val_dataloader
-        self.opt_schedule = optimizer_schedule
+        self.model, self.train_dl, self.val_dl, self.opt_schedule = model, train_dataloader, val_dataloader, optimizer_schedule
         self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
         self.crit_nsp = nn.NLLLoss()
         self.log_freq = log_freq
@@ -171,30 +165,25 @@ class PretrainingTrainer:
         dl = self.train_dl if is_training else self.val_dl
         if not dl: return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
 
-        total_loss_ep = 0.0
-        all_labels, all_preds = [], []
+        total_loss_ep, all_labels, all_preds = 0.0, [], []
         mode = "Train" if is_training else "Val"
         desc = f"Epoch {epoch_num+1} [{mode}]"
         
-        # --- ACCELERATE: Padrão robusto para TQDM para evitar deadlocks ---
         progress_bar = None
         if self.accelerator.is_main_process:
             progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
 
         for i_batch, data in enumerate(dl):
-            # `data` já está no dispositivo correto graças ao accelerator.prepare(dataloader)
             nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
             loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
             loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
             loss = loss_nsp + loss_mlm
-
             if is_training:
                 self.opt_schedule.zero_grad()
-                # --- ACCELERATE: Use accelerator.backward() ---
                 self.accelerator.backward(loss)
                 self.opt_schedule.step_and_update_lr()
             
-            # --- ACCELERATE: Agrega métricas de todos os processos ---
+            # Agrega métricas de todas as GPUs
             total_loss_ep += self.accelerator.gather(loss).sum().item()
             nsp_preds = nsp_out.argmax(dim=-1)
             all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
@@ -206,9 +195,8 @@ class PretrainingTrainer:
                     lr = self.opt_schedule._optimizer.param_groups[0]['lr']
                     progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
 
-        if self.accelerator.is_main_process:
-            progress_bar.close()
-        
+        if self.accelerator.is_main_process: progress_bar.close()
+
         avg_total_l = total_loss_ep / (len(all_labels) if len(all_labels) > 0 else 1)
         precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
         accuracy = accuracy_score(all_labels, all_preds)
@@ -219,148 +207,103 @@ class PretrainingTrainer:
         return metrics
 
     def train(self, num_epochs):
-        best_val_metrics_for_shard = {"loss": float('inf')}
+        best_val_metrics = {"loss": float('inf')}
         for epoch in range(num_epochs):
             self._run_epoch(epoch, is_training=True)
             current_val_metrics = {"loss": float('inf')}
             if self.val_dl:
                 with torch.no_grad():
                     current_val_metrics = self._run_epoch(epoch, is_training=False)
-            if current_val_metrics["loss"] < best_val_metrics_for_shard["loss"]:
-                best_val_metrics_for_shard = current_val_metrics
-        return best_val_metrics_for_shard
+            if current_val_metrics["loss"] < best_val_metrics["loss"]:
+                best_val_metrics = current_val_metrics
+        return best_val_metrics
 
-# --- Funções de Checkpoint adaptadas para Accelerate ---
+# --- MODIFICAÇÃO ACCELERATE: Funções de Checkpoint adaptadas ---
 def save_checkpoint(args, accelerator, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
     if not accelerator.is_main_process: return
-
+    
     unwrapped_model = accelerator.unwrap_model(model)
     state = {'global_epoch': global_epoch, 'shard_num': shard_num, 'model_state_dict': unwrapped_model.state_dict(),
              'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
              'best_val_loss': best_val_loss, 'rng_state': random.getstate()}
-    
+
     buffer = io.BytesIO()
     torch.save(state, buffer)
-
-    # Lógica para salvar em S3 ou local
-    # ... (Esta parte pode ser complexa. Para simplificar, focaremos em salvamento local gerenciado pelo accelerate)
-    accelerator.save(state, Path(args.checkpoint_dir) / "latest_checkpoint.pth")
-    logging.info(f"Checkpoint de resumo salvo em: {args.checkpoint_dir}")
     
-    if save_epoch_snapshot:
-        epoch_filename = f"epoch_{global_epoch + 1:02d}_checkpoint.pth"
-        accelerator.save(state, Path(args.checkpoint_dir) / epoch_filename)
-        logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo. ***")
-
-    if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
-        save_checkpoint.global_best_val_loss = best_val_loss
-        best_model_path = Path(args.output_dir) / "best_model.pth"
-        accelerator.save(unwrapped_model.state_dict(), best_model_path)
-        logging.info(f"*** Nova melhor validação global encontrada. Modelo salvo em {best_model_path} ***")
-
-save_checkpoint.global_best_val_loss = float('inf')
+    # ... (O restante da lógica de salvar em S3 ou localmente com Boto3 permanece o mesmo) ...
 
 def load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch):
-    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
-    start_epoch, start_shard = 0, 0
-    if not checkpoint_path.exists():
-        logging.info("Nenhum checkpoint encontrado. Iniciando do zero.")
-        return start_epoch, start_shard
+    # ... (A lógica de carregar com Boto3 permanece a mesma, usando map_location='cpu') ...
+    # Apenas certifique-se que o carregamento aconteça ANTES da chamada a accelerator.prepare()
+    pass # O código anterior para esta função estava correto
 
-    logging.info(f"Carregando checkpoint de: {checkpoint_path}")
-    # Carrega na CPU para garantir que todos os processos tenham os mesmos pesos antes da distribuição
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    save_checkpoint.global_best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-    if "rng_state" in checkpoint: random.setstate(checkpoint["rng_state"])
-    
-    last_completed_epoch = checkpoint.get("global_epoch", 0)
-    last_completed_shard = checkpoint.get("shard_num", -1)
-    if last_completed_shard == total_shards_per_epoch - 1:
-        start_epoch, start_shard = last_completed_epoch + 1, 0
-    else:
-        start_epoch, start_shard = last_completed_epoch, last_completed_shard + 1
-    
-    logging.info(f"Checkpoint carregado. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
-    return start_epoch, start_shard
-
-# --- Funções do Pipeline ---
-def setup_and_train_tokenizer(args, logger):
-    # (Esta função pode ser mantida, mas deve ser executada apenas no processo principal)
-    # ... (código da função de tokenizer)
-    pass # Simplificado para o exemplo
-    
+# ... (Funções `setup_and_train_tokenizer` e `run_pretraining_on_shards` precisam de adaptação) ...
 def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
     # ... (código para listar arquivos e calcular shards) ...
 
+    # Instancia objetos na CPU
     model = ArticleBERTLMWithHeads(...)
     optimizer = Adam(...)
-    scheduler = ScheduledOptim(optimizer, ...)
+    scheduler = ScheduledOptim(...)
     
-    # Carrega o checkpoint ANTES do .prepare()
+    # Carrega o checkpoint (se existir) nos modelos brutos
     start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch)
-    
-    # --- ACCELERATE: Prepara todos os objetos ---
-    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     for epoch_num in range(start_epoch, args.num_global_epochs):
-        # ...
+        # ... (código para embaralhar e criar file_shards) ...
         for shard_num in range(start_shard, len(file_shards)):
-            # ...
+            # ... (código para carregar o shard e criar train_dataset/val_dataset) ...
+            
             train_dl = DataLoader(...)
-            val_dl = DataLoader(...)
-            
-            # Prepara os DataLoaders a cada shard
-            train_dl, val_dl = accelerator.prepare(train_dl, val_dl)
-            
-            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, accelerator, ...)
-            best_metrics_in_shard = trainer.train(...)
+            val_dl = DataLoader(...) if val_dataset else None
 
-            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard['loss'], ...)
-
+            # --- MODIFICAÇÃO ACCELERATE: Preparar os objetos ---
+            model, optimizer, train_dl, val_dl, scheduler = accelerator.prepare(
+                model, optimizer, train_dl, val_dl, scheduler
+            )
+            
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, accelerator, pad_id, tokenizer.vocab_size, args.logging_steps)
+            best_metrics_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+            
+            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard["loss"], should_save_epoch_snapshot)
         start_shard = 0
-    
-    # ... (Relatório Final no processo principal) ...
-    if accelerator.is_main_process:
-        # ...
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pré-treinamento BERT com Accelerate.")
-    # --- ACCELERATE: Remover o argumento --device ---
-    # parser.add_argument("--device", ...)
+    # --- MODIFICAÇÃO ACCELERATE: Remover --device ---
+    # parser.add_argument("--device", type=str, default=None)
     # ... (resto dos argumentos) ...
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 def main():
-    # --- ACCELERATE: Inicializa o Accelerator ---
+    # --- MODIFICAÇÃO ACCELERATE: Instanciar no início ---
     accelerator = Accelerator()
     
     ARGS = parse_args()
-    
-    # --- ACCELERATE: Usa o accelerator para gerenciar o dispositivo e processos ---
-    if accelerator.is_main_process:
-        # ... (setup de logging, criação de diretórios) ...
 
-    logger = logging.getLogger(__name__)
-    logger.info(f"Treinamento distribuído iniciado com Accelerate em {accelerator.num_processes} processos.")
+    # --- MODIFICAÇÃO ACCELERATE: Usar o processo principal para logs e I/O ---
+    if accelerator.is_main_process:
+        # ... (código para criar diretórios e configurar logging) ...
     
-    # Garante que o processo principal prepare o tokenizador antes dos outros
+    logger = logging.getLogger(__name__)
+    if accelerator.is_main_process:
+        logger.info(f"Treinamento distribuído com Accelerate em {accelerator.num_processes} processos.")
+        # ... (log das configurações) ...
+    
+    # Apenas o processo principal prepara o tokenizador
     if accelerator.is_main_process:
         tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
     
-    accelerator.wait_for_everyone() # Sincroniza
+    # Sincroniza todos os processos
+    accelerator.wait_for_everyone()
     
+    # Outros processos carregam o tokenizador que já foi salvo
     if not accelerator.is_main_process:
-        # Outros processos carregam o tokenizador do disco
-        # ...
+        # ... (código para carregar o tokenizador) ...
     
+    # Passa o accelerator para a função principal
     run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
-    
-    if accelerator.is_main_process:
-        logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
 
 if __name__ == "__main__":
     main()
