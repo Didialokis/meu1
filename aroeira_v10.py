@@ -1,102 +1,108 @@
-def load_checkpoint(args, model, optimizer, scheduler):
-    """
-    Carrega o último checkpoint. Retorna a próxima época e o próximo shard a serem processados.
-    """
-    # A localização do `device` é importante para o torch.load
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if hasattr(args, 'device'):
-        device = args.device
-
-    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
-    start_epoch = 0
-    start_shard = 0
-    
-    if not checkpoint_path.exists():
-        logging.info("Nenhum checkpoint encontrado. Iniciando do zero.")
-        return start_epoch, start_shard
-
-    logging.info(f"Carregando checkpoint de: {checkpoint_path}")
-    # Carrega na CPU primeiro para evitar problemas de GPU, depois o modelo move para o device certo
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    # Atribui a melhor perda global para a função de salvamento
-    save_checkpoint.global_best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-    
-    if 'rng_state' in checkpoint:
-        random.setstate(checkpoint['rng_state'])
-    
-    # Obtém o último estado salvo
-    last_completed_epoch = checkpoint.get('global_epoch', 0)
-    last_completed_shard = checkpoint.get('shard_num', -1)
-    
-    # Calcula o ponto de início
-    start_epoch = last_completed_epoch
-    start_shard = last_completed_shard + 1
-    
-    logging.info(f"Checkpoint indica que a Época {last_completed_epoch + 1}, Shard {last_completed_shard + 1} foi concluída.")
-    logging.info(f"==> Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}. <==")
-    
-    return start_epoch, start_shard
-2. run_pretraining_on_shards() - A Correção Principal na Lógica do Loop
-
-Esta é a função onde o bug de estado estava ocorrendo. A versão abaixo corrige a interação entre os loops.
-
-Python
-
 def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
-    logger.info("--- Fase: Pré-Treinamento em Épocas Globais e Shards ---")
+    logger.info("--- Fase: Pré-Treinamento em Shards ---")
     
-    # 1. Obter a lista de todos os arquivos de dados
-    # ... (código para listar arquivos do S3, `all_files_master_list`) ...
+    csv_log_path = Path(args.output_dir) / "training_metrics.csv"
+    setup_csv_logger(csv_log_path)
+    logger.info(f"Métricas detalhadas serão salvas em: {csv_log_path}")
 
-    # 2. Instanciar modelo e otimizadores FORA do loop para manter o estado
-    model = ArticleBERTLMWithHeads(...) # (argumentos completos do modelo aqui)
-    optimizer = Adam(...)
-    scheduler = ScheduledOptim(...)
-    
-    # 3. Carrega o estado do último checkpoint, se existir.
-    # Esta chamada acontece APENAS UMA VEZ, no início.
-    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler)
-    
-    # --- CORREÇÃO: LÓGICA DE LOOP ROBUSTA ---
+    logger.info("Buscando a lista e metadados dos arquivos de dados...")
+    base_data_path = args.s3_data_path.rstrip("/")
+    glob_data_path = (
+        f"{base_data_path}/batch_*.jsonl"
+        if "batch_*.jsonl" not in base_data_path
+        else base_data_path
+    )
+    s3 = s3fs.S3FileSystem()
+    all_files_master_list = sorted(s3.glob(glob_data_path))
+    if not all_files_master_list:
+        logger.error(f"Nenhum arquivo de dados encontrado em '{glob_data_path}'.")
+        return
 
-    # 4. Loop de ÉPOCA GLOBAL: Começa da 'start_epoch' carregada.
+    total_bytes = sum(s3.info(f)["Size"] for f in all_files_master_list)
+    total_gb = total_bytes / (1024**3)
+    logger.info(f"Encontrados {len(all_files_master_list)} arquivos de dados, tamanho total: {total_gb:.2f} GB.")
+
+    num_files_per_shard = args.files_per_shard_training
+    total_shards_per_epoch = math.ceil(len(all_files_master_list) / num_files_per_shard)
+    logger.info(f"Dados divididos em {total_shards_per_epoch} shards de treinamento por época.")
+    
+    model = ArticleBERTLMWithHeads(
+        ArticleBERT(
+            vocab_sz=tokenizer.vocab_size, d_model=args.model_d_model, n_layers=args.model_n_layers, 
+            heads_config=args.model_heads, seq_len_config=args.max_len, pad_idx_config=pad_id, 
+            dropout_rate_config=args.model_dropout_prob, ff_h_size_config=args.model_d_model * 4
+        ),
+        tokenizer.vocab_size,
+    )
+    optimizer = Adam(model.parameters(), lr=args.lr_pretrain, betas=(0.9, 0.999), weight_decay=0.01)
+    scheduler = ScheduledOptim(optimizer, args.model_d_model, args.warmup_steps)
+    model.to(args.device)
+
+    # Carrega o checkpoint, se existir. A função load_checkpoint está correta.
+    start_epoch, initial_start_shard = load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch)
+    
+    # --- CORREÇÃO NA LÓGICA DO LOOP ---
+    # Loop de Épocas Globais
     for epoch_num in range(start_epoch, args.num_global_epochs):
-        logger.info(f"--- INICIANDO ÉPOCA GLOBAL {epoch_num + 1}/{args.num_global_epochs} ---")
-        
+        logger.info(f"--- Iniciando Época Global {epoch_num + 1}/{args.num_global_epochs} ---")
+
         current_files = list(all_files_master_list)
-        # Embaralha os arquivos no início de cada época, mas apenas se não estivermos
-        # continuando uma época já iniciada.
-        if start_shard == 0:
+        # Só embaralha se estivermos no início de uma época (ou seja, shard 0)
+        # E só se a época não for a primeira de uma execução retomada.
+        if initial_start_shard == 0:
             random.shuffle(current_files)
             logger.info("Ordem dos arquivos de dados foi embaralhada para esta época.")
         
-        file_shards = [current_files[i:i + args.files_per_shard_training] for i in range(0, len(current_files), args.files_per_shard_training)]
+        file_shards = [current_files[i : i + num_files_per_shard] for i in range(0, len(current_files), num_files_per_shard)]
         
-        # 5. Loop INTERNO sobre os shards: Começa do 'start_shard' carregado.
-        for shard_num in range(start_shard, len(file_shards)):
+        # Define o shard inicial para a iteração atual do loop de épocas
+        # Se for a primeira época da execução, usa o valor do checkpoint.
+        # Para todas as épocas seguintes, começa do shard 0.
+        current_start_shard = initial_start_shard if epoch_num == start_epoch else 0
+
+        # Loop de Shards
+        for shard_num in range(current_start_shard, len(file_shards)):
             file_list_for_shard = file_shards[shard_num]
             logger.info(f"--- Processando Shard {shard_num + 1}/{len(file_shards)} (Época Global {epoch_num + 1}) ---")
             
-            # ... (código para carregar o shard e criar DataLoaders) ...
-            
-            # Instancia o Trainer
-            trainer = PretrainingTrainer(...)
-            best_loss_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
-            
-            # Salva o checkpoint no final de cada shard
-            save_checkpoint(args, epoch_num, shard_num, model, optimizer, scheduler, best_loss_in_shard)
+            # (O resto do seu código dentro do loop de shards permanece o mesmo)
+            # ... carregar dados do shard, criar datasets e dataloaders ...
+            full_path_files = [f"s3://{f}" if not f.startswith("s3://") else f for f in file_list_for_shard]
+            shard_ds = datasets.load_dataset("json", data_files=full_path_files, split="train")
+            sentences_list = [ex["text"] for ex in shard_ds if ex and ex.get("text")]
+            if not sentences_list:
+                logger.warning(f"Shard {shard_num + 1} vazio. Pulando.")
+                continue
 
-        # 6. IMPORTANTE: Reseta o 'start_shard' para 0 para a PRÓXIMA época global.
-        # Isso garante que a próxima época comece do primeiro shard (shard 0).
-        start_shard = 0
+            val_split = int(len(sentences_list) * 0.1)
+            train_sents, val_sents = sentences_list[val_split:], sentences_list[:val_split]
+            train_dataset = ArticleStyleBERTDataset(train_sents, tokenizer, args.max_len)
+            val_dataset = ArticleStyleBERTDataset(val_sents, tokenizer, args.max_len) if val_sents else None
+            
+            train_dl = DataLoader(train_dataset, batch_size=args.batch_size_pretrain, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+            val_dl = DataLoader(val_dataset, batch_size=args.batch_size_pretrain, shuffle=False, num_workers=args.num_workers, pin_memory=True) if val_dataset else None
 
-    logger.info(f"--- {args.num_global_epochs} ÉPOCAS GLOBAIS CONCLUÍDAS ---")
-Explicação da Correção
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, args.device, pad_id, tokenizer.vocab_size, args.logging_steps)
+            best_metrics_in_shard = trainer.train(num_epochs=args.epochs_per_shard)
+
+            log_entry = {
+                "timestamp": datetime.datetime.now().isoformat(), "global_epoch": epoch_num + 1, "shard_num": shard_num + 1,
+                "avg_loss": best_metrics_in_shard.get("loss"), "nsp_accuracy": best_metrics_in_shard.get("accuracy"),
+                "nsp_precision": best_metrics_in_shard.get("precision"), "nsp_recall": best_metrics_in_shard.get("recall"),
+                "nsp_f1": best_metrics_in_shard.get("f1"),
+            }
+            log_metrics_to_csv(csv_log_path, log_entry)
+
+            is_last_shard_of_epoch = (shard_num == len(file_shards) - 1)
+            should_save_epoch_snapshot = is_last_shard_of_epoch and args.save_epoch_checkpoints
+
+            save_checkpoint(
+                args, global_epoch=epoch_num, shard_num=shard_num, model=model, optimizer=optimizer,
+                scheduler=scheduler, best_val_loss=best_metrics_in_shard["loss"],
+                save_epoch_snapshot=should_save_epoch_snapshot,
+            )
+
+    # ... (Relatório Final de Treinamento)
 ///////////////////////////////////////
 1. save_checkpoint() - Garantindo a Nomenclatura Correta
 
