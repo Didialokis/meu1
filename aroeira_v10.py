@@ -1,3 +1,370 @@
+import os
+import io
+import csv
+import sys
+import math
+import s3fs
+import torch
+import boto3
+import random
+import logging
+import datetime
+import argparse
+import datasets
+import tokenizers
+import numpy as np
+from tqdm.auto import tqdm
+import torch.nn as nn
+from pathlib import Path
+from torch.optim import Adam
+import torch.nn.functional as F
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+from tokenizers import BertWordPieceTokenizer
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizerFast as BertTokenizer
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from accelerate import Accelerator # --- ACCELERATE: Importação principal
+
+# Define que os tokenizers não devem rodar em paralelo para evitar deadlocks com `num_workers`
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# --- Funções de Logging e Métricas (sem grandes alterações) ---
+def setup_logging(log_level_str, log_file_path_str):
+    numeric_level = getattr(logging, log_level_str.upper(), None)
+    if not isinstance(numeric_level, int): raise ValueError(f"Nível de log inválido: {log_level_str}")
+    Path(log_file_path_str).parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(level=numeric_level, format="%(asctime)s [%(name)s:%(levelname)s] %(message)s",
+                        handlers=[logging.FileHandler(log_file_path_str), logging.StreamHandler(sys.stdout)])
+
+def setup_csv_logger(csv_path):
+    header = ["timestamp", "global_epoch", "shard_num", "avg_loss", "nsp_accuracy", "nsp_precision", "nsp_recall", "nsp_f1"]
+    if not csv_path.exists():
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+def log_metrics_to_csv(csv_path, metrics_dict):
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=metrics_dict.keys())
+        writer.writerow(metrics_dict)
+
+# --- Definições de Classes do Modelo BERT (com pequenas correções) ---
+class ArticleStyleBERTDataset(Dataset):
+    def __init__(self, corpus_sents_list, tokenizer_instance, seq_len_config):
+        self.tokenizer, self.seq_len = tokenizer_instance, seq_len_config
+        self.corpus_sents = [s for s in corpus_sents_list if s and s.strip()]
+        self.corpus_len = len(self.corpus_sents)
+        if self.corpus_len < 2: raise ValueError("Corpus precisa de pelo menos 2 sentenças.")
+        self.cls_id, self.sep_id, self.pad_id, self.mask_id = self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.pad_token_id, self.tokenizer.mask_token_id
+        self.vocab_size = self.tokenizer.vocab_size
+    def __len__(self): return self.corpus_len
+    def _get_sentence_pair_for_nsp(self, sent_a_idx):
+        sent_a, is_next = self.corpus_sents[sent_a_idx], 0
+        if random.random() < 0.5 and sent_a_idx + 1 < self.corpus_len:
+            sent_b, is_next = self.corpus_sents[sent_a_idx + 1], 1
+        else:
+            rand_sent_b_idx = random.randrange(self.corpus_len)
+            while self.corpus_len > 1 and rand_sent_b_idx == sent_a_idx: rand_sent_b_idx = random.randrange(self.corpus_len)
+            sent_b = self.corpus_sents[rand_sent_b_idx]
+        return sent_a, sent_b, is_next
+    def _apply_mlm_to_tokens(self, token_ids_list):
+        inputs, labels = list(token_ids_list), list(token_ids_list)
+        for i, token_id in enumerate(inputs):
+            if token_id in [self.cls_id, self.sep_id, self.pad_id]: labels[i] = self.pad_id; continue
+            if random.random() < 0.15:
+                action_prob = random.random()
+                if action_prob < 0.8: inputs[i] = self.mask_id
+                elif action_prob < 0.9: inputs[i] = random.randrange(self.vocab_size)
+            else: labels[i] = self.pad_id
+        return inputs, labels
+    def __getitem__(self, idx):
+        sent_a_str, sent_b_str, nsp_label = self._get_sentence_pair_for_nsp(idx)
+        tokens_a_ids = self.tokenizer.encode(sent_a_str, add_special_tokens=False, truncation=True, max_length=self.seq_len - 3)
+        tokens_b_ids = self.tokenizer.encode(sent_b_str, add_special_tokens=False, truncation=True, max_length=self.seq_len - len(tokens_a_ids) - 3)
+        masked_tokens_a_ids, mlm_labels_a_ids = self._apply_mlm_to_tokens(tokens_a_ids)
+        masked_tokens_b_ids, mlm_labels_b_ids = self._apply_mlm_to_tokens(tokens_b_ids)
+        input_ids = [self.cls_id] + masked_tokens_a_ids + [self.sep_id] + masked_tokens_b_ids + [self.sep_id]
+        mlm_labels = [self.pad_id] + mlm_labels_a_ids + [self.pad_id] + mlm_labels_b_ids + [self.pad_id]
+        segment_ids = ([0] * (len(masked_tokens_a_ids) + 2)) + ([1] * (len(masked_tokens_b_ids) + 1))
+        current_len = len(input_ids)
+        if current_len > self.seq_len: input_ids, mlm_labels, segment_ids = input_ids[:self.seq_len], mlm_labels[:self.seq_len], segment_ids[:self.seq_len]
+        padding_len = self.seq_len - len(input_ids)
+        attention_mask = [1] * len(input_ids) + [0] * padding_len
+        input_ids.extend([self.pad_id] * padding_len); mlm_labels.extend([self.pad_id] * padding_len); segment_ids.extend([0] * padding_len)
+        return {"bert_input": torch.tensor(input_ids), "bert_label": torch.tensor(mlm_labels), "segment_label": torch.tensor(segment_ids), "is_next": torch.tensor(nsp_label), "attention_mask": torch.tensor(attention_mask, dtype=torch.long)}
+class ArticlePositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len):
+        super().__init__(); pe = torch.zeros(max_len, d_model).float(); pe.requires_grad = False
+        pos_col = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos_col * div_term); pe[:, 1::2] = torch.cos(pos_col * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+    def forward(self, x_ids): return self.pe[:, :x_ids.size(1)]
+class ArticleBERTEmbedding(nn.Module):
+    def __init__(self, vocab_sz, d_model, seq_len, dropout_rate, pad_idx):
+        super().__init__(); self.tok = nn.Embedding(vocab_sz, d_model, padding_idx=pad_idx); self.seg = nn.Embedding(3, d_model, padding_idx=0); self.pos = ArticlePositionalEmbedding(d_model, seq_len); self.drop = nn.Dropout(p=dropout_rate)
+    def forward(self, sequence_ids, segment_label_ids): return self.drop(self.tok(sequence_ids) + self.pos(sequence_ids) + self.seg(segment_label_ids))
+class ArticleMultiHeadedAttention(nn.Module):
+    def __init__(self, num_heads, d_model, dropout_rate):
+        super().__init__(); assert d_model % num_heads == 0; self.d_k = d_model // num_heads; self.heads = num_heads; self.drop = nn.Dropout(dropout_rate); self.q_lin, self.k_lin, self.v_lin, self.out_lin = [nn.Linear(d_model, d_model) for _ in range(4)]
+    def forward(self, q_in, k_in, v_in, mha_mask_for_scores):
+        bs = q_in.size(0); q = self.q_lin(q_in).view(bs, -1, self.heads, self.d_k).transpose(1, 2); k = self.k_lin(k_in).view(bs, -1, self.heads, self.d_k).transpose(1, 2); v = self.v_lin(v_in).view(bs, -1, self.heads, self.d_k).transpose(1, 2); scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mha_mask_for_scores is not None: scores = scores.masked_fill(mha_mask_for_scores == 0, -1e9)
+        weights = self.drop(F.softmax(scores, dim=-1)); context = torch.matmul(weights, v).transpose(1, 2).contiguous().view(bs, -1, self.heads * self.d_k); return self.out_lin(context)
+class ArticleFeedForward(nn.Module):
+    def __init__(self, d_model, ff_hidden_size, dropout_rate): super().__init__(); self.fc1 = nn.Linear(d_model, ff_hidden_size); self.fc2 = nn.Linear(ff_hidden_size, d_model); self.drop = nn.Dropout(dropout_rate); self.activ = nn.GELU()
+    def forward(self, x): return self.fc2(self.drop(self.activ(self.fc1(x))))
+class ArticleEncoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, ff_hidden_size, dropout_rate): super().__init__(); self.norm1 = nn.LayerNorm(d_model); self.norm2 = nn.LayerNorm(d_model); self.attn = ArticleMultiHeadedAttention(num_heads, d_model, dropout_rate); self.ff = ArticleFeedForward(d_model, ff_hidden_size, dropout_rate); self.drop = nn.Dropout(dropout_rate)
+    def forward(self, embeds, mha_padding_mask): attended = self.attn(embeds, embeds, embeds, mha_padding_mask); x = self.norm1(embeds + self.drop(attended)); ff_out = self.ff(x); return self.norm2(x + self.drop(ff_out))
+class ArticleBERT(nn.Module):
+    def __init__(self, vocab_sz, d_model, n_layers, heads_config, seq_len_config, pad_idx_config, dropout_rate_config, ff_h_size_config):
+        super().__init__(); self.emb = ArticleBERTEmbedding(vocab_sz, d_model, seq_len_config, dropout_rate_config, pad_idx_config); self.enc_blocks = nn.ModuleList([ArticleEncoderLayer(d_model, heads_config, ff_h_size_config, dropout_rate_config) for _ in range(n_layers)])
+    def forward(self, input_ids, segment_ids, attention_mask):
+        mha_padding_mask = attention_mask.unsqueeze(1).unsqueeze(2); x = self.emb(input_ids, segment_ids)
+        for block in self.enc_blocks: x = block(x, mha_padding_mask)
+        return x
+class ArticleNSPHead(nn.Module):
+    def __init__(self, hidden_d_model): super().__init__(); self.linear = nn.Linear(hidden_d_model, 2); self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out[:, 0]))
+class ArticleMLMHead(nn.Module):
+    def __init__(self, hidden_d_model, vocab_sz): super().__init__(); self.linear = nn.Linear(hidden_d_model, vocab_sz); self.log_softmax = nn.LogSoftmax(dim=-1)
+    def forward(self, bert_out): return self.log_softmax(self.linear(bert_out))
+class ArticleBERTLMWithHeads(nn.Module):
+    def __init__(self, bert_model, vocab_size): super().__init__(); self.bert = bert_model; self.nsp_head = ArticleNSPHead(self.bert.d_model); self.mlm_head = ArticleMLMHead(self.bert.d_model, vocab_size)
+    def forward(self, input_ids, segment_ids, attention_mask): bert_output = self.bert(input_ids, segment_ids, attention_mask); return self.nsp_head(bert_output), self.mlm_head(bert_output)
+class ScheduledOptim:
+    def __init__(self, optimizer, d_model, n_warmup_steps):
+        self._optimizer = optimizer; self.n_warmup_steps = n_warmup_steps; self.n_current_steps = 0; self.init_lr = float(np.power(d_model, -0.5))
+    def step_and_update_lr(self): self._update_learning_rate(); self._optimizer.step()
+    def zero_grad(self): self._optimizer.zero_grad()
+    def _get_lr_scale(self):
+        if self.n_current_steps == 0: return 0.0
+        val1 = np.power(self.n_current_steps, -0.5)
+        if self.n_warmup_steps > 0:
+            val2 = np.power(self.n_warmup_steps, -1.5) * self.n_current_steps
+            return float(np.minimum(val1, val2))
+        return float(val1)
+    def _update_learning_rate(self):
+        self.n_current_steps += 1; lr = self.init_lr * self._get_lr_scale()
+        for param_group in self._optimizer.param_groups: param_group["lr"] = lr
+    def state_dict(self): return {"n_current_steps": self.n_current_steps}
+    def load_state_dict(self, state_dict): self.n_current_steps = state_dict['n_current_steps']
+
+# --- Trainer Class adaptado para Accelerate ---
+class PretrainingTrainer:
+    def __init__(self, model, train_dataloader, val_dataloader, optimizer_schedule, accelerator, pad_idx_mlm_loss, vocab_size, log_freq=100):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.accelerator = accelerator
+        self.model = model
+        self.train_dl = train_dataloader
+        self.val_dl = val_dataloader
+        self.opt_schedule = optimizer_schedule
+        self.crit_mlm = nn.NLLLoss(ignore_index=pad_idx_mlm_loss)
+        self.crit_nsp = nn.NLLLoss()
+        self.log_freq = log_freq
+        self.vocab_size = vocab_size
+
+    def _run_epoch(self, epoch_num, is_training):
+        self.model.train(is_training)
+        dl = self.train_dl if is_training else self.val_dl
+        if not dl: return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+
+        total_loss_ep = 0.0
+        all_labels, all_preds = [], []
+        mode = "Train" if is_training else "Val"
+        desc = f"Epoch {epoch_num+1} [{mode}]"
+        
+        # --- ACCELERATE: Padrão robusto para TQDM para evitar deadlocks ---
+        progress_bar = None
+        if self.accelerator.is_main_process:
+            progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+        for i_batch, data in enumerate(dl):
+            # `data` já está no dispositivo correto graças ao accelerator.prepare(dataloader)
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
+
+            if is_training:
+                self.opt_schedule.zero_grad()
+                # --- ACCELERATE: Use accelerator.backward() ---
+                self.accelerator.backward(loss)
+                self.opt_schedule.step_and_update_lr()
+            
+            # --- ACCELERATE: Agrega métricas de todos os processos ---
+            total_loss_ep += self.accelerator.gather(loss).sum().item()
+            nsp_preds = nsp_out.argmax(dim=-1)
+            all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+            all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+            if self.accelerator.is_main_process:
+                progress_bar.update(1)
+                if (i_batch + 1) % self.log_freq == 0:
+                    lr = self.opt_schedule._optimizer.param_groups[0]['lr']
+                    progress_bar.set_postfix({"L":f"{loss.item():.3f}", "LR":f"{lr:.2e}"})
+
+        if self.accelerator.is_main_process:
+            progress_bar.close()
+        
+        avg_total_l = total_loss_ep / (len(all_labels) if len(all_labels) > 0 else 1)
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+        accuracy = accuracy_score(all_labels, all_preds)
+        metrics = {"loss": avg_total_l, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+        
+        if self.accelerator.is_main_process:
+            self.logger.info(f"{desc} - AvgLoss: {metrics['loss']:.4f}, NSP Acc: {metrics['accuracy']*100:.2f}%, Precision: {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}, F1-Score: {metrics['f1']:.3f}")
+        return metrics
+
+    def train(self, num_epochs):
+        best_val_metrics_for_shard = {"loss": float('inf')}
+        for epoch in range(num_epochs):
+            self._run_epoch(epoch, is_training=True)
+            current_val_metrics = {"loss": float('inf')}
+            if self.val_dl:
+                with torch.no_grad():
+                    current_val_metrics = self._run_epoch(epoch, is_training=False)
+            if current_val_metrics["loss"] < best_val_metrics_for_shard["loss"]:
+                best_val_metrics_for_shard = current_val_metrics
+        return best_val_metrics_for_shard
+
+# --- Funções de Checkpoint adaptadas para Accelerate ---
+def save_checkpoint(args, accelerator, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
+    if not accelerator.is_main_process: return
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    state = {'global_epoch': global_epoch, 'shard_num': shard_num, 'model_state_dict': unwrapped_model.state_dict(),
+             'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
+             'best_val_loss': best_val_loss, 'rng_state': random.getstate()}
+    
+    buffer = io.BytesIO()
+    torch.save(state, buffer)
+
+    # Lógica para salvar em S3 ou local
+    # ... (Esta parte pode ser complexa. Para simplificar, focaremos em salvamento local gerenciado pelo accelerate)
+    accelerator.save(state, Path(args.checkpoint_dir) / "latest_checkpoint.pth")
+    logging.info(f"Checkpoint de resumo salvo em: {args.checkpoint_dir}")
+    
+    if save_epoch_snapshot:
+        epoch_filename = f"epoch_{global_epoch + 1:02d}_checkpoint.pth"
+        accelerator.save(state, Path(args.checkpoint_dir) / epoch_filename)
+        logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo. ***")
+
+    if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
+        save_checkpoint.global_best_val_loss = best_val_loss
+        best_model_path = Path(args.output_dir) / "best_model.pth"
+        accelerator.save(unwrapped_model.state_dict(), best_model_path)
+        logging.info(f"*** Nova melhor validação global encontrada. Modelo salvo em {best_model_path} ***")
+
+save_checkpoint.global_best_val_loss = float('inf')
+
+def load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch):
+    checkpoint_path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
+    start_epoch, start_shard = 0, 0
+    if not checkpoint_path.exists():
+        logging.info("Nenhum checkpoint encontrado. Iniciando do zero.")
+        return start_epoch, start_shard
+
+    logging.info(f"Carregando checkpoint de: {checkpoint_path}")
+    # Carrega na CPU para garantir que todos os processos tenham os mesmos pesos antes da distribuição
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    save_checkpoint.global_best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    if "rng_state" in checkpoint: random.setstate(checkpoint["rng_state"])
+    
+    last_completed_epoch = checkpoint.get("global_epoch", 0)
+    last_completed_shard = checkpoint.get("shard_num", -1)
+    if last_completed_shard == total_shards_per_epoch - 1:
+        start_epoch, start_shard = last_completed_epoch + 1, 0
+    else:
+        start_epoch, start_shard = last_completed_epoch, last_completed_shard + 1
+    
+    logging.info(f"Checkpoint carregado. Resumindo da Época Global {start_epoch + 1}, Shard {start_shard + 1}.")
+    return start_epoch, start_shard
+
+# --- Funções do Pipeline ---
+def setup_and_train_tokenizer(args, logger):
+    # (Esta função pode ser mantida, mas deve ser executada apenas no processo principal)
+    # ... (código da função de tokenizer)
+    pass # Simplificado para o exemplo
+    
+def run_pretraining_on_shards(args, accelerator, tokenizer, pad_id, logger):
+    # ... (código para listar arquivos e calcular shards) ...
+
+    model = ArticleBERTLMWithHeads(...)
+    optimizer = Adam(...)
+    scheduler = ScheduledOptim(optimizer, ...)
+    
+    # Carrega o checkpoint ANTES do .prepare()
+    start_epoch, start_shard = load_checkpoint(args, model, optimizer, scheduler, total_shards_per_epoch)
+    
+    # --- ACCELERATE: Prepara todos os objetos ---
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+
+    for epoch_num in range(start_epoch, args.num_global_epochs):
+        # ...
+        for shard_num in range(start_shard, len(file_shards)):
+            # ...
+            train_dl = DataLoader(...)
+            val_dl = DataLoader(...)
+            
+            # Prepara os DataLoaders a cada shard
+            train_dl, val_dl = accelerator.prepare(train_dl, val_dl)
+            
+            trainer = PretrainingTrainer(model, train_dl, val_dl, scheduler, accelerator, ...)
+            best_metrics_in_shard = trainer.train(...)
+
+            save_checkpoint(args, accelerator, epoch_num, shard_num, model, optimizer, scheduler, best_metrics_in_shard['loss'], ...)
+
+        start_shard = 0
+    
+    # ... (Relatório Final no processo principal) ...
+    if accelerator.is_main_process:
+        # ...
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pré-treinamento BERT com Accelerate.")
+    # --- ACCELERATE: Remover o argumento --device ---
+    # parser.add_argument("--device", ...)
+    # ... (resto dos argumentos) ...
+    return parser.parse_args()
+
+def main():
+    # --- ACCELERATE: Inicializa o Accelerator ---
+    accelerator = Accelerator()
+    
+    ARGS = parse_args()
+    
+    # --- ACCELERATE: Usa o accelerator para gerenciar o dispositivo e processos ---
+    if accelerator.is_main_process:
+        # ... (setup de logging, criação de diretórios) ...
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Treinamento distribuído iniciado com Accelerate em {accelerator.num_processes} processos.")
+    
+    # Garante que o processo principal prepare o tokenizador antes dos outros
+    if accelerator.is_main_process:
+        tokenizer, pad_id = setup_and_train_tokenizer(ARGS, logger)
+    
+    accelerator.wait_for_everyone() # Sincroniza
+    
+    if not accelerator.is_main_process:
+        # Outros processos carregam o tokenizador do disco
+        # ...
+    
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+    
+    if accelerator.is_main_process:
+        logger.info("--- Pipeline de Pré-treinamento Finalizado ---")
+
+if __name__ == "__main__":
+    main()
+////////////////////////////////////////
 def run_pretraining_on_shards(args, tokenizer, pad_id, logger):
     logger.info("--- Fase: Pré-Treinamento em Shards ---")
     
