@@ -1,3 +1,136 @@
+Olá\! Este erro é bastante específico e a mensagem de traceback nos dá a resposta exata.
+
+O erro **`AttributeError: 'S3' object has no attribute 'open'`** acontece porque há uma mistura de duas bibliotecas diferentes para interagir com o S3.
+
+1.  A biblioteca `boto3`, quando você cria um cliente com `s3 = boto3.client('s3')`, retorna um objeto que **não** tem um método `.open()`. Ele usa métodos como `upload_fileobj()` e `download_fileobj()`.
+2.  A biblioteca `s3fs`, quando você cria um sistema de arquivos com `s3 = s3fs.S3FileSystem()`, retorna um objeto que **tem** um método `.open()`, que imita a abertura de arquivos locais.
+
+Seu código de *carregamento* (`load_checkpoint`) foi corrigido para usar o padrão `boto3` (que você confirmou que funciona), mas a função de *salvamento* (`save_checkpoint`) ainda estava tentando usar o método `.open()`, que pertence ao `s3fs`.
+
+### A Solução: Padronizar o Uso do `boto3`
+
+A correção é garantir que a função `save_checkpoint` também use exclusivamente os métodos do `boto3` para escrever no S3, assim como a função de carregamento. Vamos usar o `s3.upload_fileobj()` com um buffer em memória.
+
+-----
+
+### Código Completo da Função Corrigida
+
+Você só precisa substituir a sua função `save_checkpoint` pela versão completa abaixo. Nenhuma outra parte do código precisa ser alterada.
+
+**Pré-requisitos:** Garanta que estas importações estejam no topo do seu arquivo.
+
+```python
+import boto3
+import io
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+```
+
+**Função `save_checkpoint` Corrigida:**
+
+```python
+def save_checkpoint(args, global_epoch, shard_num, model, optimizer, scheduler, best_val_loss, save_epoch_snapshot=False):
+    """
+    Salva um checkpoint completo, usando Boto3 para caminhos S3 de forma consistente.
+    """
+    # Apenas o processo principal (em DDP) ou o único processo deve salvar.
+    # Esta verificação é segura mesmo em modo não-distribuído.
+    if hasattr(args, 'global_rank') and args.global_rank != 0:
+        return
+
+    is_s3_checkpoint = args.checkpoint_dir.startswith("s3://")
+    is_s3_output = args.output_dir.startswith("s3://")
+
+    # Cria o estado do checkpoint
+    model_to_save = model.module if isinstance(model, (DDP, nn.DataParallel)) else model
+    state = {
+        'global_epoch': global_epoch,
+        'shard_num': shard_num,
+        'model_state_dict': model_to_save.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'rng_state': random.getstate(),
+    }
+
+    # 1. Salva o checkpoint mais recente ('latest_checkpoint.pth')
+    try:
+        # Prepara o buffer em memória para o checkpoint
+        buffer = io.BytesIO()
+        torch.save(state, buffer)
+        buffer.seek(0)  # Rebobina o buffer para o início para a leitura do upload
+
+        if is_s3_checkpoint:
+            s3 = boto3.client('s3')
+            parsed_url = urlparse(args.checkpoint_dir)
+            bucket = parsed_url.netloc
+            key = f"{parsed_url.path.lstrip('/')}/latest_checkpoint.pth"
+            s3.upload_fileobj(Fileobj=buffer, Bucket=bucket, Key=key)
+            logging.info(f"Checkpoint de resumo salvo em: s3://{bucket}/{key}")
+        else:
+            path = Path(args.checkpoint_dir) / "latest_checkpoint.pth"
+            with open(path, 'wb') as f: f.write(buffer.read())
+            logging.info(f"Checkpoint de resumo salvo em: {path}")
+
+    except Exception as e:
+        logging.error(f"Falha ao salvar o checkpoint 'latest': {e}")
+        return # Evita continuar se o salvamento principal falhar
+
+    # 2. Salva o snapshot da época, se solicitado
+    if save_epoch_snapshot:
+        try:
+            buffer.seek(0) # Reutiliza o mesmo buffer
+            epoch_filename = f"epoch_{global_epoch + 1:02d}_checkpoint.pth"
+            if is_s3_checkpoint:
+                s3 = boto3.client('s3')
+                parsed_url = urlparse(args.checkpoint_dir)
+                bucket = parsed_url.netloc
+                key = f"{parsed_url.path.lstrip('/')}/{epoch_filename}"
+                s3.upload_fileobj(Fileobj=buffer, Bucket=bucket, Key=key)
+                logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo em: s3://{bucket}/{key} ***")
+            else:
+                path = Path(args.checkpoint_dir) / epoch_filename
+                with open(path, 'wb') as f: f.write(buffer.read())
+                logging.info(f"*** Snapshot da Época {global_epoch + 1} salvo em: {path} ***")
+        except Exception as e:
+            logging.error(f"Falha ao salvar o snapshot da época: {e}")
+
+    # 3. Salva o melhor modelo se um novo recorde for alcançado
+    if best_val_loss < getattr(save_checkpoint, "global_best_val_loss", float('inf')):
+        save_checkpoint.global_best_val_loss = best_val_loss
+        
+        model_buffer = io.BytesIO()
+        torch.save(model_to_save.state_dict(), model_buffer)
+        model_buffer.seek(0)
+        
+        try:
+            if is_s3_output:
+                s3 = boto3.client('s3')
+                parsed_url = urlparse(args.output_dir)
+                bucket = parsed_url.netloc
+                key = f"{parsed_url.path.lstrip('/')}/best_model.pth"
+                s3.upload_fileobj(Fileobj=model_buffer, Bucket=bucket, Key=key)
+                logging.info(f"*** Nova melhor validação. Modelo salvo em s3://{bucket}/{key} ***")
+            else:
+                path = Path(args.output_dir) / "best_model.pth"
+                with open(path, 'wb') as f: f.write(model_buffer.read())
+                logging.info(f"*** Nova melhor validação. Modelo salvo em {path} ***")
+        except Exception as e:
+            logging.error(f"Falha ao salvar o melhor modelo: {e}")
+
+# Inicializa o atributo estático para rastrear a melhor perda global
+save_checkpoint.global_best_val_loss = float('inf')
+```
+
+### Resumo da Correção
+
+  * **Padronização:** Agora, toda a lógica de escrita de arquivos no S3 dentro de `save_checkpoint` usa o método `boto3.client('s3').upload_fileobj()`.
+  * **Uso de Buffer:** Assim como na função de carregamento, os dados são primeiro escritos em um buffer em memória (`io.BytesIO`) e depois o conteúdo do buffer é enviado para o S3.
+  * **Flexibilidade:** A função continua funcionando para caminhos locais e S3, tornando o script versátil para testes e produção.
+
+Com esta alteração, o erro `AttributeError` será resolvido e seu processo de salvamento de checkpoints funcionará de forma consistente com a lógica de carregamento que você já validou.
+
+/////////////////////////////////
 Com certeza. O `accelerator.accumulate` é uma das funcionalidades mais poderosas e elegantes do `accelerate`. Ele implementa a **acumulação de gradientes** de forma automática e limpa.
 
 A acumulação de gradientes é uma técnica usada para simular um tamanho de batch muito maior do que o que cabe na memória da sua GPU. Por exemplo, se você deseja um `batch size` de 256, mas sua GPU só suporta 32, você pode definir `gradient_accumulation_steps=8`. O `accelerate` irá rodar 8 "micro-batches" de 32, acumular os gradientes de cada um, e só então atualizar os pesos do modelo uma única vez, efetivamente simulando um batch de `32 * 8 = 256`.
