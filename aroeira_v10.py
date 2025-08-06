@@ -1,3 +1,135 @@
+Com certeza. O `accelerator.accumulate` é uma das funcionalidades mais poderosas e elegantes do `accelerate`. Ele implementa a **acumulação de gradientes** de forma automática e limpa.
+
+A acumulação de gradientes é uma técnica usada para simular um tamanho de batch muito maior do que o que cabe na memória da sua GPU. Por exemplo, se você deseja um `batch size` de 256, mas sua GPU só suporta 32, você pode definir `gradient_accumulation_steps=8`. O `accelerate` irá rodar 8 "micro-batches" de 32, acumular os gradientes de cada um, e só então atualizar os pesos do modelo uma única vez, efetivamente simulando um batch de `32 * 8 = 256`.
+
+A integração no seu código, como você pediu, requer modificações mínimas e torna o loop de treinamento ainda mais limpo.
+
+-----
+
+### Código Completo das Funções Modificadas
+
+A seguir estão as únicas três funções que precisam de alteração: `parse_args`, `main`, e o loop de treinamento em `PretrainingTrainer._run_epoch`.
+
+**1. `parse_args()` - Adicionando o Argumento de Acumulação**
+
+Primeiro, adicionamos um argumento para que você possa controlar o número de passos de acumulação pelo terminal.
+
+```python
+def parse_args():
+    parser = argparse.ArgumentParser(description="Script de Pré-treino BERT com Accelerate e Acumulação de Gradientes.")
+    
+    # ... (todos os argumentos anteriores) ...
+    parser.add_argument("--batch_size_pretrain", type=int, default=32)
+    
+    # --- MODIFICAÇÃO: Argumento para acumulação de gradientes ---
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Número de passos para acumular gradientes antes de uma atualização do otimizador. Batch size efetivo = batch_size_pretrain * gradient_accumulation_steps.")
+
+    # ... (resto dos argumentos) ...
+    
+    args = parser.parse_args()
+    return args
+```
+
+**2. `main()` - Informando o `Accelerator` sobre a Acumulação**
+
+Passamos o novo argumento diretamente para o construtor do `Accelerator`.
+
+```python
+def main():
+    ARGS = parse_args()
+    
+    # --- MODIFICAÇÃO: Passar os passos de acumulação para o Accelerator ---
+    accelerator = Accelerator(gradient_accumulation_steps=ARGS.gradient_accumulation_steps)
+    
+    # O resto da função main permanece o mesmo...
+    # ... (setup de logging, tokenizador, etc.)
+    
+    # Inicia o treinamento, passando o accelerator já configurado
+    run_pretraining_on_shards(ARGS, accelerator, tokenizer, pad_id, logger)
+```
+
+**3. `PretrainingTrainer._run_epoch()` - Implementando o Context Manager**
+
+Esta é a mudança principal, onde aplicamos o padrão do tutorial. O loop de treinamento fica mais simples e declarativo.
+
+```python
+# Dentro da classe PretrainingTrainer
+
+def _run_epoch(self, epoch_num, is_training):
+    self.model.train(is_training)
+    dl = self.train_dl if is_training else self.val_dl
+    if not dl:
+        return {"loss": float('inf'), "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+    
+    total_loss_ep = 0.0
+    all_labels, all_preds = [], []
+    
+    mode = "Train" if is_training else "Val"
+    desc = f"Epoch {epoch_num+1} [{mode}]"
+    
+    progress_bar = None
+    if self.accelerator.is_main_process:
+        progress_bar = tqdm(total=len(dl), desc=desc, file=sys.stdout)
+
+    for i_batch, data in enumerate(dl):
+        # --- MODIFICAÇÃO: Usar o contexto accelerator.accumulate ---
+        with self.accelerator.accumulate(self.model):
+            # 1. Forward pass (como antes)
+            nsp_out, mlm_out = self.model(data["bert_input"], data["segment_label"], data["attention_mask"])
+            loss_nsp = self.crit_nsp(nsp_out, data["is_next"])
+            loss_mlm = self.crit_mlm(mlm_out.view(-1, self.vocab_size), data["bert_label"].view(-1))
+            loss = loss_nsp + loss_mlm
+
+            if is_training:
+                # 2. Backward pass (como antes, o accelerator gerencia a acumulação)
+                self.accelerator.backward(loss)
+                
+                # 3. Optimizer e Scheduler step (AGORA DENTRO DO BLOCO)
+                # O accelerate garante que estas linhas só executem quando os gradientes
+                # de `gradient_accumulation_steps` batches forem acumulados.
+                self.opt_schedule.step_and_update_lr()
+                self.opt_schedule.zero_grad()
+        # -------------------------------------------------------------
+
+        # A lógica de agregação de métricas e atualização da barra de progresso continua fora do 'with'
+        total_loss_ep += self.accelerator.gather(loss).sum().item()
+        
+        nsp_preds = nsp_out.argmax(dim=-1)
+        all_labels.extend(self.accelerator.gather(data["is_next"]).cpu().numpy())
+        all_preds.extend(self.accelerator.gather(nsp_preds).cpu().numpy())
+
+        if self.accelerator.is_main_process:
+            progress_bar.update(1)
+            # ... (lógica do progress_bar.set_postfix) ...
+
+    # ... (resto da função para fechar a barra e calcular métricas finais) ...
+    return metrics
+```
+
+### Como Funciona na Prática
+
+  - **Seu Código Permanece Limpo:** Você escreve seu loop como se estivesse atualizando a cada passo (`optimizer.step()`, `optimizer.zero_grad()`).
+  - **O `accelerate` Faz a Mágica:** O `with accelerator.accumulate(model):` intercepta essas chamadas. Ele só permitirá que `step()` e `zero_grad()` sejam de fato executados a cada `gradient_accumulation_steps`. Nos passos intermediários, ele apenas acumula os gradientes calculados por `accelerator.backward(loss)`.
+
+### Como Executar
+
+A execução é a mesma de antes, mas agora você pode usar o novo argumento.
+
+**Exemplo:** Para simular um batch size de **256** usando uma GPU que só suporta batches de **32**:
+
+```bash
+accelerate launch seu_script.py \
+    --s3_data_path "s3://seu-bucket/caminho/dados/" \
+    --batch_size_pretrain 32 \
+    --gradient_accumulation_steps 8 \
+    --num_global_epochs 50 \
+    --output_dir "./bert_accumulate_output"
+```
+
+O `accelerate` irá rodar 8 micro-batches de 32 e só então atualizará os pesos, resultando em um **batch size efetivo de 256**, o que pode levar a uma maior estabilidade e melhor performance final do modelo.
+
+///////////////////////////////////////////////
 Com certeza. Analisei o código que você forneceu e o guia do `accelerate`. O código atual tem vários problemas de formatação, indentação e duplicação que o impedem de rodar.
 
 Em vez de corrigir o código quebrado linha por linha, eu o reconstruí a partir de uma base funcional, aplicando as melhores práticas do `accelerate` e mantendo toda a sua lógica de treinamento em shards, checkpointing e métricas. O resultado é um código muito mais limpo, robusto e fácil de manter.
