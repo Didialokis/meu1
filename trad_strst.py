@@ -1,38 +1,27 @@
 # -*- coding: utf-8 -*-
 
-pip install torch transformers sentencepiece datasets
-python traduzir_online.py
-
-import json
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from datasets import load_dataset # Importação da nova biblioteca
+from datasets import load_dataset
 
 # --- CONFIGURAÇÕES ---
-# Modelo de tradução do Hugging Face
 MODEL_NAME = "facebook/m2m100_418M"
-
-# Identificador do dataset no Hugging Face Hub
 DATASET_NAME = "McGill-NLP/stereoset"
-DATASET_SPLIT = "validation" # O split de desenvolvimento é chamado de 'validation'
+# As configurações corretas, conforme indicado pelo erro
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
 
-# Idiomas (ISO 639-1 codes)
-SOURCE_LANG = "en"  # Inglês
-TARGET_LANG = "pt"  # Português
+SOURCE_LANG = "en"
+TARGET_LANG = "pt"
 
-# Caminho do arquivo de saída
-OUTPUT_JSON_PATH = "stereoset_validation_pt.json"
+BATCH_SIZE = 16
 
-# Parâmetros de processamento
-BATCH_SIZE = 16  # Ajuste conforme a memória da sua GPU
-
-def traduzir_dataset_huggingface():
+def traduzir_dataset_huggingface_corrigido():
     """
-    Função principal para carregar o dataset Stereoset do Hugging Face,
-    traduzi-lo e salvá-lo como um novo arquivo JSON.
+    Função corrigida para carregar as configurações corretas do dataset,
+    traduzir e salvar os resultados.
     """
     # --- 1. PREPARAÇÃO DO MODELO ---
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Usando dispositivo: {device}")
 
@@ -41,29 +30,24 @@ def traduzir_dataset_huggingface():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- 2. CARREGAMENTO E EXTRAÇÃO DAS SENTENÇAS ---
-
-    print(f"Baixando e carregando o dataset '{DATASET_NAME}' do Hugging Face Hub...")
-    dataset = load_dataset(DATASET_NAME, "en", split=DATASET_SPLIT)
-    print("Dataset carregado.")
-
-    # Coleta todas as strings de texto em uma lista para traduzir em lote
+    # --- 2. CARREGAMENTO E EXTRAÇÃO DAS SENTENÇAS (DE AMBAS AS CONFIGS) ---
+    datasets = {}
     sentences_to_translate = []
-    for example in dataset:
-        # Adiciona o contexto (seja uma palavra ou uma sentença)
-        sentences_to_translate.append(example['context'])
-        # Adiciona todas as sentenças alvo associadas
-        sentences_to_translate.extend(example['sentences']['sentence'])
 
-    if not sentences_to_translate:
-        print("Nenhuma sentença encontrada para traduzir.")
-        return
-
-    print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
+    for config in CONFIGS:
+        print(f"Baixando e carregando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT)
+        datasets[config] = dataset
+        
+        # Extrai sentenças de cada dataset e adiciona à lista geral
+        for example in dataset:
+            sentences_to_translate.append(example['context'])
+            sentences_to_translate.extend(example['sentences']['sentence'])
+    
+    print(f"Total de {len(sentences_to_translate)} sentenças extraídas de todas as configurações.")
 
     # --- 3. TRADUÇÃO EM LOTE ---
-    # (Esta seção permanece a mesma, pois é a mais eficiente)
-
+    # A lógica de tradução é a mesma, pois processamos tudo de uma vez
     print("Iniciando a tradução em lotes...")
     translated_sentences = []
     forced_bos_token_id = tokenizer.get_lang_id(TARGET_LANG)
@@ -78,37 +62,29 @@ def traduzir_dataset_huggingface():
 
     print("Tradução finalizada.")
 
-    # --- 4. RECONSTRUÇÃO DO DATASET COM O MÉTODO .MAP() ---
-
-    print("Reconstruindo o dataset com as sentenças traduzidas...")
-    
-    # Cria um iterador para fornecer as sentenças traduzidas em ordem
+    # --- 4. RECONSTRUÇÃO DE CADA DATASET ---
+    print("Reconstruindo os datasets com as sentenças traduzidas...")
     translated_iter = iter(translated_sentences)
 
-    def replace_sentences(example):
-        """
-        Função auxiliar que substitui o texto em um exemplo do dataset.
-        """
-        # Substitui o contexto
-        example['context'] = next(translated_iter)
+    for config in CONFIGS:
+        dataset_original = datasets[config]
+
+        def replace_sentences(example):
+            example['context'] = next(translated_iter)
+            num_target_sentences = len(example['sentences']['sentence'])
+            translated_target_sentences = [next(translated_iter) for _ in range(num_target_sentences)]
+            example['sentences']['sentence'] = translated_target_sentences
+            return example
+
+        # Aplica o mapeamento para criar o dataset traduzido
+        translated_dataset = dataset_original.map(replace_sentences)
         
-        # Substitui as sentenças alvo
-        num_target_sentences = len(example['sentences']['sentence'])
-        translated_target_sentences = [next(translated_iter) for _ in range(num_target_sentences)]
-        example['sentences']['sentence'] = translated_target_sentences
-        
-        return example
-
-    # O método .map() aplica a função 'replace_sentences' a cada exemplo no dataset
-    translated_dataset = dataset.map(replace_sentences)
-
-    # --- 5. SALVANDO O RESULTADO FINAL ---
-
-    print(f"Salvando o dataset traduzido em: {OUTPUT_JSON_PATH}")
-    # O objeto 'Dataset' tem um método conveniente para salvar em JSON
-    translated_dataset.to_json(OUTPUT_JSON_PATH, force_ascii=False, indent=2)
+        # --- 5. SALVANDO O RESULTADO ---
+        output_path = f"stereoset_{config}_{DATASET_SPLIT}_pt.json"
+        print(f"Salvando o dataset '{config}' traduzido em: {output_path}")
+        translated_dataset.to_json(output_path, force_ascii=False, indent=2)
 
     print("\nSucesso! Processo concluído.")
 
 if __name__ == "__main__":
-    traduzir_dataset_huggingface()
+    traduzir_dataset_huggingface_corrigido()
