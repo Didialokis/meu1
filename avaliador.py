@@ -6,17 +6,9 @@ from tqdm import tqdm
 import math
 
 # --- CONFIGURAÇÕES ---
-
-# Modelo a ser avaliado: Bertimbau (Base).
-# "Bertimbau" é o nome da série de modelos BERT da NeuralMind.
-# O identificador abaixo carrega o modelo base diretamente do Hugging Face.
 MODEL_ID = "neuralmind/bert-base-portuguese-cased" 
-
-# Para usar a versão "Large" do Bertimbau, que é mais poderosa porém mais pesada,
-# descomente a linha abaixo e comente a de cima:
 # MODEL_ID = "neuralmind/bert-large-portuguese-cased"
 
-# Caminho para os seus arquivos JSON traduzidos
 FILES_TO_EVALUATE = [
     "stereoset_intersentence_validation_pt.json",
     "stereoset_intrasentence_validation_pt.json"
@@ -25,7 +17,6 @@ FILES_TO_EVALUATE = [
 def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
     """
     Calcula o Pseudo-Log-Likelihood (PLL) para modelos Masked Language (BERT).
-    Este método é o padrão usado na avaliação oficial do StereoSet.
     """
     if context and not context.endswith(' '):
         context += ' '
@@ -75,15 +66,26 @@ def evaluate_bertimbau():
     print("Modelo carregado com sucesso.")
 
     all_examples = []
+    
+    # --- SEÇÃO CORRIGIDA ---
+    # O código agora lê cada arquivo linha por linha.
+    print("Carregando dados dos arquivos JSON Lines...")
     for file_path in FILES_TO_EVALUATE:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                all_examples.extend(json.load(f))
+                for line in f:
+                    # Cada linha é um objeto JSON, usamos json.loads() para decodificá-la
+                    if line.strip(): # Garante que linhas vazias não causem erro
+                        all_examples.append(json.loads(line))
         except FileNotFoundError:
             print(f"AVISO: O arquivo '{file_path}' não foi encontrado. Pulando.")
+        except json.JSONDecodeError as e:
+            print(f"ERRO: Falha ao decodificar uma linha no arquivo {file_path}. Detalhes: {e}")
+            
+    # --- FIM DA SEÇÃO CORRIGIDA ---
             
     if not all_examples:
-        print("ERRO: Nenhum dado de avaliação encontrado. Verifique os caminhos dos arquivos JSON.")
+        print("ERRO: Nenhum dado de avaliação encontrado. Verifique os arquivos JSON.")
         return
         
     print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
@@ -124,7 +126,6 @@ def evaluate_bertimbau():
     print(f"Language Model Score (LMS): {final_lms:.2f}%")
     print(f"Stereotype Score (SS): {final_ss:.2f}%")
     print("-------------------------------------------")
-
 
 if __name__ == "__main__":
     evaluate_bertimbau()
