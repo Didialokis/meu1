@@ -1,20 +1,20 @@
-# -*- coding: utf-8 -*-
-
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from datasets import load_dataset
-
 # --- CONFIGURAÇÕES ---
-MODEL_NAME = "facebook/m2m100_418M"
+
+# Modelo foi trocado para o NLLB-200 com 1.3 bilhão de parâmetros
+MODEL_NAME = "facebook/nllb-200-1.3B" 
+# Para uma versão mais rápida, use: "facebook/nllb-200-distilled-600M"
+
 DATASET_NAME = "McGill-NLP/stereoset"
-# As configurações corretas, conforme indicado pelo erro
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 
-SOURCE_LANG = "en"
-TARGET_LANG = "pt"
+# ATENÇÃO: Os códigos de idioma foram atualizados para o padrão do NLLB
+SOURCE_LANG = "eng_Latn"  # Código para Inglês no NLLB
+TARGET_LANG = "por_Latn"  # Código para Português no NLLB
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8 # É prudente diminuir o batch size inicial para um modelo maior
+
+# ... o resto do script permanece o mesmo ...
 
 def traduzir_dataset_huggingface_corrigido():
     """
