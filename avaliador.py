@@ -93,7 +93,6 @@ def evaluate_bertimbau():
     print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
 
     lms_scores, ss_scores = [], []
-    error_count = 0 # Contador para os erros de processamento
 
     for example in tqdm(all_examples, desc="Avaliando exemplos"):
         context = example['context']
@@ -103,27 +102,20 @@ def evaluate_bertimbau():
             labels = sentences_data['gold_label']
             sents = sentences_data['sentence']
 
-            stereotype_idx = labels.index('stereotype')
-            anti_stereotype_idx = labels.index('anti-stereotype')
-            unrelated_idx = labels.index('unrelated')
+            # --- INÍCIO DA CORREÇÃO FINAL ---
+            # O script agora procura pelos NÚMEROS (0, 1, 2) em vez das palavras.
+            stereotype_idx = labels.index(0)  # 0 = stereotype
+            anti_stereotype_idx = labels.index(1)  # 1 = anti-stereotype
+            unrelated_idx = labels.index(2)  # 2 = unrelated
+            # --- FIM DA CORREÇÃO FINAL ---
 
             stereotype_sent = sents[stereotype_idx]
             anti_stereotype_sent = sents[anti_stereotype_idx]
             unrelated_sent = sents[unrelated_idx]
 
-        except (KeyError, ValueError) as e:
-            # --- ADIÇÃO PARA DEBUG ---
-            # Imprime o erro para os primeiros 5 exemplos que falharem
-            if error_count < 5:
-                print("\n--- ERRO DE PROCESSAMENTO EM UM EXEMPLO (será pulado) ---")
-                print(f"Não foi possível encontrar as etiquetas no exemplo com contexto: '{context[:100]}...'")
-                print(f"Etiquetas encontradas no arquivo: {sentences_data.get('gold_label', 'CHAVE NÃO ENCONTRADA')}")
-                print(f"Erro específico do Python: {e}")
-                print("Verifique se as etiquetas acima correspondem exatamente a ['stereotype', 'anti-stereotype', 'unrelated']")
-                print("-------------------------------------------------------")
-            error_count += 1
-            continue # Pula para o próximo exemplo
-        
+        except (KeyError, ValueError):
+            continue
+
         score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
         score_anti_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, anti_stereotype_sent)
         score_unrelated = calculate_pseudo_log_likelihood(model, tokenizer, context, unrelated_sent)
@@ -143,7 +135,7 @@ def evaluate_bertimbau():
 
     print("\n--- RESULTADOS DA AVALIAÇÃO (BERTİMBAU) ---")
     print(f"Modelo Avaliado: {MODEL_ID}")
-    print(f"Total de Exemplos Válidos: {len(ss_scores)} de {len(all_examples)}") # Mostra o total de exemplos
+    print(f"Total de Exemplos Válidos: {len(ss_scores)} de {len(all_examples)}")
     print(f"Language Model Score (LMS): {final_lms:.2f}%")
     print(f"Stereotype Score (SS): {final_ss:.2f}%")
     print("-------------------------------------------")
