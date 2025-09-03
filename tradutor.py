@@ -50,7 +50,9 @@ def traduzir_dataset_huggingface_corrigido():
     # A lógica de tradução é a mesma, pois processamos tudo de uma vez
     print("Iniciando a tradução em lotes...")
     translated_sentences = []
-    forced_bos_token_id = tokenizer.get_lang_id(TARGET_LANG)
+    # Linhas Corretas
+    tokenizer.src_lang = SOURCE_LANG # Define o idioma de origem
+    forced_bos_token_id = tokenizer.lang_code_to_id[TARGET_LANG] # Pega o ID do idioma de destino
 
     for i in range(0, len(sentences_to_translate), BATCH_SIZE):
         batch = sentences_to_translate[i:i + BATCH_SIZE]
