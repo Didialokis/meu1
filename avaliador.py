@@ -93,33 +93,37 @@ def evaluate_bertimbau():
     print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
 
     lms_scores, ss_scores = [], []
+    error_count = 0 # Contador para os erros de processamento
 
     for example in tqdm(all_examples, desc="Avaliando exemplos"):
         context = example['context']
         sentences_data = example['sentences']
         
-        # --- INÍCIO DA CORREÇÃO ---
-        # A lógica foi alterada para encontrar o índice da etiqueta e usá-lo para
-        # pegar a sentença correta, de acordo com a estrutura de dados do Stereoset.
         try:
             labels = sentences_data['gold_label']
             sents = sentences_data['sentence']
 
-            # Encontra o índice de cada tipo de sentença
             stereotype_idx = labels.index('stereotype')
             anti_stereotype_idx = labels.index('anti-stereotype')
             unrelated_idx = labels.index('unrelated')
 
-            # Usa o índice para buscar a sentença correspondente
             stereotype_sent = sents[stereotype_idx]
             anti_stereotype_sent = sents[anti_stereotype_idx]
             unrelated_sent = sents[unrelated_idx]
 
-        except (KeyError, ValueError):
-            # Pula o exemplo se a estrutura estiver incorreta ou uma etiqueta faltar
-            continue
-        # --- FIM DA CORREÇÃO ---
-
+        except (KeyError, ValueError) as e:
+            # --- ADIÇÃO PARA DEBUG ---
+            # Imprime o erro para os primeiros 5 exemplos que falharem
+            if error_count < 5:
+                print("\n--- ERRO DE PROCESSAMENTO EM UM EXEMPLO (será pulado) ---")
+                print(f"Não foi possível encontrar as etiquetas no exemplo com contexto: '{context[:100]}...'")
+                print(f"Etiquetas encontradas no arquivo: {sentences_data.get('gold_label', 'CHAVE NÃO ENCONTRADA')}")
+                print(f"Erro específico do Python: {e}")
+                print("Verifique se as etiquetas acima correspondem exatamente a ['stereotype', 'anti-stereotype', 'unrelated']")
+                print("-------------------------------------------------------")
+            error_count += 1
+            continue # Pula para o próximo exemplo
+        
         score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
         score_anti_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, anti_stereotype_sent)
         score_unrelated = calculate_pseudo_log_likelihood(model, tokenizer, context, unrelated_sent)
@@ -139,7 +143,7 @@ def evaluate_bertimbau():
 
     print("\n--- RESULTADOS DA AVALIAÇÃO (BERTİMBAU) ---")
     print(f"Modelo Avaliado: {MODEL_ID}")
-    print(f"Total de Exemplos Válidos: {len(ss_scores)}")
+    print(f"Total de Exemplos Válidos: {len(ss_scores)} de {len(all_examples)}") # Mostra o total de exemplos
     print(f"Language Model Score (LMS): {final_lms:.2f}%")
     print(f"Stereotype Score (SS): {final_ss:.2f}%")
     print("-------------------------------------------")
