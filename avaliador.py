@@ -6,14 +6,7 @@ from tqdm import tqdm
 import math
 
 # --- CONFIGURAÇÕES ---
-
-# Modelo a ser avaliado: Bertimbau (Base).
-MODEL_ID = "neuralmind/bert-base-portuguese-cased" 
-
-# Para usar a versão "Large" do Bertimbau, descomente a linha abaixo:
-# MODEL_ID = "neuralmind/bert-large-portuguese-cased"
-
-# Caminho para os seus arquivos JSON traduzidos
+MODEL_ID = "neuralmind/bert-base-portuguese-cased"
 FILES_TO_EVALUATE = [
     "stereoset_intersentence_validation_pt.json",
     "stereoset_intrasentence_validation_pt.json"
@@ -73,21 +66,24 @@ def evaluate_bertimbau():
     all_examples = []
     
     # --- INÍCIO DA CORREÇÃO ---
-    # Modificamos o loop para ler cada arquivo linha por linha (formato JSON Lines).
+    # Revertemos para a leitura do arquivo JSON inteiro de uma vez,
+    # pois o script de tradução salva os dados como um único bloco.
     print("Carregando arquivos de avaliação...")
     for file_path in FILES_TO_EVALUATE:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    # Garante que a linha não está em branco antes de decodificar
-                    if line.strip():
-                        all_examples.append(json.loads(line))
+                # Usa json.load() para carregar o arquivo inteiro
+                data = json.load(f)
+                all_examples.extend(data)
         except FileNotFoundError:
             print(f"AVISO: O arquivo '{file_path}' não foi encontrado. Pulando.")
+        except json.JSONDecodeError as e:
+            print(f"ERRO: O arquivo '{file_path}' não é um JSON válido. Verifique o arquivo. Detalhe: {e}")
+            return
     # --- FIM DA CORREÇÃO ---
 
     if not all_examples:
-        print("ERRO: Nenhum dado de avaliação encontrado. Verifique os caminhos dos arquivos JSON.")
+        print("ERRO: Nenhum dado de avaliação encontrado.")
         return
         
     print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
@@ -102,7 +98,7 @@ def evaluate_bertimbau():
             stereotype_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'stereotype')
             anti_stereotype_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'anti-stereotype')
             unrelated_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'unrelated')
-        except StopIteration:
+        except (StopIteration, KeyError):
             continue
 
         score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
