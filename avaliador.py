@@ -21,30 +21,17 @@ def load_repaired_json(file_path):
     print(f"Carregando e reparando o arquivo: {file_path}...")
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Remove espaços em branco no início/fim para evitar problemas
-        content = content.strip()
-        
-        # Usa expressão regular para adicionar uma vírgula entre os objetos JSON
-        # Procura por '}' seguido de espaços/quebras de linha e então '{'
+            content = f.read().strip()
         repaired_content = re.sub(r'}\s*{', '},{', content)
-        
-        # Adiciona os colchetes de início e fim para formar uma lista JSON válida
         final_json_string = f"[{repaired_content}]"
-        
-        # Carrega a string JSON agora corrigida
         data = json.loads(final_json_string)
         return data
-
     except FileNotFoundError:
         print(f"AVISO: O arquivo '{file_path}' não foi encontrado. Pulando.")
         return []
     except json.JSONDecodeError as e:
-        print(f"ERRO: Falha ao carregar e reparar o JSON do arquivo '{file_path}'.")
-        print(f"O problema pode ser mais complexo. Detalhe do erro: {e}")
+        print(f"ERRO: Falha ao carregar e reparar o JSON do arquivo '{file_path}'. Detalhe: {e}")
         return []
-
 
 def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
     """
@@ -95,12 +82,9 @@ def evaluate_bertimbau():
     print("Modelo carregado com sucesso.")
 
     all_examples = []
-    # --- INÍCIO DA MUDANÇA ---
-    # Usando a nova função de carregamento que repara o JSON
     for file_path in FILES_TO_EVALUATE:
         repaired_data = load_repaired_json(file_path)
         all_examples.extend(repaired_data)
-    # --- FIM DA MUDANÇA ---
 
     if not all_examples:
         print("ERRO: Nenhum dado de avaliação foi carregado. Verifique os arquivos JSON.")
@@ -112,14 +96,29 @@ def evaluate_bertimbau():
 
     for example in tqdm(all_examples, desc="Avaliando exemplos"):
         context = example['context']
-        sentences = example['sentences']
+        sentences_data = example['sentences']
         
+        # --- INÍCIO DA CORREÇÃO ---
+        # A lógica foi alterada para encontrar o índice da etiqueta e usá-lo para
+        # pegar a sentença correta, de acordo com a estrutura de dados do Stereoset.
         try:
-            stereotype_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'stereotype')
-            anti_stereotype_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'anti-stereotype')
-            unrelated_sent = next(s['sentence'] for s in sentences if s['gold_label'] == 'unrelated')
-        except (StopIteration, KeyError):
+            labels = sentences_data['gold_label']
+            sents = sentences_data['sentence']
+
+            # Encontra o índice de cada tipo de sentença
+            stereotype_idx = labels.index('stereotype')
+            anti_stereotype_idx = labels.index('anti-stereotype')
+            unrelated_idx = labels.index('unrelated')
+
+            # Usa o índice para buscar a sentença correspondente
+            stereotype_sent = sents[stereotype_idx]
+            anti_stereotype_sent = sents[anti_stereotype_idx]
+            unrelated_sent = sents[unrelated_idx]
+
+        except (KeyError, ValueError):
+            # Pula o exemplo se a estrutura estiver incorreta ou uma etiqueta faltar
             continue
+        # --- FIM DA CORREÇÃO ---
 
         score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
         score_anti_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, anti_stereotype_sent)
