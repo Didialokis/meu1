@@ -1,41 +1,16 @@
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # -*- coding: utf-8 -*-
 
-# As importações mudaram para usar vLLM em vez de transformers para o modelo
 import torch
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
 import re
 
-# --- CONFIGURAÇÕES ---
-# Novo modelo da Unbabel
+# --- CONFIGURAÇÕES E DEFINIÇÕES (podem ficar no escopo global) ---
 MODEL_NAME = "Unbabel/Tower-Plus-9B" 
-
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
-
-# Parâmetros para o processamento em lote com vLLM
-BATCH_SIZE = 32 # vLLM é eficiente, podemos tentar um batch size maior
-
-# --- 1. PREPARAÇÃO DO MODELO COM VLLM ---
-
-# Define os parâmetros de amostragem para a geração de texto
-# Temperatura 0 para respostas mais determinísticas, ideal para tradução
-sampling_params = SamplingParams(
-  best_of=1,
-  temperature=0,
-  max_tokens=256, # 256 tokens devem ser suficientes para a maioria das sentenças
-)
-
-# Carrega o modelo usando o LLM do vLLM
-# Certifique-se de ter GPU com VRAM suficiente (ex: A100, H100)
-print(f"Carregando o modelo '{MODEL_NAME}' com vLLM...")
-# O tensor_parallel_size=1 é para uma única GPU. Ajuste se tiver mais.
-llm = LLM(model=MODEL_NAME, tensor_parallel_size=1)
-print("Modelo carregado com sucesso.")
-
+BATCH_SIZE = 32 
 
 def sanitize_text(text):
     """
@@ -43,7 +18,11 @@ def sanitize_text(text):
     """
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
-def traduzir_dataset_com_vllm():
+def traduzir_dataset_com_vllm(llm, sampling_params):
+    """
+    A função de tradução agora recebe o modelo 'llm' e os parâmetros
+    de amostragem como argumentos para evitar o escopo global.
+    """
     datasets_dict = {}
     sentences_to_translate = []
 
@@ -60,23 +39,18 @@ def traduzir_dataset_com_vllm():
     print("Iniciando a tradução em lotes com vLLM...")
     translated_sentences = []
 
-    # --- 2. LÓGICA DE TRADUÇÃO EM LOTE ADAPTADA PARA VLLM ---
     for i in range(0, len(sentences_to_translate), BATCH_SIZE):
         batch = sentences_to_translate[i:i + BATCH_SIZE]
         
-        # Cria a lista de prompts no formato esperado pelo modelo Tower
         prompts = [
             f"Translate the following English source text to Portuguese (Brazil):\nEnglish: {sentence}\nPortuguese (Brazil): "
             for sentence in batch
         ]
         
-        # Executa a geração em lote com vLLM
         outputs = llm.generate(prompts, sampling_params)
         
-        # Extrai o texto traduzido de cada saída
         batch_translated_raw = [output.outputs[0].text.strip() for output in outputs]
         
-        # Aplica a sanitização
         batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
         translated_sentences.extend(batch_sanitized)
         
@@ -84,7 +58,6 @@ def traduzir_dataset_com_vllm():
 
     print("Tradução finalizada.")
 
-    # --- 3. RECONSTRUÇÃO E SALVAMENTO (sem alterações) ---
     print("Reconstruindo os datasets com as sentenças traduzidas...")
     translated_iter = iter(translated_sentences)
 
@@ -100,11 +73,28 @@ def traduzir_dataset_com_vllm():
 
         translated_dataset = dataset_original.map(replace_sentences)
         
-        output_path = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower.json" # Nome de arquivo atualizado
+        output_path = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower.json"
         print(f"Salvando o dataset '{config}' traduzido em: {output_path}")
         translated_dataset.to_json(output_path, force_ascii=False, indent=2)
 
     print("\nSucesso! Processo concluído.")
 
+# --- INÍCIO DA CORREÇÃO ---
+# O bloco de proteção 'if __name__ == "__main__":' garante que o código
+# pesado de inicialização do modelo só seja executado pelo processo principal.
 if __name__ == "__main__":
-    traduzir_dataset_com_vllm()
+    # 1. Parâmetros de amostragem
+    sampling_params = SamplingParams(
+      best_of=1,
+      temperature=0,
+      max_tokens=256,
+    )
+
+    # 2. Carregamento do modelo
+    print(f"Carregando o modelo '{MODEL_NAME}' com vLLM...")
+    llm = LLM(model=MODEL_NAME, tensor_parallel_size=1)
+    print("Modelo carregado com sucesso.")
+    
+    # 3. Chamada da função de tradução
+    traduzir_dataset_com_vllm(llm, sampling_params)
+# --- FIM DA CORREÇÃO ---
