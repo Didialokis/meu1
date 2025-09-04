@@ -1,3 +1,5 @@
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # -*- coding: utf-8 -*-
 
 # As importações mudaram para usar vLLM em vez de transformers para o modelo
