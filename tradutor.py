@@ -1,3 +1,45 @@
+# ... (início do script de tradução) ...
+
+    for i in range(0, len(sentences_to_translate), BATCH_SIZE):
+        batch = sentences_to_translate[i:i + BATCH_SIZE]
+        
+        # --- PASSO 1: PRÉ-PROCESSAMENTO (ANTES DE TRADUZIR) ---
+        # Substitui "BLANK" por um placeholder que o modelo não traduzirá.
+        placeholder = "__BLANK_PLACEHOLDER__"
+        batch_com_placeholder = [s.replace("BLANK", placeholder) for s in batch]
+
+        # Traduz o lote com os placeholders
+        inputs = tokenizer(batch_com_placeholder, return_tensors="pt", padding=True, truncation=True).to(device)
+        
+        generated_tokens = model.generate(
+            **inputs,
+            forced_bos_token_id=forced_bos_token_id,
+            max_length=128
+        )
+        
+        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+
+        # --- PASSO 2: PÓS-PROCESSAMENTO (DEPOIS DE TRADUZIR) ---
+        # Substitui o placeholder de volta para "BLANK" (ou sua versão em português)
+        batch_translated_final = [s.replace(placeholder, "BLANK") for s in batch_translated_raw]
+        
+        # Sanitiza e adiciona à lista final
+        batch_sanitized = [sanitize_text(text) for text in batch_translated_final]
+        translated_sentences.extend(batch_sanitized)
+        
+        print(f"  Lote {i//BATCH_SIZE + 1} de {len(sentences_to_translate)//BATCH_SIZE + 1} concluído...")
+
+# ... (resto do script) ...
+
+
+
+
+
+
+
+
+
+
 # --- CONFIGURAÇÕES ---
 
 # Modelo foi trocado para o NLLB-200 com 1.3 bilhão de parâmetros
