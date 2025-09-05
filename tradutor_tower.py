@@ -1,69 +1,132 @@
 # -*- coding: utf-8 -*-
 
-import torch
-from vllm import LLM, SamplingParams
-from datasets import load_dataset
-import re
+# É recomendado ter as versões mais recentes das bibliotecas.
+# pip install torch transformers datasets accelerate
+# Para recursos muito recentes, pode ser necessário instalar do source:
+# pip install git+https://github.com/huggingface/transformers.git
 
-# --- CONFIGURAÇÕES E DEFINIÇÕES (podem ficar no escopo global) ---
-MODEL_NAME = "Unbabel/Tower-Plus-9B" 
+import torch
+from transformers import pipeline
+from datasets import load_dataset
+from tqdm import tqdm
+import re
+import json
+
+# --- 1. CONFIGURAÇÕES ---
+
+# Modelo de geração de texto para tradução
+MODEL_ID = "Unbabel/Tower-Plus-2B"
+
+# Informações do dataset Stereoset
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
-BATCH_SIZE = 32 
+
+# Idioma de destino
+TARGET_LANGUAGE = "Portuguese (Brazil)"
+
+# Tamanho do lote. Para um modelo grande (2B), um valor baixo é crucial
+# para evitar erros de falta de memória (Out of Memory).
+# Ajuste conforme a VRAM da sua GPU. Comece com 4 ou 8.
+BATCH_SIZE = 8
+
+# Template do prompt, adaptado para português do Brasil
+PROMPT_TEMPLATE = f"Translate the following English source text to {TARGET_LANGUAGE}:\nEnglish: {{text}}\n{TARGET_LANGUAGE}: "
+
+
+# --- 2. FUNÇÕES AUXILIARES ---
 
 def sanitize_text(text):
-    """
-    Função para "limpar" o texto, removendo caracteres de controle.
-    """
+    """Limpa o texto de caracteres de controle que podem quebrar o JSON."""
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
-def traduzir_dataset_com_vllm(llm, sampling_params):
+
+def translate_batch(pipe, batch_texts):
     """
-    A função de tradução agora recebe o modelo 'llm' e os parâmetros
-    de amostragem como argumentos para evitar o escopo global.
+    Formata um lote de textos no template de chat e os traduz usando o pipeline.
     """
+    # 1. Cria a lista de prompts para cada texto no lote
+    prompts = [PROMPT_TEMPLATE.format(text=text) for text in batch_texts]
+
+    # 2. Formata os prompts no formato de 'messages' que o pipeline espera
+    messages_batch = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    
+    # 3. Executa o pipeline. O batch_size aqui ajuda o pipeline a otimizar.
+    outputs = pipe(messages_batch, max_new_tokens=128, do_sample=False, batch_size=len(batch_texts))
+    
+    translations = []
+    for output in outputs:
+        # O resultado inclui o prompt. Precisamos extrair apenas a tradução.
+        generated_text = output[0]['generated_text']
+        
+        # Encontra o final do prompt e pega o que vem depois
+        try:
+            translation = generated_text.split(f"{TARGET_LANGUAGE}: ")[-1].strip()
+            translations.append(translation)
+        except IndexError:
+            # Caso o parsing falhe, adiciona uma string vazia para não quebrar o pipeline
+            translations.append("")
+            
+    return translations
+
+
+# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
+
+def translate_stereoset_with_tower():
+    """
+    Função principal que executa todo o pipeline de tradução.
+    """
+    print(f"--- INICIANDO TRADUÇÃO COM O MODELO: {MODEL_ID} ---")
+    
+    # Carrega o pipeline. `device_map="auto"` distribui o modelo pelas GPUs.
+    # `torch_dtype=torch.bfloat16` acelera a inferência e economiza memória.
+    print("Carregando o pipeline de geração de texto...")
+    try:
+        pipe = pipeline(
+            "text-generation",
+            model=MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+    except Exception as e:
+        print(f"ERRO ao carregar o pipeline. Verifique se a biblioteca 'accelerate' está instalada.")
+        print(f"Detalhe do erro: {e}")
+        return
+        
+    print("Pipeline carregado com sucesso.")
+
+    # Carrega e extrai todas as sentenças do dataset
     datasets_dict = {}
     sentences_to_translate = []
-
     for config in CONFIGS:
-        print(f"Carregando a configuração '{config}' do dataset...")
+        print(f"Carregando configuração '{config}' do dataset...")
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT)
         datasets_dict[config] = dataset
         for example in dataset:
             sentences_to_translate.append(example['context'])
             sentences_to_translate.extend(example['sentences']['sentence'])
-    
+
     print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    print("Iniciando a tradução em lotes com vLLM...")
+    # Traduz em lotes
     translated_sentences = []
-
-    for i in range(0, len(sentences_to_translate), BATCH_SIZE):
+    for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo lotes"):
         batch = sentences_to_translate[i:i + BATCH_SIZE]
         
-        prompts = [
-            f"Translate the following English source text to Portuguese (Brazil):\nEnglish: {sentence}\nPortuguese (Brazil): "
-            for sentence in batch
-        ]
+        # Traduz o lote usando a nova função
+        translated_batch = translate_batch(pipe, batch)
         
-        outputs = llm.generate(prompts, sampling_params)
-        
-        batch_translated_raw = [output.outputs[0].text.strip() for output in outputs]
-        
-        batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
-        translated_sentences.extend(batch_sanitized)
-        
-        print(f"  Lote {i//BATCH_SIZE + 1} de {len(sentences_to_translate)//BATCH_SIZE + 1} concluído...")
+        # Sanitiza e armazena os resultados
+        sanitized_batch = [sanitize_text(text) for text in translated_batch]
+        translated_sentences.extend(sanitized_batch)
 
     print("Tradução finalizada.")
 
-    print("Reconstruindo os datasets com as sentenças traduzidas...")
+    # Reconstrói os datasets com os textos traduzidos
+    print("Reconstruindo os datasets...")
     translated_iter = iter(translated_sentences)
-
     for config in CONFIGS:
         dataset_original = datasets_dict[config]
-
         def replace_sentences(example):
             example['context'] = next(translated_iter)
             num_target_sentences = len(example['sentences']['sentence'])
@@ -74,27 +137,12 @@ def traduzir_dataset_com_vllm(llm, sampling_params):
         translated_dataset = dataset_original.map(replace_sentences)
         
         output_path = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower.json"
-        print(f"Salvando o dataset '{config}' traduzido em: {output_path}")
+        print(f"Salvando dataset '{config}' em: {output_path}")
         translated_dataset.to_json(output_path, force_ascii=False, indent=2)
 
     print("\nSucesso! Processo concluído.")
 
-# --- INÍCIO DA CORREÇÃO ---
-# O bloco de proteção 'if __name__ == "__main__":' garante que o código
-# pesado de inicialização do modelo só seja executado pelo processo principal.
-if __name__ == "__main__":
-    # 1. Parâmetros de amostragem
-    sampling_params = SamplingParams(
-      best_of=1,
-      temperature=0,
-      max_tokens=256,
-    )
+# --- 4. EXECUÇÃO ---
 
-    # 2. Carregamento do modelo
-    print(f"Carregando o modelo '{MODEL_NAME}' com vLLM...")
-    llm = LLM(model=MODEL_NAME, tensor_parallel_size=1)
-    print("Modelo carregado com sucesso.")
-    
-    # 3. Chamada da função de tradução
-    traduzir_dataset_com_vllm(llm, sampling_params)
-# --- FIM DA CORREÇÃO ---
+if __name__ == "__main__":
+    translate_stereoset_with_tower()
