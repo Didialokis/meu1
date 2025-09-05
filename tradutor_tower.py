@@ -17,8 +17,6 @@ CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 
 # Parâmetros de processamento
-# Ajuste o BATCH_SIZE conforme a VRAM total de suas GPUs.
-# Comece com um valor baixo (ex: 4 ou 8) e aumente se não houver erros de memória.
 BATCH_SIZE = 8
 
 # --- 2. FUNÇÕES AUXILIARES ---
@@ -34,15 +32,29 @@ def create_translation_prompt(english_text):
     )
     return [{"role": "user", "content": prompt}]
 
-def parse_generated_text(generated_output_text):
+def parse_generated_text(generated_output):
     """
     Extrai apenas a tradução do texto completo gerado pelo modelo.
+    Esta versão é robusta para lidar com saídas que são listas.
     """
+    # --- INÍCIO DA CORREÇÃO ---
+    text_to_parse = generated_output
+
+    # 1. Verifica se a saída é uma lista e extrai o primeiro elemento.
+    if isinstance(text_to_parse, list):
+        text_to_parse = text_to_parse[0] if text_to_parse else ""
+
+    # 2. Garante que o que sobrou é uma string antes de continuar.
+    if not isinstance(text_to_parse, str):
+        return "" # Retorna string vazia para formatos inesperados
+
+    # 3. Lógica original para extrair a tradução do prompt.
     marker = "Portuguese (Brazil): "
-    if marker in generated_output_text:
-        return generated_output_text.split(marker)[-1].strip()
+    if marker in text_to_parse:
+        return text_to_parse.split(marker)[-1].strip()
     else:
-        return generated_output_text.strip()
+        return text_to_parse.strip()
+    # --- FIM DA CORREÇÃO ---
 
 
 # --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
@@ -59,7 +71,7 @@ def translate_stereoset_with_tower():
         "text-generation",
         model=MODEL_ID,
         torch_dtype=torch.bfloat16,
-        device_map="auto", # Requer a biblioteca 'accelerate'
+        device_map="auto",
     )
     print("Modelo carregado com sucesso em todas as GPUs.")
 
@@ -83,10 +95,9 @@ def translate_stereoset_with_tower():
     print(f"Iniciando a tradução em lotes de tamanho {BATCH_SIZE}...")
     for i in tqdm(range(0, len(prompts), BATCH_SIZE), desc="Traduzindo Lotes"):
         batch_prompts = prompts[i:i + BATCH_SIZE]
-        outputs = pipe(batch_prompts, max_new_tokens=256, do_sample=False, temperature=0.0)
+        outputs = pipe(batch_prompts, max_new_tokens=256, do_sample=False)
         
         for output in outputs:
-            # Acessa o texto gerado de dentro da estrutura de lista/dicionário
             generated_text = output[0]['generated_text'] 
             parsed_translation = parse_generated_text(generated_text)
             all_translations.append(parsed_translation)
