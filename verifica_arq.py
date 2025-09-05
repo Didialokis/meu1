@@ -1,150 +1,154 @@
+import torch
 import json
-import re
-import sys
-import tty
-import termios
-from datasets import load_dataset
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+import numpy as np
+from tqdm import tqdm
+import math
 
 # --- 1. CONFIGURAÇÕES ---
 
-# Arquivos traduzidos em português para inspecionar
-FILES_TO_INSPECT = [
-    "stereoset_intersentence_validation_pt.json",
-    "stereoset_intrasentence_validation_pt.json"
+# Modelo a ser avaliado (continua o mesmo)
+MODEL_ID = "neuralmind/bert-base-portuguese-cased"
+
+# ATENÇÃO: Nomes dos arquivos atualizados para corresponder à saída do novo tradutor
+FILES_TO_EVALUATE = [
+    "stereoset_intersentence_validation_pt_tower.jsonl",
+    "stereoset_intrasentence_validation_pt_tower.jsonl"
 ]
 
-# Quantidade de exemplos de cada arquivo que você deseja avaliar
-# Mude para um número maior ou para None se quiser avaliar o arquivo inteiro
-EXAMPLES_PER_FILE = 50
-
-# Mapeamento de rótulos numéricos para texto
-LABEL_MAP = {
-    0: "Estereótipo",
-    1: "Anti-Estereótipo",
-    2: "Não Relacionado"
-}
 
 # --- 2. FUNÇÕES AUXILIARES ---
 
-def getch():
+def load_jsonl(file_path):
     """
-    Função para capturar um único caracter do teclado sem precisar de 'Enter'.
-    Funciona em sistemas Linux/macOS.
+    Função corrigida para ler arquivos no formato JSON Lines (.jsonl),
+    onde cada linha é um objeto JSON completo.
     """
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-
-def load_repaired_json(file_path):
-    """Carrega e repara o arquivo JSON traduzido."""
+    print(f"Carregando o arquivo JSON Lines: {file_path}...")
+    data = []
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        repaired_content = re.sub(r'}\s*{', '},{', content)
-        final_json_string = f"[{repaired_content}]"
-        data = json.loads(final_json_string)
+            for line in f:
+                if line.strip(): # Ignora linhas em branco
+                    data.append(json.loads(line))
         return data
     except FileNotFoundError:
-        print(f"!!! AVISO: O arquivo '{file_path}' não foi encontrado. Pulando. !!!")
-        return None
+        print(f"ERRO: O arquivo '{file_path}' não foi encontrado.")
+        return []
     except json.JSONDecodeError as e:
-        print(f"!!! ERRO: Falha ao carregar o arquivo '{file_path}'. Detalhe: {e} !!!")
-        return None
+        print(f"ERRO: Falha ao decodificar uma linha no arquivo '{file_path}'. Linha: {e.lineno}, Coluna: {e.colno}")
+        return []
+
+
+def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
+    """
+    Calcula o Pseudo-Log-Likelihood (PLL) para modelos Masked Language (BERT).
+    """
+    if context and not context.endswith(' '):
+        context += ' '
+    
+    context_tokens = tokenizer.encode(context, add_special_tokens=False)
+    sentence_tokens = tokenizer.encode(sentence, add_special_tokens=False)
+
+    if not sentence_tokens:
+        return -math.inf
+
+    input_ids = torch.tensor([tokenizer.cls_token_id] + context_tokens + sentence_tokens + [tokenizer.sep_token_id]).unsqueeze(0)
+    
+    start_index = len(context_tokens) + 1
+    end_index = start_index + len(sentence_tokens)
+    
+    total_log_prob = 0.0
+    
+    for i in range(start_index, end_index):
+        masked_input_ids = input_ids.clone()
+        original_token_id = masked_input_ids[0, i].item()
+        masked_input_ids[0, i] = tokenizer.mask_token_id
+        
+        with torch.no_grad():
+            outputs = model(masked_input_ids.to(model.device))
+            logits = outputs.logits
+        
+        masked_token_logits = logits[0, i, :]
+        log_probs = torch.nn.functional.log_softmax(masked_token_logits, dim=0)
+        token_log_prob = log_probs[original_token_id].item()
+        
+        if not math.isinf(token_log_prob):
+            total_log_prob += token_log_prob
+
+    return total_log_prob / len(sentence_tokens)
+
 
 # --- 3. FUNÇÃO PRINCIPAL DE AVALIAÇÃO ---
 
-def interactive_evaluation():
-    """
-    Executa o processo de avaliação interativa lado a lado.
-    """
-    # Contadores para o resumo final
-    stats = {"correto": 0, "incorreto": 0, "pulado": 0}
+def evaluate_model_bias():
+    print(f"--- INICIANDO AVALIAÇÃO DE VIÉS PARA O MODELO: {MODEL_ID} ---")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando dispositivo: {device}")
+    
+    print("Carregando modelo e tokenizador...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForMaskedLM.from_pretrained(MODEL_ID).to(device)
+    model.eval()
+    print("Modelo carregado com sucesso.")
 
-    try:
-        for file_path in FILES_TO_INSPECT:
-            print("=" * 80)
-            print(f"INICIANDO AVALIAÇÃO DO ARQUIVO: {file_path}")
-            print("=" * 80)
-            
-            # Carrega o arquivo traduzido (português)
-            data_pt = load_repaired_json(file_path)
-            if data_pt is None:
-                continue
+    # MUDANÇA: Usando a nova função de carregamento 'load_jsonl'
+    all_examples = []
+    for file_path in FILES_TO_EVALUATE:
+        data = load_jsonl(file_path)
+        all_examples.extend(data)
 
-            # Carrega o arquivo original (inglês) correspondente do Hugging Face
-            config = "intersentence" if "intersentence" in file_path else "intrasentence"
-            print(f"Carregando dataset original '{config}' do Hugging Face para comparação...")
-            data_en = load_dataset("McGill-NLP/stereoset", config, split="validation")
-            
-            num_examples = min(EXAMPLES_PER_FILE or len(data_pt), len(data_pt))
+    if not all_examples:
+        print("ERRO: Nenhum dado de avaliação foi carregado. Verifique os arquivos.")
+        return
+        
+    print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
 
-            for i in range(num_examples):
-                example_pt = data_pt[i]
-                example_en = data_en[i]
-                
-                # Exibe o exemplo lado a lado
-                print("\n" + "-" * 40 + f" Exemplo {i + 1}/{num_examples} " + "-" * 40)
-                
-                # Original em Inglês
-                print("\n[ VERSÃO ORIGINAL - INGLÊS ]")
-                print(f"Contexto: {example_en['context']}")
-                for sent, label in zip(example_en['sentences']['sentence'], example_en['sentences']['gold_label']):
-                    print(f"  - {LABEL_MAP[label]}: \"{sent}\"")
+    lms_scores, ss_scores = [], []
+    
+    for example in tqdm(all_examples, desc="Avaliando exemplos"):
+        context = example['context']
+        sentences_data = example['sentences']
+        
+        try:
+            labels = sentences_data['gold_label']
+            sents = sentences_data['sentence']
+            stereotype_idx = labels.index(0)
+            anti_stereotype_idx = labels.index(1)
+            unrelated_idx = labels.index(2)
+            stereotype_sent = sents[stereotype_idx]
+            anti_stereotype_sent = sents[anti_stereotype_idx]
+            unrelated_sent = sents[unrelated_idx]
+        except (KeyError, ValueError):
+            continue
 
-                # Tradução em Português
-                print("\n[ SUA TRADUÇÃO - PORTUGUÊS ]")
-                print(f"Contexto: {example_pt['context']}")
-                for sent, label in zip(example_pt['sentences']['sentence'], example_pt['sentences']['gold_label']):
-                    print(f"  - {LABEL_MAP[label]}: \"{sent}\"")
-                
-                # Pergunta interativa
-                print("\n" + "-" * 30)
-                print("A tradução parece correta e natural? Pressione a tecla:")
-                print("[s] Sim  |  [n] Não  |  [p] Pular  |  [q] Sair")
-                
-                # Captura a resposta sem 'Enter'
-                while True:
-                    char = getch().lower()
-                    if char == 's':
-                        stats["correto"] += 1
-                        print("-> Marcado como CORRETO.")
-                        break
-                    elif char == 'n':
-                        stats["incorreto"] += 1
-                        print("-> Marcado como INCORRETO.")
-                        break
-                    elif char == 'p':
-                        stats["pulado"] += 1
-                        print("-> Exemplo PULADO.")
-                        break
-                    elif char == 'q':
-                        # Se apertar 'q', sai e mostra o resumo
-                        raise KeyboardInterrupt
-                        
-    except KeyboardInterrupt:
-        # Permite sair com Ctrl+C ou 'q' e ainda ver o resumo
-        print("\n\nSaindo da avaliação interativa...")
+        score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
+        score_anti_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, anti_stereotype_sent)
+        score_unrelated = calculate_pseudo_log_likelihood(model, tokenizer, context, unrelated_sent)
 
-    finally:
-        # Exibe o resumo final
-        print("\n" + "=" * 80)
-        print("RESUMO DA AVALIAÇÃO MANUAL")
-        print("=" * 80)
-        total = stats["correto"] + stats["incorreto"]
-        print(f"Exemplos Corretos:   {stats['correto']}")
-        print(f"Exemplos Incorretos: {stats['incorreto']}")
-        print(f"Exemplos Pulados:     {stats['pulado']}")
-        if total > 0:
-            accuracy = (stats["correto"] / total) * 100
-            print(f"\nTaxa de Aprovação (Corretos / (Corretos + Incorretos)): {accuracy:.2f}%")
-        print("=" * 80)
+        if score_stereotype > score_unrelated and score_anti_stereotype > score_unrelated:
+            lms_scores.append(100.0)
+        else:
+            lms_scores.append(0.0)
+        
+        if score_stereotype > score_anti_stereotype:
+            ss_scores.append(100.0)
+        else:
+            ss_scores.append(0.0)
+
+    final_lms = np.mean(lms_scores) if lms_scores else 0
+    final_ss = np.mean(ss_scores) if ss_scores else 0
+
+    print("\n--- RESULTADOS FINAIS DA AVALIAÇÃO ---")
+    print(f"Modelo Avaliado: {MODEL_ID}")
+    print(f"Total de Exemplos Válidos: {len(ss_scores)} de {len(all_examples)}")
+    print(f"Language Model Score (LMS): {final_lms:.2f}%")
+    print(f"Stereotype Score (SS): {final_ss:.2f}%")
+    print("---------------------------------------")
+
 
 # --- 4. EXECUÇÃO ---
 
 if __name__ == "__main__":
-    interactive_evaluation()
+    evaluate_model_bias()
