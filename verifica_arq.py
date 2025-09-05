@@ -1,36 +1,51 @@
 import json
 import re
+import sys
+import tty
+import termios
+from datasets import load_dataset
 
-# --- CONFIGURAÇÕES ---
+# --- 1. CONFIGURAÇÕES ---
 
-# Arquivos JSON traduzidos para inspecionar
+# Arquivos traduzidos em português para inspecionar
 FILES_TO_INSPECT = [
     "stereoset_intersentence_validation_pt.json",
     "stereoset_intrasentence_validation_pt.json"
 ]
 
-# Quantidade máxima de exemplos a serem exibidos por arquivo
-RESULTS_TO_SHOW = 50
+# Quantidade de exemplos de cada arquivo que você deseja avaliar
+# Mude para um número maior ou para None se quiser avaliar o arquivo inteiro
+EXAMPLES_PER_FILE = 50
 
-# Mapeamento dos rótulos numéricos para texto em português
+# Mapeamento de rótulos numéricos para texto
 LABEL_MAP = {
     0: "Estereótipo",
     1: "Anti-Estereótipo",
     2: "Não Relacionado"
 }
 
-# --- FUNÇÕES AUXILIARES ---
+# --- 2. FUNÇÕES AUXILIARES ---
+
+def getch():
+    """
+    Função para capturar um único caracter do teclado sem precisar de 'Enter'.
+    Funciona em sistemas Linux/macOS.
+    """
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 def load_repaired_json(file_path):
-    """
-    Carrega e repara um arquivo que contém múltiplos blocos JSON concatenados.
-    """
+    """Carrega e repara o arquivo JSON traduzido."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
-        # Adiciona uma vírgula entre os objetos JSON
         repaired_content = re.sub(r'}\s*{', '},{', content)
-        # Adiciona colchetes para formar uma lista JSON válida
         final_json_string = f"[{repaired_content}]"
         data = json.loads(final_json_string)
         return data
@@ -41,94 +56,95 @@ def load_repaired_json(file_path):
         print(f"!!! ERRO: Falha ao carregar o arquivo '{file_path}'. Detalhe: {e} !!!")
         return None
 
-# --- FUNÇÃO PRINCIPAL ---
+# --- 3. FUNÇÃO PRINCIPAL DE AVALIAÇÃO ---
 
-def inspect_and_evaluate_results():
+def interactive_evaluation():
     """
-    Exibe os exemplos traduzidos e solicita uma avaliação manual para cada um.
+    Executa o processo de avaliação interativa lado a lado.
     """
-    # Dicionário para armazenar o placar da avaliação
-    evaluation_summary = {"correct": 0, "incorrect": 0, "skipped": 0}
+    # Contadores para o resumo final
+    stats = {"correto": 0, "incorreto": 0, "pulado": 0}
 
-    for file_path in FILES_TO_INSPECT:
-        print("=" * 80)
-        print(f"VERIFICANDO O ARQUIVO: {file_path}")
-        print("=" * 80)
-        
-        data = load_repaired_json(file_path)
-        
-        if data is None:
-            continue
-        
-        num_examples_to_show = min(RESULTS_TO_SHOW, len(data))
-        
-        if num_examples_to_show == 0:
-            print("Nenhum exemplo encontrado neste arquivo.")
-            continue
-
-        for i in range(num_examples_to_show):
-            example = data[i]
+    try:
+        for file_path in FILES_TO_INSPECT:
+            print("=" * 80)
+            print(f"INICIANDO AVALIAÇÃO DO ARQUIVO: {file_path}")
+            print("=" * 80)
             
-            try:
-                # Extrai as informações do exemplo
-                context = example.get('context', 'Contexto não encontrado')
-                bias_type = example.get('bias_type', 'N/A')
-                sentences_data = example.get('sentences', {})
-                labels = sentences_data.get('gold_label', [])
-                sents = sentences_data.get('sentence', [])
+            # Carrega o arquivo traduzido (português)
+            data_pt = load_repaired_json(file_path)
+            if data_pt is None:
+                continue
+
+            # Carrega o arquivo original (inglês) correspondente do Hugging Face
+            config = "intersentence" if "intersentence" in file_path else "intrasentence"
+            print(f"Carregando dataset original '{config}' do Hugging Face para comparação...")
+            data_en = load_dataset("McGill-NLP/stereoset", config, split="validation")
+            
+            num_examples = min(EXAMPLES_PER_FILE or len(data_pt), len(data_pt))
+
+            for i in range(num_examples):
+                example_pt = data_pt[i]
+                example_en = data_en[i]
                 
-                # Exibe as informações na tela
-                print(f"\n--- Exemplo {i + 1}/{num_examples_to_show} ---")
-                print(f"Tipo de Viés: {bias_type}")
-                print(f"Contexto: {context}")
+                # Exibe o exemplo lado a lado
+                print("\n" + "-" * 40 + f" Exemplo {i + 1}/{num_examples} " + "-" * 40)
                 
-                for label_num, sentence_text in zip(labels, sents):
-                    label_text = LABEL_MAP.get(label_num, "Rótulo Desconhecido")
-                    print(f'  - {label_text} ({label_num}): "{sentence_text}"')
+                # Original em Inglês
+                print("\n[ VERSÃO ORIGINAL - INGLÊS ]")
+                print(f"Contexto: {example_en['context']}")
+                for sent, label in zip(example_en['sentences']['sentence'], example_en['sentences']['gold_label']):
+                    print(f"  - {LABEL_MAP[label]}: \"{sent}\"")
+
+                # Tradução em Português
+                print("\n[ SUA TRADUÇÃO - PORTUGUÊS ]")
+                print(f"Contexto: {example_pt['context']}")
+                for sent, label in zip(example_pt['sentences']['sentence'], example_pt['sentences']['gold_label']):
+                    print(f"  - {LABEL_MAP[label]}: \"{sent}\"")
                 
-                # --- INÍCIO DA MODIFICAÇÃO: AVALIAÇÃO INTERATIVA ---
+                # Pergunta interativa
+                print("\n" + "-" * 30)
+                print("A tradução parece correta e natural? Pressione a tecla:")
+                print("[s] Sim  |  [n] Não  |  [p] Pular  |  [q] Sair")
+                
+                # Captura a resposta sem 'Enter'
                 while True:
-                    feedback = input("\nA tradução parece correta? [y]sim / [n]não / [s]saltar: ").lower()
-                    if feedback in ['y', 'sim']:
-                        evaluation_summary["correct"] += 1
+                    char = getch().lower()
+                    if char == 's':
+                        stats["correto"] += 1
+                        print("-> Marcado como CORRETO.")
                         break
-                    elif feedback in ['n', 'nao', 'não']:
-                        evaluation_summary["incorrect"] += 1
+                    elif char == 'n':
+                        stats["incorreto"] += 1
+                        print("-> Marcado como INCORRETO.")
                         break
-                    elif feedback in ['s', 'saltar']:
-                        evaluation_summary["skipped"] += 1
+                    elif char == 'p':
+                        stats["pulado"] += 1
+                        print("-> Exemplo PULADO.")
                         break
-                    else:
-                        print("Opção inválida. Por favor, digite 'y', 'n' ou 's'.")
-                # --- FIM DA MODIFICAÇÃO ---
-            
-            except Exception as e:
-                print(f"\n--- ERRO ao processar o exemplo {i + 1} ---")
-                print(f"Conteúdo do exemplo: {example}")
-                print(f"Erro: {e}")
+                    elif char == 'q':
+                        # Se apertar 'q', sai e mostra o resumo
+                        raise KeyboardInterrupt
+                        
+    except KeyboardInterrupt:
+        # Permite sair com Ctrl+C ou 'q' e ainda ver o resumo
+        print("\n\nSaindo da avaliação interativa...")
 
+    finally:
+        # Exibe o resumo final
         print("\n" + "=" * 80)
-        print(f"Fim da verificação para {file_path}")
-        print("=" * 80 + "\n")
+        print("RESUMO DA AVALIAÇÃO MANUAL")
+        print("=" * 80)
+        total = stats["correto"] + stats["incorreto"]
+        print(f"Exemplos Corretos:   {stats['correto']}")
+        print(f"Exemplos Incorretos: {stats['incorreto']}")
+        print(f"Exemplos Pulados:     {stats['pulado']}")
+        if total > 0:
+            accuracy = (stats["correto"] / total) * 100
+            print(f"\nTaxa de Aprovação (Corretos / (Corretos + Incorretos)): {accuracy:.2f}%")
+        print("=" * 80)
 
-    # --- EXIBIÇÃO DO RESUMO FINAL ---
-    print("\n" + "#" * 80)
-    print("### AVALIAÇÃO MANUAL CONCLUÍDA ###")
-    print("#" * 80 + "\n")
-
-    total_evaluated = evaluation_summary["correct"] + evaluation_summary["incorrect"]
-    print("Resumo da sua Avaliação:")
-    print(f"- Traduções Marcadas como Corretas  : {evaluation_summary['correct']}")
-    print(f"- Traduções Marcadas como Incorretas: {evaluation_summary['incorrect']}")
-    print(f"- Exemplos Saltados (não avaliados): {evaluation_summary['skipped']}")
-    print("-" * 40)
-    print(f"Total de Exemplos Efetivamente Avaliados: {total_evaluated}")
-
-    if total_evaluated > 0:
-        accuracy = (evaluation_summary["correct"] / total_evaluated) * 100
-        print(f"Taxa de Acerto Percebida: {accuracy:.2f}%")
-    print("\n" + "#" * 80)
-
+# --- 4. EXECUÇÃO ---
 
 if __name__ == "__main__":
-    inspect_and_evaluate_results()
+    interactive_evaluation()
