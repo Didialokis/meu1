@@ -105,21 +105,40 @@ def translate_stereoset_with_tower():
     translation_map = dict(zip(unique_english_sentences, all_translations))
     print("Tradução de todas as sentenças concluída.")
 
+# ... (todo o código anterior permanece o mesmo) ...
+
+    # Reconstrói e salva os datasets traduzidos
     for config, dataset in original_datasets.items():
         output_filename = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower.jsonl"
         print(f"Reconstruindo e salvando o dataset traduzido em: {output_filename}")
         
         with open(output_filename, 'w', encoding='utf-8') as f:
             for example in tqdm(dataset, desc=f"Salvando '{config}'"):
-                translated_example = example.copy()
-                translated_example['context'] = translation_map.get(example['context'], example['context'])
                 
-                translated_sentences = [
-                    translation_map.get(sent, sent) for sent in example['sentences']['sentence']
-                ]
-                translated_example['sentences']['sentence'] = translated_sentences
+                # --- INÍCIO DA CORREÇÃO ---
+                # Em vez de modificar o 'example' original, construímos um novo dicionário Python
+                # "puro" a partir dele. Isso garante que não haja tipos de dados complexos
+                # que possam quebrar a função json.dumps.
                 
-                f.write(json.dumps(translated_example, ensure_ascii=False) + '\n')
+                clean_example = {
+                    "id": example["id"],
+                    "target": example["target"],
+                    "bias_type": example["bias_type"],
+                    "context": translation_map.get(example["context"], example["text"]),
+                    "sentences": {
+                        "sentence": [
+                            translation_map.get(sent, sent)
+                            for sent in example["sentences"]["sentence"]
+                        ],
+                        # Copia explicitamente os labels para garantir que são listas puras.
+                        # O .tolist() é uma segurança extra se for um array numpy, por exemplo.
+                        "gold_label": list(example["sentences"]["gold_label"]),
+                    },
+                }
+                # --- FIM DA CORREÇÃO ---
+                
+                # Salva o dicionário limpo como uma linha no arquivo .jsonl
+                f.write(json.dumps(clean_example, ensure_ascii=False) + '\n')
 
     print("\n--- PROCESSO DE TRADUÇÃO CONCLUÍDO COM SUCESSO! ---")
 
