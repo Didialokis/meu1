@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 
-import torch
-from transformers import pipeline
-from datasets import load_dataset
+import torch  # <-- MUDANÇA 1: Importar torch para checar as GPUs
 import json
 from tqdm import tqdm
+from datasets import load_dataset
+from vllm import LLM, SamplingParams
 
 # --- 1. CONFIGURAÇÕES ---
 
@@ -12,45 +12,39 @@ MODEL_ID = "Unbabel/Tower-Plus-2B"
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
-BATCH_SIZE = 8
 
-# --- 2. FUNÇÕES AUXILIARES ---
+# --- 2. FUNÇÃO AUXILIAR ---
 
 def create_translation_prompt(english_text):
     """
-    Formata uma sentença em inglês no template de chat que o modelo espera.
+    Formata uma sentença em inglês no template que o modelo espera.
     """
-    prompt = (
+    return (
         "Translate the following English text to Brazilian Portuguese.\n"
         f"English source: \"{english_text}\"\n"
         "Brazilian Portuguese translation: "
     )
-    return [{"role": "user", "content": prompt}]
 
-def parse_assistant_response(assistant_response):
-    """
-    Extrai a tradução da resposta do assistente de forma robusta.
-    """
-    # A resposta do assistente já é o texto traduzido.
-    # Esta função pode ser usada para limpezas futuras, se necessário.
-    # Por exemplo, remover aspas que o modelo possa adicionar no início/fim.
-    return assistant_response.strip().strip('"')
+# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO COM VLLM ---
 
-
-# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
-
-def translate_stereoset_with_tower():
-    print(f"--- INICIANDO TRADUÇÃO COM O MODELO: {MODEL_ID} ---")
+def translate_stereoset_with_vllm():
+    print(f"--- INICIANDO TRADUÇÃO COM O MODELO: {MODEL_ID} (via vLLM) ---")
     
-    print("Carregando o pipeline...")
-    pipe = pipeline(
-        "text-generation",
-        model=MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    sampling_params = SamplingParams(temperature=0, max_tokens=256)
+    
+    # <-- MUDANÇA 2: Detectar o número de GPUs disponíveis automaticamente
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        raise ValueError("Nenhuma GPU encontrada! vLLM requer pelo menos uma GPU CUDA.")
+    
+    print(f"Detectadas {num_gpus} GPUs. O modelo será distribuído entre elas.")
+
+    # <-- MUDANÇA 3: Usar o número de GPUs detectado para o paralelismo de tensores
+    print("Carregando o modelo com vLLM...")
+    llm = LLM(model=MODEL_ID, tensor_parallel_size=num_gpus)
     print("Modelo carregado com sucesso.")
 
+    # Carrega e prepara os dados
     original_datasets = {}
     all_sentences_to_translate = set()
 
@@ -65,38 +59,19 @@ def translate_stereoset_with_tower():
     unique_english_sentences = sorted(list(all_sentences_to_translate))
     print(f"Total de {len(unique_english_sentences)} sentenças únicas para traduzir.")
 
-    prompts_for_model = [create_translation_prompt(text) for text in unique_english_sentences]
+    all_prompts = [create_translation_prompt(text) for text in unique_english_sentences]
     
-    all_translations = []
-    print(f"Iniciando a tradução em lotes de tamanho {BATCH_SIZE}...")
+    print("Iniciando a tradução com vLLM em múltiplas GPUs...")
+    outputs = llm.generate(all_prompts, sampling_params)
     
-    for i in tqdm(range(0, len(prompts_for_model), BATCH_SIZE), desc="Traduzindo Lotes"):
-        batch_prompts_model = prompts_for_model[i:i + BATCH_SIZE]
-        
-        outputs = pipe(batch_prompts_model, max_new_tokens=256, do_sample=False)
-        
-        for output in outputs:
-            # --- INÍCIO DA CORREÇÃO ---
-            # A saída é uma conversa (lista de dicionários).
-            conversation = output[0]['generated_text']
-            
-            # A tradução é o conteúdo da última mensagem na conversa (a resposta do assistente).
-            # Adicionamos uma verificação para garantir que a conversa não está vazia.
-            if isinstance(conversation, list) and len(conversation) > 0:
-                assistant_response = conversation[-1]['content']
-            else:
-                # Fallback caso a saída não seja no formato esperado
-                assistant_response = ""
-
-            parsed_translation = parse_assistant_response(assistant_response)
-            # --- FIM DA CORREÇÃO ---
-            all_translations.append(parsed_translation)
+    all_translations = [output.outputs[0].text.strip().strip('"') for output in outputs]
 
     translation_map = dict(zip(unique_english_sentences, all_translations))
     print("Tradução de todas as sentenças concluída.")
 
+    # Reconstrói e salva os datasets
     for config, dataset in original_datasets.items():
-        output_filename = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower.jsonl"
+        output_filename = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower_vllm.jsonl"
         print(f"Reconstruindo e salvando o dataset traduzido em: {output_filename}")
         
         with open(output_filename, 'w', encoding='utf-8') as f:
@@ -120,4 +95,4 @@ def translate_stereoset_with_tower():
 
 # --- 4. EXECUÇÃO ---
 if __name__ == "__main__":
-    translate_stereoset_with_tower()
+    translate_stereoset_with_vllm()
