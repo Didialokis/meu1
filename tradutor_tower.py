@@ -2,6 +2,7 @@
 
 import torch
 import json
+import re
 from tqdm import tqdm
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
@@ -25,6 +26,29 @@ def create_translation_prompt(english_text):
         "Brazilian Portuguese translation: "
     )
 
+def clean_translation(text):
+    """
+    Função de limpeza robusta para remover ruídos e padrões indesejados
+    da saída do modelo de tradução.
+    """
+    if not isinstance(text, str):
+        return ""
+
+    # Remove aspas extras no início e no fim do texto
+    text = text.strip().strip('"')
+
+    # Remove padrões como "0:12", "1. I", "10.", etc., no início da string.
+    # Esta expressão regular procura por:
+    # ^                  - início da string
+    # (["\s]*)?         - aspas e/ou espaços opcionais
+    # (\d+[:.]\s*|\d+\.\s*I\s*)? - padrões como "0:", "12.", "1. I "
+    # ([\s"]*)?         - mais espaços e/ou aspas opcionais
+    pattern = r'^([\'"\s]*)?(\d+[:.]\s*|\d+\.\s*I\s*)?([\'"\s]*)?'
+    cleaned_text = re.sub(pattern, '', text, count=1)
+
+    return cleaned_text.strip()
+
+
 def save_translated_dataset(config_name, dataset, translation_map, split_name):
     """
     Função dedicada para reconstruir e salvar um dataset traduzido.
@@ -34,7 +58,6 @@ def save_translated_dataset(config_name, dataset, translation_map, split_name):
     
     with open(output_filename, 'w', encoding='utf-8') as f:
         for example in tqdm(dataset, desc=f"Salvando '{config_name}'"):
-            # Garante que os dados do exemplo estão limpos e corretos
             clean_example = {
                 "id": example["id"],
                 "target": example["target"],
@@ -55,6 +78,8 @@ def save_translated_dataset(config_name, dataset, translation_map, split_name):
 def translate_stereoset_with_vllm():
     print(f"--- INICIANDO TRADUÇÃO COM O MODELO: {MODEL_ID} (via vLLM) ---")
     
+    # Aumentar um pouco a temperatura pode ajudar a evitar repetições de padrões,
+    # mas para tradução, 0 ou um valor muito baixo é geralmente melhor.
     sampling_params = SamplingParams(temperature=0, max_tokens=256)
     
     num_gpus = torch.cuda.device_count()
@@ -67,7 +92,6 @@ def translate_stereoset_with_vllm():
     llm = LLM(model=MODEL_ID, tensor_parallel_size=num_gpus)
     print("Modelo carregado com sucesso.")
 
-    # Carrega e prepara os dados
     original_datasets = {}
     all_sentences_to_translate = set()
 
@@ -84,21 +108,20 @@ def translate_stereoset_with_vllm():
 
     all_prompts = [create_translation_prompt(text) for text in unique_english_sentences]
     
-    print("Iniciando a tradução com vLLM em múltiplas GPUs...")
+    print("Iniciando a tradução com vLLM...")
     outputs = llm.generate(all_prompts, sampling_params)
     
-    all_translations = [output.outputs[0].text.strip().strip('"') for output in outputs]
+    # --- INÍCIO DA CORREÇÃO ---
+    # Aplicamos a função de limpeza a cada saída do modelo.
+    all_translations = [clean_translation(output.outputs[0].text) for output in outputs]
+    # --- FIM DA CORREÇÃO ---
 
     translation_map = dict(zip(unique_english_sentences, all_translations))
-    print("Tradução de todas as sentenças concluída.")
+    print("Tradução e limpeza de todas as sentenças concluída.")
 
-    # --- 4. RECONSTRUÇÃO E SALVAMENTO (LÓGICA CORRIGIDA) ---
-    # Em vez de um loop, chamamos explicitamente a função de salvamento para cada dataset.
-    # Isso evita o bug e torna o código mais claro e robusto.
-    
+    # --- 4. RECONSTRUÇÃO E SALVAMENTO ---
     print("\n--- Reconstruindo e salvando os datasets traduzidos ---")
     
-    # Processa e salva o dataset 'intersentence'
     save_translated_dataset(
         config_name='intersentence',
         dataset=original_datasets['intersentence'],
@@ -106,7 +129,6 @@ def translate_stereoset_with_vllm():
         split_name=DATASET_SPLIT
     )
     
-    # Processa e salva o dataset 'intrasentence'
     save_translated_dataset(
         config_name='intrasentence',
         dataset=original_datasets['intrasentence'],
