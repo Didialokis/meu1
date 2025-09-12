@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import torch  # <-- MUDANÇA 1: Importar torch para checar as GPUs
+import torch
 import json
 from tqdm import tqdm
 from datasets import load_dataset
@@ -13,7 +13,7 @@ DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 
-# --- 2. FUNÇÃO AUXILIAR ---
+# --- 2. FUNÇÕES AUXILIARES ---
 
 def create_translation_prompt(english_text):
     """
@@ -25,6 +25,31 @@ def create_translation_prompt(english_text):
         "Brazilian Portuguese translation: "
     )
 
+def save_translated_dataset(config_name, dataset, translation_map, split_name):
+    """
+    Função dedicada para reconstruir e salvar um dataset traduzido.
+    """
+    output_filename = f"stereoset_{config_name}_{split_name}_pt_tower_vllm.jsonl"
+    print(f"Reconstruindo e salvando o dataset '{config_name}' em: {output_filename}")
+    
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        for example in tqdm(dataset, desc=f"Salvando '{config_name}'"):
+            # Garante que os dados do exemplo estão limpos e corretos
+            clean_example = {
+                "id": example["id"],
+                "target": example["target"],
+                "bias_type": example["bias_type"],
+                "context": translation_map.get(example["context"], example["context"]),
+                "sentences": {
+                    "sentence": [
+                        translation_map.get(sent, sent)
+                        for sent in example["sentences"]["sentence"]
+                    ],
+                    "gold_label": list(example["sentences"]["gold_label"]),
+                },
+            }
+            f.write(json.dumps(clean_example, ensure_ascii=False) + '\n')
+
 # --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO COM VLLM ---
 
 def translate_stereoset_with_vllm():
@@ -32,14 +57,12 @@ def translate_stereoset_with_vllm():
     
     sampling_params = SamplingParams(temperature=0, max_tokens=256)
     
-    # <-- MUDANÇA 2: Detectar o número de GPUs disponíveis automaticamente
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         raise ValueError("Nenhuma GPU encontrada! vLLM requer pelo menos uma GPU CUDA.")
     
     print(f"Detectadas {num_gpus} GPUs. O modelo será distribuído entre elas.")
 
-    # <-- MUDANÇA 3: Usar o número de GPUs detectado para o paralelismo de tensores
     print("Carregando o modelo com vLLM...")
     llm = LLM(model=MODEL_ID, tensor_parallel_size=num_gpus)
     print("Modelo carregado com sucesso.")
@@ -69,30 +92,30 @@ def translate_stereoset_with_vllm():
     translation_map = dict(zip(unique_english_sentences, all_translations))
     print("Tradução de todas as sentenças concluída.")
 
-    # Reconstrói e salva os datasets
-    for config, dataset in original_datasets.items():
-        output_filename = f"stereoset_{config}_{DATASET_SPLIT}_pt_tower_vllm.jsonl"
-        print(f"Reconstruindo e salvando o dataset traduzido em: {output_filename}")
-        
-        with open(output_filename, 'w', encoding='utf-8') as f:
-            for example in tqdm(dataset, desc=f"Salvando '{config}'"):
-                clean_example = {
-                    "id": example["id"],
-                    "target": example["target"],
-                    "bias_type": example["bias_type"],
-                    "context": translation_map.get(example["context"], example["context"]),
-                    "sentences": {
-                        "sentence": [
-                            translation_map.get(sent, sent)
-                            for sent in example["sentences"]["sentence"]
-                        ],
-                        "gold_label": list(example["sentences"]["gold_label"]),
-                    },
-                }
-                f.write(json.dumps(clean_example, ensure_ascii=False) + '\n')
+    # --- 4. RECONSTRUÇÃO E SALVAMENTO (LÓGICA CORRIGIDA) ---
+    # Em vez de um loop, chamamos explicitamente a função de salvamento para cada dataset.
+    # Isso evita o bug e torna o código mais claro e robusto.
+    
+    print("\n--- Reconstruindo e salvando os datasets traduzidos ---")
+    
+    # Processa e salva o dataset 'intersentence'
+    save_translated_dataset(
+        config_name='intersentence',
+        dataset=original_datasets['intersentence'],
+        translation_map=translation_map,
+        split_name=DATASET_SPLIT
+    )
+    
+    # Processa e salva o dataset 'intrasentence'
+    save_translated_dataset(
+        config_name='intrasentence',
+        dataset=original_datasets['intrasentence'],
+        translation_map=translation_map,
+        split_name=DATASET_SPLIT
+    )
 
     print("\n--- PROCESSO DE TRADUÇÃO CONCLUÍDO COM SUCESSO! ---")
 
-# --- 4. EXECUÇÃO ---
+# --- 5. EXECUÇÃO ---
 if __name__ == "__main__":
     translate_stereoset_with_vllm()
