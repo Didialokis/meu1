@@ -35,14 +35,30 @@ def load_repaired_json(file_path):
 
 def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
     """
-    Calcula o Pseudo-Log-Likelihood (PLL) para modelos Masked Language (BERT).
+    Calcula o Pseudo-Log-Likelihood (PLL) para modelos Masked Language (BERT),
+    com lógica para truncar sequências que excedam o limite do modelo.
     """
     if context and not context.endswith(' '):
         context += ' '
     
+    # --- INÍCIO DA CORREÇÃO: LÓGICA DE TRUNCAMENTO ---
+    max_length = tokenizer.model_max_length # Geralmente 512 para o BERT
+
     context_tokens = tokenizer.encode(context, add_special_tokens=False)
     sentence_tokens = tokenizer.encode(sentence, add_special_tokens=False)
+
+    # Verifica se o comprimento total excede o limite (considerando [CLS] e [SEP])
+    if len(context_tokens) + len(sentence_tokens) + 2 > max_length:
+        # Calcula o excesso
+        overflow_len = len(context_tokens) + len(sentence_tokens) + 2 - max_length
+        # Remove o excesso do final do contexto para preservar a sentença
+        context_tokens = context_tokens[:-overflow_len]
+
+    # --- FIM DA CORREÇÃO ---
     
+    if not sentence_tokens:
+        return -math.inf
+
     input_ids = torch.tensor([tokenizer.cls_token_id] + context_tokens + sentence_tokens + [tokenizer.sep_token_id]).unsqueeze(0)
     
     start_index = len(context_tokens) + 1
@@ -66,7 +82,7 @@ def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
         if not math.isinf(token_log_prob):
             total_log_prob += token_log_prob
 
-    return total_log_prob
+    return total_log_prob / len(sentence_tokens)
 
 
 def evaluate_bertimbau():
