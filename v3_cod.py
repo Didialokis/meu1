@@ -32,6 +32,13 @@ python3 evaluation.py \
 ////////////////////////////////////////////////////////////////
 
 
+
+python src/run_evaluation.py \
+    --model-name-or-path neuralmind/bert-base-portuguese-cased \
+    --input-file /caminho/para/seu/arquivo_intrasentence_traduzido.json \
+    --output-file resultados_intrasentence_bertimbau.json \
+    --task intrasentence
+
 Replace the original prediction loop in this function with the corrected version below.
 
 Python
