@@ -55,116 +55,117 @@ python src/run_evaluation.py \
     --output-file resultados_intrasentence_bertimbau.json \
     --task intrasentence
 
-Script para Unificar os Arquivos:
-
-Salve o código abaixo como unificar_json.py, por exemplo.
-
-Coloque seus dois arquivos traduzidos (ex: intersentence_pt.json e intrasentence_pt.json) no mesmo diretório.
-
-Execute o script. Ele criará um novo arquivo chamado stereoset_pt_gold.json.
-
-Python
-
 import json
+import torch
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+from tqdm import tqdm
+import logging
 
-# Nomes dos seus arquivos traduzidos
-intersentence_file = 'intersentence_pt.json'
-intrasentence_file = 'intrasentence_pt.json'
-output_file = 'stereoset_pt_gold.json'
+# Desativa logs de informação da biblioteca 'transformers' para um output mais limpo
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Dicionário para armazenar o conteúdo dos dois arquivos
-data_unificada = {}
+# --- CONFIGURAÇÕES ---
+# Mude para 'neuralmind/bert-large-portuguese-cased' se quiser usar o modelo grande
+MODEL_NAME = 'neuralmind/bert-base-portuguese-cased' 
+GOLD_FILE = 'stereoset_pt_gold.json'
+OUTPUT_FILE = 'predictions_bertimbau.json'
+# ---------------------
 
-# Carregar dados de intersentence
-try:
-    with open(intersentence_file, 'r', encoding='utf-8') as f:
-        # O arquivo original tem "intersentence" como chave principal
-        data_unificada['intersentence'] = json.load(f)['intersentence']
-    print(f"✅ Arquivo '{intersentence_file}' carregado com sucesso.")
-except (json.JSONDecodeError, KeyError) as e:
-    print(f"❌ Erro ao ler '{intersentence_file}'. Verifique se o formato JSON é válido e contém a chave 'intersentence'. Erro: {e}")
-    exit()
+def calculate_pll_score(text, model, tokenizer, device):
+    """
+    Calcula a Pseudo-Log-Likelihood (PLL) para uma dada sentença.
+    Scores mais altos (menos negativos) indicam maior probabilidade.
+    """
+    # Tokeniza a sentença, adicionando tokens especiais [CLS] e [SEP]
+    tokenized_input = tokenizer.encode(text, return_tensors='pt').to(device)
+    
+    # Ignora os tokens [CLS] e [SEP] no cálculo do score
+    tokens_to_score = tokenized_input[0][1:-1]
+    
+    total_log_prob = 0.0
+
+    # Itera sobre cada token da sentença (exceto [CLS] e [SEP])
+    for i in range(1, len(tokenized_input[0]) - 1):
+        
+        # Cria uma cópia dos IDs para mascarar o token da iteração atual
+        masked_input = tokenized_input.clone()
+        
+        # Guarda o ID do token original que será mascarado
+        original_token_id = masked_input[0, i].item()
+        
+        # Mascara o token na posição 'i'
+        masked_input[0, i] = tokenizer.mask_token_id
+
+        # Realiza a predição com o modelo sem calcular gradientes para otimização
+        with torch.no_grad():
+            outputs = model(masked_input)
+            logits = outputs.logits
+        
+        # Pega os logits (saída bruta) apenas para a posição do token mascarado
+        masked_token_logits = logits[0, i, :]
+        
+        # Aplica log_softmax para converter logits em log-probabilidades
+        log_probs = torch.nn.functional.log_softmax(masked_token_logits, dim=0)
+        
+        # Pega a log-probabilidade específica do token original e soma ao total
+        token_log_prob = log_probs[original_token_id].item()
+        total_log_prob += token_log_prob
+        
+    return total_log_prob
 
 
-# Carregar dados de intrasentence
-try:
-    with open(intrasentence_file, 'r', encoding='utf-8') as f:
-        # O arquivo original tem "intrasentence" como chave principal
-        data_unificada['intrasentence'] = json.load(f)['intrasentence']
-    print(f"✅ Arquivo '{intrasentence_file}' carregado com sucesso.")
-except (json.JSONDecodeError, KeyError) as e:
-    print(f"❌ Erro ao ler '{intrasentence_file}'. Verifique se o formato JSON é válido e contém a chave 'intrasentence'. Erro: {e}")
-    exit()
+def generate_predictions():
+    """
+    Função principal que carrega o modelo, os dados, calcula os scores
+    e salva o arquivo de predições.
+    """
+    # Verifica se a GPU está disponível e define o dispositivo
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"🚀 Usando dispositivo: {device.upper()}")
 
-# Salvar o novo arquivo unificado
-with open(output_file, 'w', encoding='utf-8') as f:
-    json.dump(data_unificada, f, indent=2, ensure_ascii=False)
+    # Carrega o modelo e o tokenizador pré-treinados
+    print(f"💾 Carregando modelo '{MODEL_NAME}'... (Isso pode levar um momento)")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval() # Coloca o modelo em modo de avaliação
+    print("✅ Modelo carregado com sucesso!")
 
-print(f"\n🚀 Arquivos unificados com sucesso em '{output_file}'!")
+    # Carrega o arquivo gold unificado
+    try:
+        with open(GOLD_FILE, 'r', encoding='utf-8') as f:
+            gold_data = json.load(f)
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo '{GOLD_FILE}' não encontrado. Verifique o nome e o caminho do arquivo.")
+        return
 
-Agora você tem o arquivo stereoset_pt_gold.json, que está no formato exato que o script de avaliação precisa.
+    predictions = {"intrasentence": [], "intersentence": []}
+    total_sentences = sum(len(ex['sentences']) for task in gold_data.values() for ex in task)
+    
+    print(f"📊 Processando {total_sentences} sentenças...")
 
-🛠️ Passo 2: Gerar as Predições (Scores) com o BERTimbau
-O script de avaliação precisa de um segundo arquivo: o de predições. Este arquivo contém a "pontuação" (score) que o BERTimbau atribui a cada frase individualmente. O método padrão para isso é a pseudo-log-likelihood (PLL), que mede o quão "provável" uma frase é de acordo com o modelo.
+    # Usa tqdm para criar uma barra de progresso
+    with tqdm(total=total_sentences, unit="sentença") as pbar:
+        # Itera sobre as duas tarefas (intrasentence e intersentence)
+        for task_type in gold_data:
+            for example in gold_data[task_type]:
+                for sentence in example['sentences']:
+                    sentence_id = sentence['id']
+                    sentence_text = sentence['sentence']
+                    
+                    # Calcula o score PLL para a sentença
+                    score = calculate_pll_score(sentence_text, model, tokenizer, device)
+                    
+                    # Adiciona o resultado à lista correta
+                    predictions[task_type].append({"id": sentence_id, "score": score})
+                    pbar.update(1)
 
-Você precisará criar um script que:
+    # Salva o arquivo de predições
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(predictions, f, indent=2, ensure_ascii=False)
 
-Carregue o modelo BERTimbau.
+    print(f"\n🎉 Arquivo de predições foi salvo com sucesso em '{OUTPUT_FILE}'!")
 
-Leia o seu arquivo stereoset_pt_gold.json.
 
-Para cada frase (estereótipo, anti-estereótipo e não relacionada) em cada exemplo, calcule seu score usando o BERTimbau.
-
-Salve esses scores em um arquivo JSON com o formato esperado.
-
-O arquivo de predições deve ter a seguinte estrutura:
-
-Exemplo de predictions_bertimbau.json:
-
-JSON
-
-{
-    "intrasentence": [
-        {
-            "id": "8899-7-1",
-            "score": -12.345
-        },
-        {
-            "id": "8899-7-2",
-            "score": -15.678
-        }
-    ],
-    "intersentence": [
-        {
-            "id": "9211-2-1",
-            "score": -20.111
-        },
-        {
-            "id": "9211-2-2",
-            "score": -18.222
-        }
-    ]
-}
-O "id" de cada frase vem do seu arquivo gold e o "score" é a pontuação calculada pelo BERTimbau. Um score maior significa que o modelo considera a frase mais provável.
-
-🚀 Passo 3: Executar a Avaliação
-Com os dois arquivos prontos (stereoset_pt_gold.json e predictions_bertimbau.json), você pode finalmente executar o script de avaliação original sem nenhuma modificação.
-
-Abra seu terminal no diretório onde estão os arquivos e execute o seguinte comando:
-
-Bash
-
-python evaluate.py --gold-file stereoset_pt_gold.json --predictions-file predictions_bertimbau.json --output-file results_bertimbau.json
-O que cada argumento faz:
-
---gold-file stereoset_pt_gold.json: Aponta para o seu arquivo de dados traduzido e unificado.
-
---predictions-file predictions_bertimbau.json: Aponta para o arquivo com os scores gerados pelo BERTimbau.
-
---output-file results_bertimbau.json: Especifica onde salvar os resultados da avaliação.
-
-O script irá então calcular o LM Score, Stereotype Score (SS) e ICAT Score para o BERTimbau com base nos seus dados em português, e imprimirá os resultados no console, além de salvá-los no arquivo results_bertimbau.json.
-class Sentence:
-    def __init__(self, id, gold_label):
-        self.id = id
-        self.gold_label = gold_label
+if __name__ == "__main__":
+    generate_predictions()
