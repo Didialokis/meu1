@@ -28,3 +28,108 @@ Bash
 python3 evaluation.py \
   --gold-file stereoset/data/dev.json \
   --predictions-file predictions/bert-base-uncased.json
+
+
+# generate_predictions.py
+import json
+import torch
+import argparse
+from transformers import BertTokenizer, BertForMaskedLM
+from tqdm import tqdm
+
+def get_pseudo_log_likelihood(sentence, model, tokenizer, device, context=None):
+    """
+    Calcula a pseudo-log-verossimilhança de uma sentença para um MLM como o BERT.
+    """
+    # Concatena contexto e sentença e tokeniza
+    if context:
+        full_text = context + " " + sentence
+    else:
+        full_text = sentence
+        
+    inputs = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=512)
+    
+    # Move os tensores para o dispositivo correto (GPU/CPU)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    input_ids = inputs["input_ids"]
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+    # Desloca os logits e os rótulos para alinhar as previsões
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+
+    # Calcula a log-verossimilhança de cada token
+    log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+    
+    # Reúne as log-verossimilhanças dos tokens corretos
+    log_likelihood = log_probs.gather(2, shift_labels.unsqueeze(2)).squeeze(2)
+
+    # Soma as log-verossimilhanças para obter a pontuação da sentença
+    pad_mask = (shift_labels!= tokenizer.pad_token_id)
+    return torch.sum(log_likelihood * pad_mask).item()
+
+def process_examples(examples, model, tokenizer, device, task_type):
+    """Processa uma lista de exemplos (intrasentence ou intersentence)."""
+    predictions =
+    for example in tqdm(examples, desc=f"Processando exemplos {task_type}"):
+        context = example['context']
+        
+        for sentence_obj in example['sentences']:
+            # Para intrasentence, o contexto é uma frase com "BLANK"
+            if task_type == 'intrasentence':
+                # Encontra a palavra a ser inserida
+                word_idx = -1
+                for idx, word in enumerate(context.split(" ")):
+                    if "BLANK" in word:
+                        word_idx = idx
+                        break
+                template_word = sentence_obj['sentence'].split(" ")[word_idx]
+                # Cria a sentença completa
+                full_sentence = context.replace("BLANK", template_word)
+                score = get_pseudo_log_likelihood(full_sentence, model, tokenizer, device)
+            else: # Para intersentence, o contexto é a primeira sentença
+                score = get_pseudo_log_likelihood(sentence_obj['sentence'], model, tokenizer, device, context=context)
+
+            predictions.append({
+                "id": sentence_obj['id'],
+                "score": score
+            })
+    return predictions
+
+def main():
+    parser = argparse.ArgumentParser(description="Gera previsões de pontuação para o StereoSet.")
+    parser.add_argument("--model_name_or_path", type=str, required=True, help="Nome ou caminho do modelo a ser avaliado.")
+    parser.add_argument("--input_file", type=str, default="stereoset/data/dev.json", help="Caminho para o arquivo de dados do StereoSet (dev.json).")
+    parser.add_argument("--output_file", type=str, required=True, help="Caminho para o arquivo de saída JSON com as previsões.")
+    
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando dispositivo: {device}")
+
+    tokenizer = BertTokenizer.from_pretrained(args.model_name_or_path)
+    model = BertForMaskedLM.from_pretrained(args.model_name_or_path)
+    model.to(device)
+    model.eval()
+
+    with open(args.input_file, 'r') as f:
+        data = json.load(f)['data']
+
+    intrasentence_examples = data.get('intrasentence',)
+    intersentence_examples = data.get('intersentence',)
+
+    results = {
+        "intrasentence": process_examples(intrasentence_examples, model, tokenizer, device, 'intrasentence'),
+        "intersentence": process_examples(intersentence_examples, model, tokenizer, device, 'intersentence')
+    }
+
+    with open(args.output_file, 'w') as f:
+        json.dump(results, f, indent=4)
+
+    print(f"Previsões salvas em {args.output_file}")
+
+if __name__ == "__main__":
+    main()
