@@ -30,6 +30,13 @@ python3 evaluation.py \
   --predictions-file predictions/bert-base-uncased.json
 
 ////////////////////////////////////////////////////////////////
+
+
+python evaluation.py \
+    --gold-file ../stereoset/data/dev.json \
+    --predictions-file predictions_bert.json
+
+
 # scripts/evaluation.py
 import json
 import numpy as np
