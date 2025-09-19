@@ -30,7 +30,14 @@ python3 evaluation.py \
   --predictions-file predictions/bert-base-uncased.json
 
 ////////////////////////////////////////////////////////////////
+Avaliar o Impacto da Qualidade do Corpus: Investigar e quantificar como a qualidade dos dados de pré-treinamento influencia o desempenho final de um modelo de linguagem para o português brasileiro.
 
+Análise Comparativa de Modelos: Realizar uma comparação direta de performance entre o seu "modelA", treinado em um corpus de alta qualidade, e o modelo de referência BERTimbau.
+
+Validação através de Tarefas Práticas: Medir o desempenho de ambos os modelos em um conjunto de tarefas de Processamento de Linguagem Natural (PLN) para obter métricas concretas sobre suas capacidades.
+
+Demonstrar a Vantagem da Curadoria de Dados: Provar a hipótese de que um corpus mais limpo e bem estruturado resulta em um modelo de linguagem mais robusto e eficiente, capaz de superar baselines estabelecidos.
+///////////////////////////////////////////////////////////////
 
 
 python src/run_evaluation.py \
