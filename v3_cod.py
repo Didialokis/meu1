@@ -49,11 +49,10 @@ Objetivo Principal: O resultado, um "StereoSet-PT", servirá como uma ferramenta
 ///////////////////////////////////////////////////////////////
 
 
-python src/run_evaluation.py \
-    --model-name-or-path neuralmind/bert-base-portuguese-cased \
-    --input-file /caminho/para/seu/arquivo_intrasentence_traduzido.json \
-    --output-file resultados_intrasentence_bertimbau.json \
-    --task intrasentence
+python evaluate.py --gold-file stereoset_pt_gold.json --predictions-file predictions_bertimbau.json --output-file results_bertimbau.json
+
+
+  
 
 import json
 import torch
