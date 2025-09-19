@@ -37,6 +37,15 @@ Análise Comparativa de Modelos: Realizar uma comparação direta de performance
 Validação através de Tarefas Práticas: Medir o desempenho de ambos os modelos em um conjunto de tarefas de Processamento de Linguagem Natural (PLN) para obter métricas concretas sobre suas capacidades.
 
 Demonstrar a Vantagem da Curadoria de Dados: Provar a hipótese de que um corpus mais limpo e bem estruturado resulta em um modelo de linguagem mais robusto e eficiente, capaz de superar baselines estabelecidos.
+
+//// stereoset
+  A Lacuna no Português: Atualmente, não existem datasets de avaliação amplamente adotados e específicos para medir este tipo de viés social em modelos de linguagem treinados para o português brasileiro, dificultando a análise de sua imparcialidade e segurança.
+
+A Solução: Tradução e Adaptação Cultural: Para preencher essa lacuna, o projeto propõe a tradução e, crucialmente, a adaptação cultural do StereoSet para a realidade brasileira. Isso garante que os exemplos sejam relevantes e que os estereótipos avaliados façam sentido no contexto local.
+
+Como a Avaliação Funciona: O dataset testa os modelos através de tarefas de preenchimento de lacunas e escolha de sentenças que revelam suas tendências associativas, fornecendo métricas claras sobre o nível de viés estereotipado que o modelo aprendeu durante o treinamento.
+
+Objetivo Principal: O resultado, um "StereoSet-PT", servirá como uma ferramenta fundamental para comparar modelos como o "modelA" e o BERTimbau, permitindo analisar como a qualidade do corpus de treinamento impacta não apenas a performance, mas também o comportamento ético do modelo.
 ///////////////////////////////////////////////////////////////
 
 
