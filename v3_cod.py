@@ -20,7 +20,7 @@ BATCH_SIZE = 8
 # Mapeamento para o "gold_label" (3 classes)
 GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 
-# Mapeamento para os labels internos (4 classes)
+# Mapeamento para os labels internos (4 classes, incluindo 'related')
 INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
 
 # --- 2. FUNÇÕES AUXILIARES ---
@@ -93,20 +93,26 @@ def traduzir_e_recriar_estrutura_final():
             num_sentences = len(original_sents_data['sentence'])
 
             for i in range(num_sentences):
-                # --- INÍCIO DA CORREÇÃO FINAL ---
-                # Recria a lista de dicionários para o campo 'labels', convertendo os números para texto
+                # --- INÍCIO DA CORREÇÃO FINALÍSSIMA ---
+                # Recria a lista de dicionários para o campo 'labels' a partir
+                # da estrutura de dicionário de listas paralelas.
                 recreated_labels = []
-                for label_dict in original_sents_data['labels'][i]:
+                labels_data_for_one_sentence = original_sents_data['labels'][i]
+                human_ids = labels_data_for_one_sentence['human_id']
+                inner_int_labels = labels_data_for_one_sentence['label']
+                
+                # "Desfaz o pivô" dos dados, juntando as listas paralelas
+                for j in range(len(human_ids)):
                     recreated_labels.append({
-                        "human_id": label_dict['human_id'],
-                        "label": INNER_LABEL_MAP[label_dict['label']] # Converte o inteiro para texto
+                        "human_id": human_ids[j],
+                        "label": INNER_LABEL_MAP[inner_int_labels[j]]
                     })
-                # --- FIM DA CORREÇÃO FINAL ---
+                # --- FIM DA CORREGO FINALÍSSIMA ---
 
                 new_sentence_obj = {
                     "id": original_sents_data['id'][i],
                     "sentence": next(translated_iter),
-                    "labels": recreated_labels, # Usa a lista de dicionários recriada e corrigida
+                    "labels": recreated_labels, # Usa a lista de dicionários recriada
                     "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
                 }
                 new_example["sentences"].append(new_sentence_obj)
@@ -120,14 +126,4 @@ def traduzir_e_recriar_estrutura_final():
         "data": reconstructed_data
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT}_pt_nllb_formato_original_final.json"
-    print(f"Salvando o dataset final em: {output_path}")
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
-
-    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível com o dataloader.py.")
-
-
-if __name__ == "__main__":
-    traduzir_e_recriar_estrutura_final()
+    output_path = f"stereoset_{DATASET_SPLIT
