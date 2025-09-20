@@ -126,4 +126,14 @@ def traduzir_e_recriar_estrutura_final():
         "data": reconstructed_data
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_nllb_formato_original_final.json"
+    print(f"Salvando o dataset final em: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
+
+    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível com o dataloader.py.")
+
+
+if __name__ == "__main__":
+    traduzir_e_recriar_estrutura_final()
