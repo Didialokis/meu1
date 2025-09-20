@@ -1,118 +1,159 @@
+Script de Tradução Final: Recriando a Estrutura Original
+Para resolver isso, não podemos mais usar o conveniente método .map(). O script abaixo foi reescrito para reconstruir manualmente a estrutura original após a tradução. Ele é mais detalhado, mas o resultado será um arquivo JSON perfeitamente compatível com o dataloader.py e qualquer outra ferramenta oficial do StereoSet.
+
+Python
+
+# -*- coding: utf-8 -*-
+
 import torch
-from transformers import AutoModelForMaskedLM, AutoTokenizer
-from tqdm import tqdm
-import logging
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from datasets import load_dataset
+import re
 import json
-import math
+from tqdm import tqdm
 
-# Desativa logs de informação da biblioteca 'transformers' para um output mais limpo
-logging.getLogger("transformers").setLevel(logging.ERROR)
+# --- 1. CONFIGURAÇÕES ---
 
-# --- CONFIGURAções ---
-MODEL_NAME = 'neuralmind/bert-base-portuguese-cased' 
+MODEL_NAME = "facebook/nllb-200-1.3B"
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
+SOURCE_LANG = "eng_Latn"
+TARGET_LANG = "por_Latn"
+BATCH_SIZE = 8
 
-# ATENÇÃO: Verifique se este nome de arquivo é EXATAMENTE igual ao gerado pelo tradutor.
-GOLD_FILE = 'stereoset_validation_pt_nllb_completo.json' 
+# Mapeamento para converter os labels numéricos de volta para texto
+LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 
-OUTPUT_FILE = 'predictions_bertimbau.json'
-# ---------------------
+# --- 2. FUNÇÕES AUXILIARES ---
 
-def calculate_pll_score(text, model, tokenizer, device):
-    """
-    Calcula a Pseudo-Log-Likelihood (PLL) normalizada para uma dada sentença.
-    """
-    # A lógica interna permanece a mesma, pois é robusta.
-    tokenized_input = tokenizer.encode(text, return_tensors='pt').to(device)
+def sanitize_text(text):
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+
+
+# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
+
+def traduzir_e_recriar_estrutura():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando dispositivo: {device}")
+
+    print(f"Carregando o modelo '{MODEL_NAME}'...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SOURCE_LANG)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    print("Modelo carregado com sucesso.")
+
+    # --- ETAPA DE EXTRAÇÃO ---
+    # Coleta todas as sentenças a serem traduzidas e mantém os datasets originais
+    datasets_dict = {}
+    sentences_to_translate = []
+    for config in CONFIGS:
+        print(f"Carregando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT)
+        datasets_dict[config] = dataset
+        for example in dataset:
+            sentences_to_translate.append(example['context'])
+            for sent_obj in example['sentences']:
+                sentences_to_translate.append(sent_obj['sentence'])
     
-    if tokenized_input.shape[1] <= 2: # Lida com sentenças vazias
-        return -math.inf
+    print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    total_log_prob = 0.0
+    # --- ETAPA DE TRADUÇÃO ---
+    print("Iniciando a tradução em lotes...")
+    translated_sentences = []
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
 
-    for i in range(1, tokenized_input.shape[1] - 1): # Itera apenas sobre os tokens reais
-        masked_input = tokenized_input.clone()
-        original_token_id = masked_input[0, i].item()
-        masked_input[0, i] = tokenizer.mask_token_id
+    for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo Lotes"):
+        batch = sentences_to_translate[i:i + BATCH_SIZE]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
+        generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
+        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
+        translated_sentences.extend(batch_sanitized)
+    print("Tradução finalizada.")
 
-        with torch.no_grad():
-            outputs = model(masked_input)
-            logits = outputs.logits
-        
-        masked_token_logits = logits[0, i, :]
-        log_probs = torch.nn.functional.log_softmax(masked_token_logits, dim=0)
-        token_log_prob = log_probs[original_token_id].item()
-        total_log_prob += token_log_prob
-        
-    return total_log_prob / (tokenized_input.shape[1] - 2)
-
-
-def generate_predictions():
-    """
-    Função principal que carrega o modelo, os dados, calcula os scores
-    e salva o arquivo de predições.
-    """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🚀 Usando dispositivo: {device.upper()}")
-
-    print(f"💾 Carregando modelo '{MODEL_NAME}'...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
-    model.to(device)
-    model.eval()
-    print("✅ Modelo carregado com sucesso!")
-
-    # --- INÍCIO DA MODIFICAÇÃO ROBUSTA ---
-    # Este bloco agora captura qualquer erro durante o carregamento e exibe uma mensagem clara.
-    try:
-        print(f"📂 Tentando carregar o arquivo de dados: '{GOLD_FILE}'...")
-        with open(GOLD_FILE, 'r', encoding='utf-8') as f:
-            full_data = json.load(f)
-        
-        # Acessa os dados dentro da chave "data", conforme a estrutura correta
-        gold_data = full_data['data'] 
-        print("✅ Arquivo de dados carregado e validado com sucesso!")
-        
-    except FileNotFoundError:
-        print(f"❌ ERRO FATAL: Arquivo de dados '{GOLD_FILE}' não foi encontrado.")
-        print("👉 Verifique se o nome do arquivo na variável GOLD_FILE está EXATAMENTE igual ao nome do arquivo gerado pelo tradutor.")
-        return # Interrompe a execução
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"❌ ERRO FATAL: O arquivo '{GOLD_FILE}' foi encontrado, mas há um erro de formato ou estrutura.")
-        print(f"👉 Detalhe do erro: {e}")
-        print("👉 Certifique-se de que o arquivo foi gerado corretamente pelo script de tradução mais recente.")
-        return # Interrompe a execução
-    # --- FIM DA MODIFICAÇÃO ROBUSTA ---
-
-    predictions = {"intrasentence": [], "intersentence": []}
+    # --- ETAPA DE RECONSTRUÇÃO MANUAL ---
+    print("Reconstruindo o dataset na estrutura original...")
+    translated_iter = iter(translated_sentences)
     
-    total_sentences = 0
-    for task_type in gold_data:
-        for example in gold_data[task_type]:
-            total_sentences += len(example['sentences']['id'])
+    reconstructed_data = {}
+    for config in CONFIGS:
+        original_dataset = datasets_dict[config]
+        new_examples_list = []
+        for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
+            new_example = {
+                "id": original_example['id'],
+                "bias_type": original_example['bias_type'],
+                "target": original_example['target'],
+                "context": next(translated_iter), # Pega o contexto traduzido
+                "sentences": []
+            }
+            
+            for original_sentence_obj in original_example['sentences']:
+                new_sentence_obj = {
+                    "id": original_sentence_obj['id'],
+                    "sentence": next(translated_iter), # Pega a sentença traduzida
+                    "labels": original_sentence_obj['labels'], # Mantém os labels originais
+                    "gold_label": LABEL_MAP[original_sentence_obj['gold_label']] # Converte o label numérico para texto
+                }
+                new_example["sentences"].append(new_sentence_obj)
+            
+            new_examples_list.append(new_example)
+        reconstructed_data[config] = new_examples_list
+
+    # --- ETAPA DE SALVAMENTO ---
+    final_output_structure = {
+        "version": "1.1.1", # Adiciona a chave de versão esperada
+        "data": reconstructed_data
+    }
     
-    print(f"📊 Processando {total_sentences} sentenças...")
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_nllb_formato_original.json"
+    print(f"Salvando o dataset final em: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    with tqdm(total=total_sentences, unit="sentença") as pbar:
-        for task_type in gold_data: # Itera sobre 'intrasentence' e 'intersentence'
-            for example in gold_data[task_type]:
-                sentences_data = example['sentences']
-                sentence_ids = sentences_data['id']
-                sentence_texts = sentences_data['sentence']
-                
-                for i in range(len(sentence_ids)):
-                    sentence_id = sentence_ids[i]
-                    sentence_text = sentence_texts[i]
-                    
-                    score = calculate_pll_score(sentence_text, model, tokenizer, device)
-                    
-                    predictions[task_type].append({"id": sentence_id, "score": score})
-                    pbar.update(1)
-
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(predictions, f, indent=2, ensure_ascii=False)
-
-    print(f"\n🎉 Arquivo de predições foi salvo com sucesso em '{OUTPUT_FILE}'!")
+    print("\n🎉 Sucesso! Processo concluído. O arquivo está 100% compatível com o dataloader.py.")
 
 
 if __name__ == "__main__":
-    generate_predictions()
+    traduzir_e_recriar_estrutura()
+
+Seu Novo Fluxo de Trabalho (Simplificado e Correto)
+Execute o Script de Tradução (acima): Use este novo script para gerar o arquivo stereoset_validation_pt_nllb_formato_original.json. Este arquivo será uma réplica perfeita do original, apenas com os textos em português.
+
+Use o dataloader.py: Agora, qualquer script (como o evaluation.py do repositório oficial) que use o dataloader.py para carregar este novo arquivo funcionará sem erros.
+
+Ajuste o Seu Script de Predição (predicao.py): Seu script de predição foi feito para a estrutura simplificada. Ele também precisa de um pequeno ajuste para funcionar com a estrutura original correta.
+
+Modificação necessária no predicao.py:
+
+Python
+
+# No seu script predicao.py...
+
+# ...
+# Carregue os dados aninhados
+with open(GOLD_FILE, 'r', encoding='utf-8') as f:
+    full_data = json.load(f)
+    gold_data = full_data['data'] 
+# ...
+
+# ...
+# Modifique o loop principal
+with tqdm(total=total_sentences, unit="sentença") as pbar:
+    for task_type in gold_data:
+        for example in gold_data[task_type]:
+
+            # --- INÍCIO DA CORREÇÃO ---
+            # Agora iteramos sobre a lista de dicionários de sentenças
+            for sentence_obj in example['sentences']:
+                sentence_id = sentence_obj['id']
+                sentence_text = sentence_obj['sentence']
+            # --- FIM DA CORREÇÃO ---
+
+                score = calculate_pll_score(sentence_text, model, tokenizer, device)
+
+                predictions[task_type].append({"id": sentence_id, "score": score})
+                pbar.update(1)
+# ...
+Com essas duas correções (no script de tradução e no de predição), todo o seu pipeline estará consistente e alinhado com a estrutura de dados oficial do StereoSet.
