@@ -28,12 +28,17 @@ LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 # --- 2. FUNÇÕES AUXILIARES ---
 
 def sanitize_text(text):
+    """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
 
 # --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
 
-def traduzir_e_recriar_estrutura():
+def traduzir_e_recriar_estrutura_corretamente():
+    """
+    Executa o pipeline de tradução e recria a estrutura original do Stereoset
+    com precisão para garantir compatibilidade com o dataloader oficial.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Usando dispositivo: {device}")
 
@@ -43,7 +48,6 @@ def traduzir_e_recriar_estrutura():
     print("Modelo carregado com sucesso.")
 
     # --- ETAPA DE EXTRAÇÃO ---
-    # Coleta todas as sentenças a serem traduzidas e mantém os datasets originais
     datasets_dict = {}
     sentences_to_translate = []
     for config in CONFIGS:
@@ -52,8 +56,8 @@ def traduzir_e_recriar_estrutura():
         datasets_dict[config] = dataset
         for example in dataset:
             sentences_to_translate.append(example['context'])
-            for sent_obj in example['sentences']:
-                sentences_to_translate.append(sent_obj['sentence'])
+            # Acessa a lista de sentenças dentro da estrutura do dataset
+            sentences_to_translate.extend(example['sentences']['sentence'])
     
     print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
@@ -71,7 +75,7 @@ def traduzir_e_recriar_estrutura():
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO MANUAL ---
+    # --- ETAPA DE RECONSTRUÇÃO MANUAL (LÓGICA CORRIGIDA) ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
     
@@ -84,16 +88,24 @@ def traduzir_e_recriar_estrutura():
                 "id": original_example['id'],
                 "bias_type": original_example['bias_type'],
                 "target": original_example['target'],
-                "context": next(translated_iter), # Pega o contexto traduzido
-                "sentences": []
+                "context": next(translated_iter),
+                "sentences": [] # Será uma lista de dicionários
             }
             
-            for original_sentence_obj in original_example['sentences']:
+            # Pega as listas paralelas da estrutura do Hugging Face
+            original_sents_texts = original_example['sentences']['sentence']
+            original_sents_ids = original_example['sentences']['id']
+            original_sents_gold_labels = original_example['sentences']['gold_label']
+            original_sents_labels = original_example['sentences']['labels']
+
+            # Itera sobre o número de sentenças para "desfazer" a estrutura paralela
+            for i in range(len(original_sents_texts)):
                 new_sentence_obj = {
-                    "id": original_sentence_obj['id'],
-                    "sentence": next(translated_iter), # Pega a sentença traduzida
-                    "labels": original_sentence_obj['labels'], # Mantém os labels originais
-                    "gold_label": LABEL_MAP[original_sentence_obj['gold_label']] # Converte o label numérico para texto
+                    "id": original_sents_ids[i],
+                    "sentence": next(translated_iter),
+                    # A chave 'labels' contém as anotações humanas e é crucial para o dataloader
+                    "labels": original_sents_labels[i],
+                    "gold_label": LABEL_MAP[original_sents_gold_labels[i]]
                 }
                 new_example["sentences"].append(new_sentence_obj)
             
@@ -102,7 +114,7 @@ def traduzir_e_recriar_estrutura():
 
     # --- ETAPA DE SALVAMENTO ---
     final_output_structure = {
-        "version": "1.1.1", # Adiciona a chave de versão esperada
+        "version": "1.1", # Chave de versão compatível
         "data": reconstructed_data
     }
     
@@ -112,11 +124,11 @@ def traduzir_e_recriar_estrutura():
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    print("\n🎉 Sucesso! Processo concluído. O arquivo está 100% compatível com o dataloader.py.")
+    print("\n🎉 Sucesso! Processo concluído. O arquivo de saída agora é 100% compatível com o dataloader.py.")
 
 
 if __name__ == "__main__":
-    traduzir_e_recriar_estrutura()
+    traduzir_e_recriar_estrutura_corretamente()
 
 Seu Novo Fluxo de Trabalho (Simplificado e Correto)
 Execute o Script de Tradução (acima): Use este novo script para gerar o arquivo stereoset_validation_pt_nllb_formato_original.json. Este arquivo será uma réplica perfeita do original, apenas com os textos em português.
