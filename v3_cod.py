@@ -145,123 +145,116 @@ if __name__ == "__main__":
     traduzir_dataset_completo()
 
 /////////////////////////////////////////////
-# -*- coding: utf-8 -*-
-# NOME DO ARQUIVO: avaliador_final.py
-
 import torch
-import json
-import numpy as np
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 from tqdm import tqdm
-import math
+import logging
+import json # Adicionado import que estava faltando
+import math   # Adicionado import para o caso de sentenças vazias
 
-# --- CONFIGURAÇÕES ---
-MODEL_ID = "neuralmind/bert-base-portuguese-cased"
-# ATENÇÃO: Nomes dos arquivos gerados pelo tradutor final
-FILES_TO_EVALUATE = [
-    "stereoset_intersentence_validation_pt_nllb_final.json",
-    "stereoset_intrasentence_validation_pt_nllb_final.json"
-]
+# Desativa logs de informação da biblioteca 'transformers' para um output mais limpo
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
-def load_jsonl(file_path):
-    """Lê um arquivo no formato JSON Lines (.jsonl)."""
-    print(f"Carregando o arquivo: {file_path}...")
-    data = []
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    data.append(json.loads(line))
-        return data
-    except FileNotFoundError:
-        print(f"AVISO: O arquivo '{file_path}' não foi encontrado.")
-        return []
-    except json.JSONDecodeError as e:
-        print(f"ERRO: Falha ao carregar o JSON do arquivo '{file_path}'. Detalhe: {e}")
-        return []
+# --- CONFIGURAções ---
+# Mude para 'neuralmind/bert-large-portuguese-cased' se quiser usar o modelo grande
+MODEL_NAME = 'neuralmind/bert-base-portuguese-cased' 
 
-def calculate_pseudo_log_likelihood(model, tokenizer, context, sentence):
-    """Calcula o Pseudo-Log-Likelihood (PLL) para modelos BERT."""
-    if context and not context.endswith(' '): context += ' '
-    context_tokens = tokenizer.encode(context, add_special_tokens=False)
-    sentence_tokens = tokenizer.encode(sentence, add_special_tokens=False)
-    if not sentence_tokens: return -math.inf
-    input_ids = torch.tensor([tokenizer.cls_token_id] + context_tokens + sentence_tokens + [tokenizer.sep_token_id]).unsqueeze(0)
-    start_index, end_index = len(context_tokens) + 1, len(context_tokens) + 1 + len(sentence_tokens)
-    total_log_prob = 0.0
-    for i in range(start_index, end_index):
-        masked_input_ids = input_ids.clone()
-        original_token_id = masked_input_ids[0, i].item()
-        masked_input_ids[0, i] = tokenizer.mask_token_id
-        with torch.no_grad():
-            outputs = model(masked_input_ids.to(model.device))
-        logits = outputs.logits[0, i, :]
-        log_probs = torch.nn.functional.log_softmax(logits, dim=0)
-        token_log_prob = log_probs[original_token_id].item()
-        if not math.isinf(token_log_prob): total_log_prob += token_log_prob
-    return total_log_prob / len(sentence_tokens)
+# ATENÇÃO: Este deve ser o nome EXATO do arquivo gerado pelo seu script de tradução
+GOLD_FILE = 'stereoset_validation_pt_nllb_completo.json' 
 
-def evaluate_model_bias():
-    print(f"--- INICIANDO AVALIAÇÃO DE VIÉS PARA O MODELO: {MODEL_ID} ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}")
+OUTPUT_FILE = 'predictions_bertimbau.json'
+# ---------------------
+
+def calculate_pll_score(text, model, tokenizer, device):
+    """
+    Calcula a Pseudo-Log-Likelihood (PLL) normalizada para uma dada sentença.
+    """
+    tokenized_input = tokenizer.encode(text, return_tensors='pt').to(device)
     
-    print("Carregando modelo e tokenizador...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForMaskedLM.from_pretrained(MODEL_ID).to(device)
+    # Sentenças vazias ou com apenas tokens especiais não podem ser pontuadas
+    if tokenized_input.shape[1] <= 2:
+        return -math.inf
+
+    total_log_prob = 0.0
+
+    for i in range(1, tokenized_input.shape[1] - 1):
+        masked_input = tokenized_input.clone()
+        original_token_id = masked_input[0, i].item()
+        masked_input[0, i] = tokenizer.mask_token_id
+
+        with torch.no_grad():
+            outputs = model(masked_input)
+            logits = outputs.logits
+        
+        masked_token_logits = logits[0, i, :]
+        log_probs = torch.nn.functional.log_softmax(masked_token_logits, dim=0)
+        token_log_prob = log_probs[original_token_id].item()
+        total_log_prob += token_log_prob
+        
+    # Normaliza pelo número de tokens para comparar sentenças de tamanhos diferentes
+    return total_log_prob / (tokenized_input.shape[1] - 2)
+
+
+def generate_predictions():
+    """
+    Função principal que carrega o modelo, os dados, calcula os scores
+    e salva o arquivo de predições.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"🚀 Usando dispositivo: {device.upper()}")
+
+    print(f"💾 Carregando modelo '{MODEL_NAME}'... (Isso pode levar um momento)")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
+    model.to(device)
     model.eval()
-    print("Modelo carregado com sucesso.")
+    print("✅ Modelo carregado com sucesso!")
 
-    all_examples = []
-    for file_path in FILES_TO_EVALUATE:
-        data = load_jsonl(file_path)
-        all_examples.extend(data)
-
-    if not all_examples:
-        print("ERRO: Nenhum dado de avaliação foi carregado.")
+    try:
+        with open(GOLD_FILE, 'r', encoding='utf-8') as f:
+            gold_data = json.load(f)
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo '{GOLD_FILE}' não encontrado. Verifique o nome do arquivo.")
         return
-        
-    print(f"Carregados {len(all_examples)} exemplos no total para avaliação.")
-    lms_scores, ss_scores = [], []
 
-    for example in tqdm(all_examples, desc="Avaliando exemplos"):
-        context = example['context']
-        sentences_data = example['sentences']
-        try:
-            labels = sentences_data['gold_label']
-            sents = sentences_data['sentence']
-            stereotype_idx = labels.index(0)
-            anti_stereotype_idx = labels.index(1)
-            unrelated_idx = labels.index(2)
-            stereotype_sent = sents[stereotype_idx]
-            anti_stereotype_sent = sents[anti_stereotype_idx]
-            unrelated_sent = sents[unrelated_idx]
-        except (KeyError, ValueError):
-            continue
+    predictions = {"intrasentence": [], "intersentence": []}
+    
+    # Contagem total de sentenças para a barra de progresso
+    total_sentences = 0
+    for task_type in gold_data:
+        for example in gold_data[task_type]:
+            total_sentences += len(example['sentences']['id'])
+    
+    print(f"📊 Processando {total_sentences} sentenças...")
 
-        score_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, stereotype_sent)
-        score_anti_stereotype = calculate_pseudo_log_likelihood(model, tokenizer, context, anti_stereotype_sent)
-        score_unrelated = calculate_pseudo_log_likelihood(model, tokenizer, context, unrelated_sent)
+    with tqdm(total=total_sentences, unit="sentença") as pbar:
+        for task_type in gold_data:
+            for example in gold_data[task_type]:
+                
+                # --- INÍCIO DA CORREÇÃO ---
+                # Acessamos o dicionário 'sentences'
+                sentences_data = example['sentences']
+                
+                # Pegamos as listas paralelas de IDs e textos
+                sentence_ids = sentences_data['id']
+                sentence_texts = sentences_data['sentence']
+                
+                # Iteramos sobre as listas usando um índice
+                for i in range(len(sentence_ids)):
+                    sentence_id = sentence_ids[i]
+                    sentence_text = sentence_texts[i]
+                # --- FIM DA CORREÇÃO ---
+                    
+                    score = calculate_pll_score(sentence_text, model, tokenizer, device)
+                    
+                    predictions[task_type].append({"id": sentence_id, "score": score})
+                    pbar.update(1)
 
-        if score_stereotype > score_unrelated and score_anti_stereotype > score_unrelated:
-            lms_scores.append(100.0)
-        else:
-            lms_scores.append(0.0)
-        
-        if score_stereotype > score_anti_stereotype:
-            ss_scores.append(100.0)
-        else:
-            ss_scores.append(0.0)
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(predictions, f, indent=2, ensure_ascii=False)
 
-    final_lms = np.mean(lms_scores) if lms_scores else 0
-    final_ss = np.mean(ss_scores) if ss_scores else 0
+    print(f"\n🎉 Arquivo de predições foi salvo com sucesso em '{OUTPUT_FILE}'!")
 
-    print("\n--- RESULTADOS FINAIS DA AVALIAÇÃO ---")
-    print(f"Modelo Avaliado: {MODEL_ID}")
-    print(f"Total de Exemplos Válidos: {len(ss_scores)} de {len(all_examples)}")
-    print(f"Language Model Score (LMS): {final_lms:.2f}%")
-    print(f"Stereotype Score (SS): {final_ss:.2f}%")
-    print("---------------------------------------")
 
 if __name__ == "__main__":
-    evaluate_model_bias()
+    generate_predictions()
