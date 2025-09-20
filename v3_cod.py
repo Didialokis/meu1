@@ -54,117 +54,92 @@ python evaluate.py --gold-file stereoset_pt_gold.json --predictions-file predict
 
   
 
-import json
-import torch
-from transformers import AutoModelForMaskedLM, AutoTokenizer
-from tqdm import tqdm
-import logging
+# -*- coding: utf-8 -*-
+# NOME DO ARQUIVO: traduzir_final.py
 
-# Desativa logs de informação da biblioteca 'transformers' para um output mais limpo
-logging.getLogger("transformers").setLevel(logging.ERROR)
+# -*- coding: utf-8 -*-
+# NOME DO ARQUIVO: traduzir_final.py
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from datasets import load_dataset
+import re
 
 # --- CONFIGURAÇÕES ---
-# Mude para 'neuralmind/bert-large-portuguese-cased' se quiser usar o modelo grande
-MODEL_NAME = 'neuralmind/bert-base-portuguese-cased' 
-GOLD_FILE = 'stereoset_pt_gold.json'
-OUTPUT_FILE = 'predictions_bertimbau.json'
-# ---------------------
+MODEL_NAME = "facebook/nllb-200-1.3B"
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
+SOURCE_LANG = "eng_Latn"
+TARGET_LANG = "por_Latn"
+BATCH_SIZE = 8
+PLACEHOLDER = "__BLANK_PLACEHOLDER__"
 
-def calculate_pll_score(text, model, tokenizer, device):
-    """
-    Calcula a Pseudo-Log-Likelihood (PLL) para uma dada sentença.
-    Scores mais altos (menos negativos) indicam maior probabilidade.
-    """
-    # Tokeniza a sentença, adicionando tokens especiais [CLS] e [SEP]
-    tokenized_input = tokenizer.encode(text, return_tensors='pt').to(device)
+def sanitize_text(text):
+    """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+
+def traduzir_dataset_completo():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando dispositivo: {device}")
+
+    print(f"Carregando o modelo '{MODEL_NAME}'...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SOURCE_LANG)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    print("Modelo carregado com sucesso.")
+
+    datasets_dict = {}
+    sentences_to_translate = []
+
+    for config in CONFIGS:
+        print(f"Baixando e carregando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT)
+        datasets_dict[config] = dataset
+        for example in dataset:
+            sentences_to_translate.append(example['context'])
+            sentences_to_translate.extend(example['sentences']['sentence'])
     
-    # Ignora os tokens [CLS] e [SEP] no cálculo do score
-    tokens_to_score = tokenized_input[0][1:-1]
-    
-    total_log_prob = 0.0
+    print(f"Total de {len(sentences_to_translate)} sentenças extraídas.")
 
-    # Itera sobre cada token da sentença (exceto [CLS] e [SEP])
-    for i in range(1, len(tokenized_input[0]) - 1):
+    print("Iniciando a tradução em lotes...")
+    translated_sentences = []
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
+
+    for i in range(0, len(sentences_to_translate), BATCH_SIZE):
+        batch = sentences_to_translate[i:i + BATCH_SIZE]
+        batch_com_placeholder = [s.replace("BLANK", PLACEHOLDER) for s in batch]
+        inputs = tokenizer(batch_com_placeholder, return_tensors="pt", padding=True, truncation=True).to(device)
         
-        # Cria uma cópia dos IDs para mascarar o token da iteração atual
-        masked_input = tokenized_input.clone()
+        generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
+        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         
-        # Guarda o ID do token original que será mascarado
-        original_token_id = masked_input[0, i].item()
+        batch_translated_final = [s.replace(PLACEHOLDER, "BLANK") for s in batch_translated_raw]
+        batch_sanitized = [sanitize_text(text) for text in batch_translated_final]
+        translated_sentences.extend(batch_sanitized)
         
-        # Mascara o token na posição 'i'
-        masked_input[0, i] = tokenizer.mask_token_id
+        print(f"  Lote {i//BATCH_SIZE + 1} de {len(sentences_to_translate)//BATCH_SIZE + 1} concluído...")
 
-        # Realiza a predição com o modelo sem calcular gradientes para otimização
-        with torch.no_grad():
-            outputs = model(masked_input)
-            logits = outputs.logits
+    print("Tradução finalizada.")
+    print("Reconstruindo os datasets com as sentenças traduzidas...")
+    translated_iter = iter(translated_sentences)
+
+    for config in CONFIGS:
+        dataset_original = datasets_dict[config]
+
+        def replace_sentences(example):
+            example['context'] = next(translated_iter)
+            num_target_sentences = len(example['sentences']['sentence'])
+            translated_target_sentences = [next(translated_iter) for _ in range(num_target_sentences)]
+            example['sentences']['sentence'] = translated_target_sentences
+            return example
+
+        translated_dataset = dataset_original.map(replace_sentences)
         
-        # Pega os logits (saída bruta) apenas para a posição do token mascarado
-        masked_token_logits = logits[0, i, :]
-        
-        # Aplica log_softmax para converter logits em log-probabilidades
-        log_probs = torch.nn.functional.log_softmax(masked_token_logits, dim=0)
-        
-        # Pega a log-probabilidade específica do token original e soma ao total
-        token_log_prob = log_probs[original_token_id].item()
-        total_log_prob += token_log_prob
-        
-    return total_log_prob
+        output_path = f"stereoset_{config}_{DATASET_SPLIT}_pt_nllb_final.json"
+        print(f"Salvando o dataset '{config}' traduzido em: {output_path}")
+        translated_dataset.to_json(output_path, force_ascii=False) # Removido indent=2 para salvar em JSON Lines
 
-
-def generate_predictions():
-    """
-    Função principal que carrega o modelo, os dados, calcula os scores
-    e salva o arquivo de predições.
-    """
-    # Verifica se a GPU está disponível e define o dispositivo
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🚀 Usando dispositivo: {device.upper()}")
-
-    # Carrega o modelo e o tokenizador pré-treinados
-    print(f"💾 Carregando modelo '{MODEL_NAME}'... (Isso pode levar um momento)")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
-    model.to(device)
-    model.eval() # Coloca o modelo em modo de avaliação
-    print("✅ Modelo carregado com sucesso!")
-
-    # Carrega o arquivo gold unificado
-    try:
-        with open(GOLD_FILE, 'r', encoding='utf-8') as f:
-            gold_data = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ ERRO: Arquivo '{GOLD_FILE}' não encontrado. Verifique o nome e o caminho do arquivo.")
-        return
-
-    predictions = {"intrasentence": [], "intersentence": []}
-    total_sentences = sum(len(ex['sentences']) for task in gold_data.values() for ex in task)
-    
-    print(f"📊 Processando {total_sentences} sentenças...")
-
-    # Usa tqdm para criar uma barra de progresso
-    with tqdm(total=total_sentences, unit="sentença") as pbar:
-        # Itera sobre as duas tarefas (intrasentence e intersentence)
-        for task_type in gold_data:
-            for example in gold_data[task_type]:
-                for sentence in example['sentences']:
-                    sentence_id = sentence['id']
-                    sentence_text = sentence['sentence']
-                    
-                    # Calcula o score PLL para a sentença
-                    score = calculate_pll_score(sentence_text, model, tokenizer, device)
-                    
-                    # Adiciona o resultado à lista correta
-                    predictions[task_type].append({"id": sentence_id, "score": score})
-                    pbar.update(1)
-
-    # Salva o arquivo de predições
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(predictions, f, indent=2, ensure_ascii=False)
-
-    print(f"\n🎉 Arquivo de predições foi salvo com sucesso em '{OUTPUT_FILE}'!")
-
+    print("\nSucesso! Processo concluído.")
 
 if __name__ == "__main__":
-    generate_predictions()
+    traduzir_dataset_completo()
