@@ -1,98 +1,159 @@
 import json
+import re
+import sys
+import tty
+import termios
+import csv
 from datasets import load_dataset
-import itertools
 
-# --- 1. CONFIGURAÇÕES ---
-
-# Nomes dos arquivos .jsonl gerados pelo seu script de tradução
-FILENAMES_TO_CHECK = [
-    "stereoset_intersentence_validation_pt_tower.jsonl",
-    "stereoset_intrasentence_validation_pt_tower.jsonl",
+# --- CONFIGURAÇÕES ---
+FILES_TO_INSPECT = [
+    "stereoset_intersentence_validation_pt_nllb_final.json",
+    "stereoset_intrasentence_validation_pt_nllb_final.json"
 ]
+EXAMPLES_PER_FILE = 50
+CSV_OUTPUT_FILE = 'avaliacao_traducoes.csv' # Nome do arquivo de saída
+LABEL_MAP = {
+    1: "Estereótipo",
+    0: "Anti-Estereótipo",
+    2: "Não Relacionado"
+}
+# ---------------------
 
-# Quantidade de exemplos a serem exibidos de cada arquivo
-NUM_EXAMPLES_TO_SHOW = 50
+def getch():
+    """Captura um único caractere do terminal sem precisar pressionar Enter."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
-# --- 2. SCRIPT DE VERIFICAÇÃO ---
+def load_repaired_json(file_path):
+    """Carrega um arquivo JSON que pode estar mal formatado (com múltiplos arrays)."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        
+        # Corrige o JSON que tem '][' entre os objetos
+        repaired_content = re.sub(r']\s*\[', ',', content)
+        # Envolve tudo em um único array
+        final_json_string = f"[{repaired_content}]"
+        
+        data = json.loads(final_json_string)
+        return data
+    except FileNotFoundError:
+        print(f"||! AVISO: O arquivo '{file_path}' não foi encontrado. Pulando. !!|")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"I!! ERRO: Falha ao carregar o arquivo '{file_path}'. Detalhe: {e} !!!")
+        return None
 
-def display_translation_samples():
-    """
-    Carrega os datasets original e traduzido e exibe uma comparação
-    lado a lado para verificação da qualidade.
-    """
-    for filename in FILENAMES_TO_CHECK:
-        print(f"\n{'='*80}")
-        print(f"VERIFICANDO AMOSTRAS DO ARQUIVO: {filename}")
-        print(f"{'='*80}\n")
+def interactive_evaluation():
+    """Função principal para avaliação interativa com salvamento em CSV."""
+    stats = {"correto": 0, "incorreto": 0, "pulado": 0}
+    
+    # Define o cabeçalho para o arquivo CSV
+    csv_header = [
+        'arquivo_origem', 'id_exemplo', 'contexto_en', 
+        'sentenca_en', 'label_en', 'sentenca_pt', 'avaliacao'
+    ]
 
-        try:
-            # Determina a configuração ('intersentence' ou 'intrasentence') a partir do nome do arquivo
-            config = filename.split('_')[1]
+    try:
+        # Abre o arquivo CSV para escrita
+        with open(CSV_OUTPUT_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+            csv_writer = csv.writer(csvfile)
+            csv_writer.writerow(csv_header) # Escreve o cabeçalho
 
-            # Carrega o dataset original correspondente do Hugging Face
-            print(f"Carregando dataset original '{config}' do Hugging Face para comparação...")
-            original_dataset = load_dataset("McGill-NLP/stereoset", config, split="validation")
-            
-            # Abre o arquivo .jsonl traduzido
-            with open(filename, 'r', encoding='utf-8') as f:
-                # Usamos islice para pegar apenas as primeiras N linhas sem carregar o arquivo inteiro
-                translated_lines = list(itertools.islice(f, NUM_EXAMPLES_TO_SHOW))
+            for file_path in FILES_TO_INSPECT:
+                print("=" * 80)
+                print(f"INICIANDO AVALIAÇÃO DO ARQUIVO: {file_path}")
+                print("=" * 80)
 
-            if not translated_lines:
-                print("Arquivo de tradução está vazio ou não foi encontrado.")
-                continue
+                data_pt = load_repaired_json(file_path)
+                if data_pt is None:
+                    continue
 
-            # Itera sobre os primeiros N exemplos de ambos os datasets
-            for i, (original_example, translated_line) in enumerate(zip(original_dataset, translated_lines)):
-                translated_example = json.loads(translated_line)
+                config = "intersentence" if "intersentence" in file_path else "intrasentence"
+                print(f"Carregando dataset original '{config}' do Hugging Face para comparação...")
+                data_en = load_dataset("McGill-NLP/stereoset", config, split="validation")
                 
-                # Extrai os dados para comparação
-                original_context = original_example['context']
-                translated_context = translated_example['context']
+                num_examples = min(EXAMPLES_PER_FILE or len(data_pt), len(data_pt))
                 
-                original_sents_data = original_example['sentences']
-                translated_sents_data = translated_example['sentences']
+                for i in range(num_examples):
+                    example_pt = data_pt[i]
+                    example_en = data_en[i]
 
-                print(f"--- Amostra {i+1}/{NUM_EXAMPLES_TO_SHOW} (ID: {original_example['id']}) ---")
-                
-                # Exibe o contexto
-                print(f"Contexto Original (EN):    {original_context}")
-                print(f"Contexto Traduzido (PT):   {translated_context}\n")
+                    print("\n" + "-" * 40 + f" Exemplo {i + 1}/{num_examples} " + "-" * 40)
+                    print(f"\n[ CONTEXTO ORIGINAL (EN) ]\n{example_en['context']}")
+                    print("-" * 30)
 
-                try:
-                    # Mapeamento de labels: 0=stereotype, 1=anti-stereotype, 2=unrelated
-                    labels = original_sents_data['gold_label']
-                    
-                    # Encontra os índices para exibir na ordem correta
-                    idx_stereotype = labels.index(0)
-                    idx_anti_stereotype = labels.index(1)
-                    idx_unrelated = labels.index(2)
+                    # Itera sobre cada sentença dentro do exemplo
+                    for sent_en, label_en, sent_pt in zip(
+                        example_en['sentences']['sentence'], 
+                        example_en['sentences']['gold_label'], 
+                        example_pt['sentences']['sentence']
+                    ):
+                        print(f"  [EN] - {LABEL_MAP[label_en]}: \"{sent_en}\"")
+                        print(f"  [PT] - Tradução: \"{sent_pt}\"\n")
+                        
+                        print("A tradução parece correta? Pressione a tecla:")
+                        print("[s] Sim | [n] Não | [p] Pular | [q] Sair e Salvar")
 
-                    # Exibe as sentenças na ordem lógica para fácil comparação
-                    print("[Estereótipo]")
-                    print(f"  Original (EN):    {original_sents_data['sentence'][idx_stereotype]}")
-                    print(f"  Traduzido (PT):   {translated_sents_data['sentence'][idx_stereotype]}\n")
+                        while True:
+                            char = getch().lower()
+                            avaliacao = None
+                            
+                            if char == 's':
+                                stats["correto"] += 1
+                                avaliacao = "correto"
+                                print("-> Marcado como CORRETO.\n")
+                            elif char == 'n':
+                                stats["incorreto"] += 1
+                                avaliacao = "incorreto"
+                                print("-> Marcado como INCORRETO.\n")
+                            elif char == 'p':
+                                stats["pulado"] += 1
+                                avaliacao = "pulado"
+                                print("-> Sentença PULADA.\n")
+                            elif char == 'q':
+                                raise KeyboardInterrupt # Usa a interrupção para sair do loop
 
-                    print("[Anti-Estereótipo]")
-                    print(f"  Original (EN):    {original_sents_data['sentence'][idx_anti_stereotype]}")
-                    print(f"  Traduzido (PT):   {translated_sents_data['sentence'][idx_anti_stereotype]}\n")
-
-                    print("[Não Relacionado]")
-                    print(f"  Original (EN):    {original_sents_data['sentence'][idx_unrelated]}")
-                    print(f"  Traduzido (PT):   {translated_sents_data['sentence'][idx_unrelated]}")
-
-                except (KeyError, ValueError):
-                    print("  ERRO: Estrutura de sentenças inesperada neste exemplo.")
-                
-                print(f"{'-'*80}\n")
-
-        except FileNotFoundError:
-            print(f"ERRO: Arquivo '{filename}' não encontrado. Verifique o nome e o caminho do arquivo.")
-        except Exception as e:
-            print(f"Ocorreu um erro inesperado ao processar o arquivo '{filename}': {e}")
+                            if avaliacao:
+                                # Prepara a linha de dados para o CSV
+                                data_row = [
+                                    file_path,
+                                    example_en['id'],
+                                    example_en['context'],
+                                    sent_en,
+                                    LABEL_MAP[label_en],
+                                    sent_pt,
+                                    avaliacao
+                                ]
+                                csv_writer.writerow(data_row)
+                                csvfile.flush() # Garante que a linha seja salva imediatamente
+                                break
+                        print("-" * 30)
 
 
-# --- 3. EXECUÇÃO ---
+    except KeyboardInterrupt:
+        print("\n\nSaindo... Avaliações salvas em '{}'.".format(CSV_OUTPUT_FILE))
+    
+    finally:
+        print("\n" + "=" * 80)
+        print("RESUMO DA SESSÃO")
+        print("=" * 80)
+        total = stats["correto"] + stats["incorreto"]
+        print(f"Exemplos Corretos: {stats['correto']}")
+        print(f"Exemplos Incorretos: {stats['incorreto']}")
+        print(f"Exemplos Pulados: {stats['pulado']}")
+        if total > 0:
+            accuracy = (stats["correto"] / total) * 100
+            print(f"\nTaxa de Aprovação (Correto / (Correto + Incorreto)): {accuracy:.2f}%")
+        print("=" * 80)
+
 
 if __name__ == "__main__":
-    display_translation_samples()
+    interactive_evaluation()
