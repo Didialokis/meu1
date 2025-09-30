@@ -1,3 +1,5 @@
+python -c "from accelerate.utils import write_basic_config; write_basic_config(mixed_precision='fp16')"
+
 # -*- coding: utf-8 -*-
 
 import torch
