@@ -6,13 +6,13 @@ from tqdm import tqdm
 
 # --- 1. CONFIGURAÇÕES ---
 
-# ATENÇÃO: Verifique se este é o nome do arquivo gerado pelo seu último script de tradução
-TRANSLATED_FILE = 'stereoset_validation_pt_nllb_completo.json' 
+# ATENÇÃO: Verifique se este é o nome do arquivo gerado pelo seu script de tradução final
+TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json' 
 
 # Nome do arquivo CSV de saída que será gerado.
-OUTPUT_CSV_FILE = 'amostra_avaliacao.csv'
+OUTPUT_CSV_FILE = 'amostra_avaliacao_final.csv'
 
-# Quantos exemplos selecionar para cada categoria de viés.
+# Quantos exemplos (contextos) selecionar para cada categoria de viés.
 SAMPLES_PER_BIAS_TYPE = 10
 
 # Configurações do dataset original no Hugging Face.
@@ -20,15 +20,13 @@ DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 
-# Mapeamento para converter os labels numéricos de volta para texto
-LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 
 # --- 2. FUNÇÃO PRINCIPAL ---
 
 def generate_evaluation_csv():
     """
     Função principal para carregar os dados, criar os mapas de correspondência,
-    selecionar as amostras e gerar o arquivo CSV.
+    selecionar as amostras corretamente e gerar o arquivo CSV.
     """
     print("🚀 Iniciando a geração do arquivo CSV de amostra para avaliação.")
 
@@ -36,12 +34,13 @@ def generate_evaluation_csv():
     print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
     try:
         with open(TRANSLATED_FILE, 'r', encoding='utf-8') as f:
+            # Acessa a chave 'data' na estrutura do arquivo
             translated_data = json.load(f)['data']
     except FileNotFoundError:
         print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
         return
-    except json.JSONDecodeError as e:
-        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Erro: {e}")
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Verifique se ele contém a chave 'data'. Erro: {e}")
         return
         
     # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
@@ -53,71 +52,77 @@ def generate_evaluation_csv():
         en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         for example in en_dataset:
             en_context_map[example['id']] = example['context']
-            sentence_ids = example['sentences']['id']
-            sentence_texts = example['sentences']['sentence']
-            for i in range(len(sentence_ids)):
-                en_sentence_map[sentence_ids[i]] = sentence_texts[i]
+            # Acessa a estrutura de dicionário de listas do dataset original
+            for i in range(len(example['sentences']['id'])):
+                sent_id = example['sentences']['id'][i]
+                sent_text = example['sentences']['sentence'][i]
+                en_sentence_map[sent_id] = sent_text
     
     print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
 
-    # --- Selecionando 10 amostras de cada categoria de viés ---
-    print(f"🔍 Selecionando {SAMPLES_PER_BIAS_TYPE} exemplos de cada categoria de viés...")
+    # --- INÍCIO DA CORREÇÃO 1: LÓGICA DE AMOSTRAGEM ---
+    # A amostragem agora é separada por 'task_type' para garantir a contagem correta.
+    print(f"🔍 Selecionando {SAMPLES_PER_BIAS_TYPE} exemplos de cada categoria de viés por tarefa...")
     
-    sampled_examples = defaultdict(list)
+    # Estrutura aninhada: { 'task_type': { 'bias_type': [lista_de_exemplos] } }
+    sampled_examples = defaultdict(lambda: defaultdict(list))
     
     for task_type in ['intrasentence', 'intersentence']:
-        for translated_example in tqdm(translated_data.get(task_type, []), desc=f"Processando {task_type}"):
+        for translated_example in translated_data.get(task_type, []):
             bias_type = translated_example['bias_type']
             
-            if len(sampled_examples[bias_type]) < SAMPLES_PER_BIAS_TYPE:
-                sampled_examples[bias_type].append(translated_example)
-
-    print(f"📦 Amostras selecionadas para as categorias: {list(sampled_examples.keys())}")
+            # Adiciona à amostra APENAS se tivermos menos de 10 para esta tarefa E este tipo de viés
+            if len(sampled_examples[task_type][bias_type]) < SAMPLES_PER_BIAS_TYPE:
+                sampled_examples[task_type][bias_type].append(translated_example)
+    # --- FIM DA CORREÇÃO 1 ---
 
     # --- Montando as linhas do CSV com dados em Inglês e Português ---
     print("✍️ Montando o arquivo CSV com dados lado a lado...")
     csv_rows = []
-    for bias_type, examples in sampled_examples.items():
-        for example in examples:
-            example_id = example['id']
-            task_type = 'intrasentence' if any(ex['id'] == example_id for ex in translated_data.get('intrasentence', [])) else 'intersentence'
-            context_en = en_context_map.get(example_id, "N/A")
-            
-            # --- INÍCIO DA CORREÇÃO ---
-            # Acessa o dicionário de listas paralelas
-            sentences_data = example['sentences']
-            sent_ids = sentences_data['id']
-            sent_texts_pt = sentences_data['sentence']
-            sent_gold_labels = sentences_data['gold_label']
-
-            # Itera sobre as listas usando um índice para "desfazer" a estrutura paralela
-            for i in range(len(sent_ids)):
-                sentence_id = sent_ids[i]
-                sentence_pt = sent_texts_pt[i]
-                gold_label_int = sent_gold_labels[i]
+    
+    # Itera sobre a estrutura de amostragem corrigida
+    for task_type, bias_types_dict in sampled_examples.items():
+        print(f"\n--- Tarefa: {task_type} ---")
+        total_task_samples = 0
+        for bias_type, examples in bias_types_dict.items():
+            print(f"  - Categoria '{bias_type}': {len(examples)} exemplos selecionados.")
+            total_task_samples += len(examples)
+            for example in examples:
+                example_id = example['id']
+                context_en = en_context_map.get(example_id, "N/A")
                 
-                sentence_en = en_sentence_map.get(sentence_id, "N/A")
+                # --- INÍCIO DA CORREÇÃO 2: LÓGICA DE LEITURA DOS DADOS ---
+                # O loop agora itera sobre a 'lista de dicionários', que é a estrutura correta do arquivo.
+                for sentence_obj in example['sentences']:
+                    sentence_id = sentence_obj['id']
+                    sentence_pt = sentence_obj['sentence']
+                    
+                    # O 'gold_label' já é texto no arquivo final, não precisa de conversão.
+                    gold_label_str = sentence_obj['gold_label']
+                    
+                    sentence_en = en_sentence_map.get(sentence_id, "N/A")
 
-                row = {
-                    'task_type': task_type,
-                    'bias_type': bias_type,
-                    'example_id': example_id,
-                    'context_en': context_en,
-                    'context_pt': example['context'],
-                    'sentence_id': sentence_id,
-                    'sentence_en': sentence_en,
-                    'sentence_pt': sentence_pt,
-                    'gold_label': LABEL_MAP.get(gold_label_int, "N/A") # Converte o número para texto
-                }
-                csv_rows.append(row)
-            # --- FIM DA CORREÇÃO ---
+                    row = {
+                        'task_type': task_type,
+                        'bias_type': bias_type,
+                        'example_id': example_id,
+                        'context_en': context_en,
+                        'context_pt': example['context'],
+                        'sentence_id': sentence_id,
+                        'sentence_en': sentence_en,
+                        'sentence_pt': sentence_pt,
+                        'gold_label': gold_label_str
+                    }
+                    csv_rows.append(row)
+                # --- FIM DA CORREÇÃO 2 ---
+        print(f"  Total para {task_type}: {total_task_samples} contextos.")
 
     # --- Salvando o arquivo CSV ---
     if not csv_rows:
         print("⚠️ Nenhuma amostra foi gerada. Verifique os arquivos de entrada.")
         return
 
-    print(f"💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
+    print(f"\n💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
     
     headers = [
         'task_type', 'bias_type', 'example_id', 
