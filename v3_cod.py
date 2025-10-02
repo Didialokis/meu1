@@ -1,3 +1,145 @@
+
+
+import json
+import csv
+from datasets import load_dataset
+from tqdm import tqdm
+
+# --- 1. CONFIGURAÇÕES ---
+
+# ATENÇÃO: Verifique se este é o nome do arquivo gerado pelo seu último script de tradução
+# O script deve ser o que gera o arquivo no formato original e completo.
+TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json' 
+
+# Nome do arquivo CSV de saída que será gerado.
+OUTPUT_CSV_FILE = 'avaliacao_completa.csv'
+
+# Configurações do dataset original no Hugging Face.
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
+
+
+# --- 2. FUNÇÃO PRINCIPAL ---
+
+def generate_full_evaluation_csv():
+    """
+    Função principal para carregar os dados originais e traduzidos,
+    combiná-los e gerar um único arquivo CSV com todo o conteúdo.
+    """
+    print("🚀 Iniciando a geração do arquivo CSV completo para avaliação.")
+
+    # --- Carregando o dataset traduzido (Português) ---
+    print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
+    try:
+        with open(TRANSLATED_FILE, 'r', encoding='utf-8') as f:
+            # Acessa os dados dentro da chave "data"
+            translated_data = json.load(f)['data']
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
+        return
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Verifique se o arquivo tem a estrutura correta com a chave 'data'. Erro: {e}")
+        return
+        
+    # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
+    print("📚 Baixando o dataset original em Inglês para comparação...")
+    en_context_map = {}  # Mapeia example_id -> contexto em inglês
+    en_sentence_map = {} # Mapeia sentence_id -> sentença em inglês
+
+    for config in CONFIGS:
+        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        for example in en_dataset:
+            en_context_map[example['id']] = example['context']
+            # Para o dataset original do HF, a estrutura é de listas paralelas
+            sentence_ids = example['sentences']['id']
+            sentence_texts = example['sentences']['sentence']
+            for i in range(len(sentence_ids)):
+                en_sentence_map[sentence_ids[i]] = sentence_texts[i]
+    
+    print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
+
+    # --- Montando as linhas do CSV com dados em Inglês e Português ---
+    print("✍️  Montando o arquivo CSV com todos os dados lado a lado...")
+    csv_rows = []
+    
+    for task_type in ['intrasentence', 'intersentence']:
+        # Itera sobre TODOS os exemplos, sem amostragem
+        for translated_example in tqdm(translated_data.get(task_type, []), desc=f"Processando {task_type}"):
+            example_id = translated_example['id']
+            bias_type = translated_example['bias_type']
+            
+            # Busca o contexto original em inglês usando o ID do exemplo
+            context_en = en_context_map.get(example_id, "N/A")
+            
+            # --- LÓGICA CORRIGIDA ---
+            # Itera sobre a lista de dicionários de sentenças, que é a estrutura correta do arquivo traduzido
+            for sentence_obj in translated_example['sentences']:
+                sentence_id = sentence_obj['id']
+                
+                # Busca a sentença original em inglês usando o ID da sentença
+                sentence_en = en_sentence_map.get(sentence_id, "N/A")
+
+                # Monta uma linha (dicionário) para o CSV
+                row = {
+                    'task_type': task_type,
+                    'bias_type': bias_type,
+                    'example_id': example_id,
+                    'context_en': context_en,
+                    'context_pt': translated_example['context'],
+                    'sentence_id': sentence_id,
+                    'sentence_en': sentence_en,
+                    'sentence_pt': sentence_obj['sentence'],
+                    'gold_label': sentence_obj['gold_label'] # O label já está em formato de texto
+                }
+                csv_rows.append(row)
+
+    # --- Salvando o arquivo CSV ---
+    if not csv_rows:
+        print("⚠️ Nenhuma linha foi gerada para o CSV. Verifique os arquivos de entrada.")
+        return
+
+    print(f"💾 Salvando {len(csv_rows)} linhas no arquivo '{OUTPUT_CSV_FILE}'...")
+    
+    headers = [
+        'task_type', 'bias_type', 'example_id', 
+        'context_en', 'context_pt', 'sentence_id', 
+        'sentence_en', 'sentence_pt', 'gold_label'
+    ]
+
+    with open(OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    print(f"\n🎉 Arquivo '{OUTPUT_CSV_FILE}' gerado com sucesso!")
+
+
+# --- 3. EXECUÇÃO ---
+
+if __name__ == "__main__":
+    generate_full_evaluation_csv()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////
 import json
 import csv
 from datasets import load_dataset
