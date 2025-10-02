@@ -129,17 +129,16 @@ from tqdm import tqdm
 
 # --- 1. CONFIGURAÇÕES ---
 
-# Arquivo JSON traduzido, gerado pelo script de tradução final
+# ATENÇÃO: Verifique se este é o nome do arquivo gerado pelo seu script de tradução final
 TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json' 
 
-# Nomes dos arquivos de saída
-FULL_OUTPUT_CSV = 'avaliacao_completa.csv'
-SAMPLED_OUTPUT_CSV = 'amostra_aleatoria_avaliacao.csv'
+# Nome do arquivo CSV de saída que será gerado.
+OUTPUT_CSV_FILE = 'amostra_avaliacao_aleatoria.csv'
 
-# Quantos exemplos (contextos) selecionar aleatoriamente para cada categoria de viés
+# Quantos exemplos (contextos) ALEATÓRIOS selecionar para cada categoria de viés.
 SAMPLES_PER_BIAS_TYPE = 10
 
-# Configurações do dataset original no Hugging Face
+# Configurações do dataset original no Hugging Face.
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
@@ -147,14 +146,12 @@ DATASET_SPLIT = "validation"
 
 # --- 2. FUNÇÃO PRINCIPAL ---
 
-def generate_csv_outputs():
+def generate_random_evaluation_csv():
     """
-    Função principal que:
-    1. Carrega os dados em português e inglês.
-    2. Gera um CSV com a conversão completa.
-    3. Gera um segundo CSV com uma amostra aleatória.
+    Função principal para carregar os dados, selecionar amostras aleatórias
+    corretamente e gerar o arquivo CSV com comparação lado a lado.
     """
-    print("🚀 Iniciando a geração dos arquivos CSV.")
+    print("🚀 Iniciando a geração do arquivo CSV com amostragem aleatória.")
 
     # --- Carregando o dataset traduzido (Português) ---
     print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
@@ -163,6 +160,9 @@ def generate_csv_outputs():
             translated_data = json.load(f)['data']
     except FileNotFoundError:
         print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
+        return
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Verifique o formato. Erro: {e}")
         return
         
     # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
@@ -174,89 +174,89 @@ def generate_csv_outputs():
         en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         for example in en_dataset:
             en_context_map[example['id']] = example['context']
-            # CORREÇÃO: Itera sobre a lista de dicionários, que é a estrutura correta
-            for sentence_obj in example['sentences']:
-                en_sentence_map[sentence_obj['id']] = sentence_obj['sentence']
+            # Acessa a estrutura aninhada do dataset original do HF
+            for i in range(len(example['sentences']['id'])):
+                sent_id = example['sentences']['id'][i]
+                sent_text = example['sentences']['sentence'][i]
+                en_sentence_map[sent_id] = sent_text
     
     print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
 
-    # --- Processando dados e agrupando para amostragem ---
-    all_csv_rows = []
-    examples_by_bias_type = defaultdict(lambda: defaultdict(list))
-
-    print("🧩 Processando e combinando dados de tradução...")
+    # --- Agrupando todos os exemplos por tarefa e tipo de viés ---
+    print("🔍 Agrupando todos os exemplos antes da amostragem...")
+    all_examples_by_group = defaultdict(lambda: defaultdict(list))
     for task_type in ['intrasentence', 'intersentence']:
         for translated_example in translated_data.get(task_type, []):
-            example_id = translated_example['id']
             bias_type = translated_example['bias_type']
-            
-            # Agrupa o exemplo completo para a amostragem posterior
-            examples_by_bias_type[task_type][bias_type].append(translated_example)
-            
-            context_en = en_context_map.get(example_id, "N/A")
-            
-            for sentence_obj in translated_example['sentences']:
-                sentence_id = sentence_obj['id']
-                sentence_en = en_sentence_map.get(sentence_id, "N/A")
-                row = {
-                    'task_type': task_type, 'bias_type': bias_type, 'example_id': example_id,
-                    'context_en': context_en, 'context_pt': translated_example['context'],
-                    'sentence_id': sentence_id, 'sentence_en': sentence_en,
-                    'sentence_pt': sentence_obj['sentence'], 'gold_label': sentence_obj['gold_label']
-                }
-                all_csv_rows.append(row)
+            all_examples_by_group[task_type][bias_type].append(translated_example)
 
-    # --- Salvando o arquivo CSV COMPLETO ---
-    print(f"\n💾 Salvando a conversão completa ({len(all_csv_rows)} linhas) em '{FULL_OUTPUT_CSV}'...")
-    headers = list(all_csv_rows[0].keys())
-    with open(FULL_OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(all_csv_rows)
-    print(f"✅ Arquivo '{FULL_OUTPUT_CSV}' gerado com sucesso!")
-
-    # --- Gerando a AMOSTRA ALEATÓRIA ---
-    print("\n🎲 Gerando amostra aleatória...")
-    sampled_csv_rows = []
-    for task_type, bias_types_dict in examples_by_bias_type.items():
-        for bias_type, example_list in bias_types_dict.items():
-            # Seleciona aleatoriamente N exemplos (ou menos, se não houver N)
-            num_to_sample = min(SAMPLES_PER_BIAS_TYPE, len(example_list))
-            random_sample = random.sample(example_list, num_to_sample)
+    # --- Montando as linhas do CSV a partir de uma amostra aleatória ---
+    print("✍️ Selecionando amostras aleatórias e montando o arquivo CSV...")
+    csv_rows = []
+    
+    # Itera sobre os grupos para realizar a amostragem aleatória
+    for task_type, bias_types_dict in all_examples_by_group.items():
+        print(f"\n--- Tarefa: {task_type} ---")
+        total_task_samples = 0
+        for bias_type, examples_list in bias_types_dict.items():
             
-            # Processa apenas os exemplos da amostra aleatória
-            for example in random_sample:
+            # Define o número de amostras a pegar (o mínimo entre 10 e o total disponível)
+            num_to_sample = min(SAMPLES_PER_BIAS_TYPE, len(examples_list))
+            
+            print(f"  - Categoria '{bias_type}': {len(examples_list)} exemplos disponíveis, selecionando {num_to_sample} aleatoriamente.")
+            total_task_samples += num_to_sample
+            
+            # Seleciona 'k' exemplos aleatórios da lista
+            random_samples = random.sample(examples_list, k=num_to_sample)
+            
+            # Processa cada exemplo da amostra aleatória para criar as linhas do CSV
+            for example in random_samples:
                 example_id = example['id']
                 context_en = en_context_map.get(example_id, "N/A")
+                
                 for sentence_obj in example['sentences']:
                     sentence_id = sentence_obj['id']
                     sentence_en = en_sentence_map.get(sentence_id, "N/A")
-                    row = {
-                        'task_type': task_type, 'bias_type': bias_type, 'example_id': example_id,
-                        'context_en': context_en, 'context_pt': example['context'],
-                        'sentence_id': sentence_id, 'sentence_en': sentence_en,
-                        'sentence_pt': sentence_obj['sentence'], 'gold_label': sentence_obj['gold_label']
-                    }
-                    sampled_csv_rows.append(row)
 
-    # --- Salvando o arquivo CSV da AMOSTRA ---
-    if not sampled_csv_rows:
-        print("⚠️ Nenhuma amostra aleatória foi gerada.")
+                    row = {
+                        'task_type': task_type,
+                        'bias_type': bias_type,
+                        'example_id': example_id,
+                        'context_en': context_en,
+                        'context_pt': example['context'],
+                        'sentence_id': sentence_id,
+                        'sentence_en': sentence_en,
+                        'sentence_pt': sentence_obj['sentence'],
+                        'gold_label': sentence_obj['gold_label']
+                    }
+                    csv_rows.append(row)
+        print(f"  Total de contextos para {task_type}: {total_task_samples}")
+
+    # --- Salvando o arquivo CSV ---
+    if not csv_rows:
+        print("⚠️ Nenhuma amostra foi gerada. Verifique os arquivos de entrada.")
         return
 
-    print(f"💾 Salvando a amostra aleatória ({len(sampled_csv_rows)} linhas) em '{SAMPLED_OUTPUT_CSV}'...")
-    with open(SAMPLED_OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+    print(f"\n💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
+    
+    headers = [
+        'task_type', 'bias_type', 'example_id', 
+        'context_en', 'context_pt', 'sentence_id', 
+        'sentence_en', 'sentence_pt', 'gold_label'
+    ]
+
+    with open(OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(sampled_csv_rows)
-    print(f"✅ Arquivo '{SAMPLED_OUTPUT_CSV}' gerado com sucesso!")
-    
-    print("\n🎉 Processo concluído!")
+        writer.writerows(csv_rows)
+
+    print(f"\n🎉 Arquivo '{OUTPUT_CSV_FILE}' gerado com sucesso!")
 
 
 # --- 3. EXECUÇÃO ---
+
 if __name__ == "__main__":
-    generate_csv_outputs()
+    generate_random_evaluation_csv()
 
 
 
