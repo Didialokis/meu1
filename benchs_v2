@@ -47,12 +47,24 @@ def generate_evaluation_csv():
     en_context_map = {}  # Mapeia example_id -> contexto em inglês
     en_sentence_map = {} # Mapeia sentence_id -> sentença em inglês
 
-    for config in CONFIGS:
-        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-        for example in en_dataset:
-            en_context_map[example['id']] = example['context']
-            for sentence_obj in example['sentences']:
-                en_sentence_map[sentence_obj['id']] = sentence_obj['sentence']
+    # --- Trecho de código corrigido e mais seguro ---
+for config in CONFIGS:
+    en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+    for example in en_dataset:
+        en_context_map[example['id']] = example['context']
+        for sentence_obj in example['sentences']:
+            # ADICIONAMOS UMA VERIFICAÇÃO AQUI
+            if isinstance(sentence_obj, dict):
+                # Este código só será executado se sentence_obj for um dicionário
+                sentence_id = sentence_obj.get('id')
+                sentence_text = sentence_obj.get('sentence')
+                
+                # Verificação adicional para garantir que as chaves existem
+                if sentence_id and sentence_text:
+                    en_sentence_map[sentence_id] = sentence_text
+            # else:
+                # Opcional: Imprimir um aviso se o formato for inesperado
+                # print(f"Aviso: formato de 'sentence_obj' inesperado e ignorado: {sentence_obj}")
     
     print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
 
