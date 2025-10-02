@@ -86,7 +86,8 @@ def generate_evaluation_csv():
     for bias_type, examples in sampled_examples.items():
         for example in examples:
             example_id = example['id']
-            task_type = 'intrasentence' if example in translated_data.get('intrasentence', []) else 'intersentence'
+            # Determina o task_type baseado em qual lista o exemplo foi encontrado
+            task_type = 'intrasentence' if any(ex['id'] == example_id for ex in translated_data.get('intrasentence', [])) else 'intersentence'
             
             context_en = en_context_map.get(example_id, "N/A")
             
