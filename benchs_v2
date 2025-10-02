@@ -1,432 +1,133 @@
-# --- Bloco 1: Imports Essenciais ---
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import datasets
-import tokenizers # Importado para tokenizers.__version__
-from tokenizers import ByteLevelBPETokenizer
-from tokenizers.processors import BertProcessing
-from tqdm.auto import tqdm # Para barras de progresso
-import random
-from pathlib import Path
-import sys
-from sklearn.metrics import accuracy_score, f1_score, classification_report
-from seqeval.metrics import classification_report as seqeval_classification_report
-from seqeval.scheme import IOB2 # Para avaliação NER com IOB2
+import json
+import csv
+from datasets import load_dataset
+from collections import defaultdict
+from tqdm import tqdm
 
-print(f"PyTorch: {torch.__version__}")
-print(f"Datasets: {datasets.__version__}")
-print(f"Tokenizers: {tokenizers.__version__}")
-# import seqeval # Para imprimir a versão, se desejar
-# print(f"Seqeval: {seqeval.__version__}")
-# import sklearn
-# print(f"Scikit-learn: {sklearn.__version__}")
+# --- 1. CONFIGURAÇÕES ---
 
-# --- Bloco 2: Constantes e Configurações Principais ---
-# Configurações Gerais e de Pré-treinamento MLM
-MAX_LEN = 128  # Comprimento máximo da sequência
-AROEIRA_SUBSET_SIZE = 5000  # Subconjunto do Aroeira. None para completo (CUIDADO COM RAM!)
-VOCAB_SIZE = 30000  # Tamanho do vocabulário do tokenizador
-MIN_FREQUENCY_TOKENIZER = 2 # Frequência mínima para tokens
+# Arquivo JSON traduzido que você gerou com o script de tradução.
+TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json'
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-EPOCHS_PRETRAIN = 1 # Épocas para pré-treinamento MLM (baixo para exemplo)
-BATCH_SIZE_PRETRAIN = 8 # Batch size para pré-treinamento MLM
+# Nome do arquivo CSV de saída que será gerado.
+OUTPUT_CSV_FILE = 'amostra_avaliacao.csv'
 
-# Arquitetura do Modelo BERT (menor para exemplo)
-MODEL_HIDDEN_SIZE = 256
-MODEL_NUM_LAYERS = 2
-MODEL_NUM_ATTENTION_HEADS = 4
-MODEL_INTERMEDIATE_SIZE = MODEL_HIDDEN_SIZE * 4 # Típico 4x hidden_size
+# Quantos exemplos selecionar para cada categoria de viés.
+SAMPLES_PER_BIAS_TYPE = 10
 
-# Nomes de Arquivos (no diretório atual)
-TOKENIZER_VOCAB_FILENAME = "aroeira_final_tokenizer-vocab.json"
-TOKENIZER_MERGES_FILENAME = "aroeira_final_tokenizer-merges.txt"
-PRETRAINED_BERTLM_SAVE_FILENAME = "aroeira_bertlm_pretrained_final.pth"
-TEMP_TOKENIZER_TRAIN_FILE = Path("temp_aroeira_for_tokenizer_final.txt")
+# Configurações do dataset original no Hugging Face.
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
 
-# Constantes para Fine-tuning (globais, podem ser sobrescritas por benchmark)
-FINETUNE_EPOCHS = 2
-FINETUNE_BATCH_SIZE = 8
-FINETUNE_LR = 3e-5
 
-print(f"Usando dispositivo: {DEVICE}")
-print(f"Subconjunto Aroeira (Pré-Treino): {AROEIRA_SUBSET_SIZE if AROEIRA_SUBSET_SIZE is not None else 'Completo'}")
-print(f"Modelo: Hidden={MODEL_HIDDEN_SIZE}, Layers={MODEL_NUM_LAYERS}, Heads={MODEL_NUM_ATTENTION_HEADS}")
+# --- 2. FUNÇÃO PRINCIPAL ---
 
-# --- Bloco 3: Carregando e Pré-processando o Corpus Aroeira (Streaming) ---
-print("\n--- Bloco 3: Carregando e Pré-processando Dados do Aroeira ---")
-all_aroeira_sentences = []
-try:
-    print("Carregando dataset Aroeira (modo streaming)...")
-    streamed_aroeira_dataset = datasets.load_dataset("Itau-Unibanco/aroeira",split="train",streaming=True,trust_remote_code=True)
-    text_column_name = "text"
+def generate_evaluation_csv():
+    """
+    Função principal para carregar os dados, criar os mapas de correspondência,
+    selecionar as amostras e gerar o arquivo CSV.
+    """
+    print("🚀 Iniciando a geração do arquivo CSV de amostra para avaliação.")
 
-    aroeira_examples_collected = []
-    if AROEIRA_SUBSET_SIZE is not None:
-        stream_iterator = iter(streamed_aroeira_dataset)
-        print(f"Coletando {AROEIRA_SUBSET_SIZE} exemplos do Aroeira stream...")
-        try:
-            for _ in range(AROEIRA_SUBSET_SIZE): aroeira_examples_collected.append(next(stream_iterator))
-        except StopIteration: print(f"Alerta: Stream Aroeira esgotado. Coletados {len(aroeira_examples_collected)}.")
-        source_for_sentences = aroeira_examples_collected
-        desc_tqdm = "Extraindo sentenças Aroeira (subconjunto)"
-    else:
-        source_for_sentences = streamed_aroeira_dataset
-        desc_tqdm = "Extraindo sentenças Aroeira (stream completo)"
-        print("AVISO: Processando stream completo do Aroeira. Isso pode consumir muita RAM para 'all_aroeira_sentences'.")
-
-    # ATENÇÃO tqdm: Se ocorrer erro "'module' object is not callable" aqui,
-    # verifique se 'tqdm' foi sobrescrito ou reinicie o kernel do notebook e execute as células em ordem.
-    # Adicionar file=sys.stdout e total=len(...) pode ajudar na exibição em alguns ambientes.
-    tqdm_total = len(source_for_sentences) if AROEIRA_SUBSET_SIZE is not None else None
-    for example in tqdm(source_for_sentences, total=tqdm_total, desc=desc_tqdm, file=sys.stdout):
-        sentence = example.get(text_column_name)
-        if isinstance(sentence, str) and sentence.strip(): all_aroeira_sentences.append(sentence.strip())
-
-    if not all_aroeira_sentences: raise ValueError("Nenhuma sentença Aroeira foi extraída.")
-    print(f"Total de sentenças Aroeira extraídas: {len(all_aroeira_sentences)}")
-
-    if TEMP_TOKENIZER_TRAIN_FILE.exists(): TEMP_TOKENIZER_TRAIN_FILE.unlink()
-    with open(TEMP_TOKENIZER_TRAIN_FILE, "w", encoding="utf-8") as fp:
-        for sentence in all_aroeira_sentences: fp.write(sentence + "\n")
-    tokenizer_train_files_list = [str(TEMP_TOKENIZER_TRAIN_FILE)]
-    print(f"Arquivo temporário para tokenizador: {tokenizer_train_files_list[0]}")
-except Exception as e: print(f"Erro Bloco 3: {e}"); import traceback; traceback.print_exc(); raise
-
-# --- Bloco 4: Treinando o Tokenizador ByteLevelBPE ---
-print("\n--- Bloco 4: Treinando o Tokenizador ---")
-if not Path(TOKENIZER_VOCAB_FILENAME).exists() or not Path(TOKENIZER_MERGES_FILENAME).exists():
-    if not tokenizer_train_files_list or not Path(tokenizer_train_files_list[0]).exists():
-        raise FileNotFoundError("Arquivo de treino para tokenizador não encontrado.")
-    tokenizer_save_prefix = TOKENIZER_VOCAB_FILENAME.replace("-vocab.json", "")
-    custom_tokenizer = ByteLevelBPETokenizer()
-    print(f"Treinando tokenizador com {tokenizer_train_files_list}...")
-    custom_tokenizer.train(files=tokenizer_train_files_list, vocab_size=VOCAB_SIZE, min_frequency=MIN_FREQUENCY_TOKENIZER, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
-    custom_tokenizer.save_model(".", prefix=tokenizer_save_prefix) # Salva no diretório atual
-    print(f"Tokenizador treinado e salvo como '{TOKENIZER_VOCAB_FILENAME}' e '{TOKENIZER_MERGES_FILENAME}'.")
-else: print(f"Tokenizador já existe ('{TOKENIZER_VOCAB_FILENAME}', '{TOKENIZER_MERGES_FILENAME}'). Carregando...")
-
-tokenizer = ByteLevelBPETokenizer(vocab=TOKENIZER_VOCAB_FILENAME, merges=TOKENIZER_MERGES_FILENAME)
-tokenizer._tokenizer.post_processor = BertProcessing(("</s>", tokenizer.token_to_id("</s>")), ("<s>", tokenizer.token_to_id("<s>")))
-tokenizer.enable_truncation(max_length=MAX_LEN)
-tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<pad>"), pad_token="<pad>", length=MAX_LEN)
-PAD_TOKEN_ID = tokenizer.token_to_id("<pad>")
-print(f"Tamanho do vocabulário do Tokenizador: {tokenizer.get_vocab_size()}")
-
-# --- Bloco 5: Definição do BERTMLMDataset ---
-print("\n--- Bloco 5: Definindo o Dataset para MLM ---")
-class BERTMLMDataset(Dataset):
-    def __init__(self, sentences, tokenizer, max_len):
-        self.sentences, self.tokenizer, self.max_len = sentences, tokenizer, max_len
-        self.vocab_size = tokenizer.get_vocab_size()
-        self.mask_id = tokenizer.token_to_id("<mask>"); self.cls_id = tokenizer.token_to_id("<s>")
-        self.sep_id = tokenizer.token_to_id("</s>"); self.pad_id = PAD_TOKEN_ID
-    def __len__(self): return len(self.sentences)
-    def _mask_tokens(self, ids_orig):
-        inputs, labels = list(ids_orig), list(ids_orig)
-        for i, token_id in enumerate(inputs):
-            if token_id in [self.cls_id, self.sep_id, self.pad_id]: labels[i] = self.pad_id; continue
-            if random.random() < 0.15:
-                act_prob = random.random()
-                if act_prob < 0.8: inputs[i] = self.mask_id
-                elif act_prob < 0.9: inputs[i] = random.randrange(self.vocab_size)
-            else: labels[i] = self.pad_id
-        return torch.tensor(inputs), torch.tensor(labels)
-    def __getitem__(self, idx):
-        enc = self.tokenizer.encode(self.sentences[idx])
-        masked_ids, mlm_labels = self._mask_tokens(enc.ids)
-        return {"input_ids": masked_ids, "attention_mask": torch.tensor(enc.attention_mask, dtype=torch.long), 
-                "segment_ids": torch.zeros_like(masked_ids, dtype=torch.long), "labels": mlm_labels}
-
-# --- Bloco 6: Definição do Modelo BERT (Backbone e Modelo MLM) ---
-print("\n--- Bloco 6: Definindo o Modelo BERT ---")
-class BERTEmbedding(nn.Module):
-    def __init__(self, vocab_size, hidden_size, max_len, dropout_prob, pad_token_id):
-        super().__init__(); self.tok_emb = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
-        self.seg_emb = nn.Embedding(2, hidden_size); self.pos_emb = nn.Embedding(max_len, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size, eps=1e-12); self.drop = nn.Dropout(dropout_prob)
-        self.register_buffer("pos_ids", torch.arange(max_len).expand((1, -1)))
-    def forward(self, input_ids, segment_ids):
-        seq_len = input_ids.size(1); tok_e, seg_e = self.tok_emb(input_ids), self.seg_emb(segment_ids)
-        pos_e = self.pos_emb(self.pos_ids[:, :seq_len])
-        return self.drop(self.norm(tok_e + pos_e + seg_e))
-
-class BERTBaseModel(nn.Module):
-    def __init__(self, vocab_size, hidden_size, num_layers, num_heads, intermediate_size, max_len_config, pad_token_id, dropout_prob=0.1):
-        super().__init__()
-        self.emb = BERTEmbedding(vocab_size, hidden_size, max_len_config, dropout_prob, pad_token_id)
-        enc_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dim_feedforward=intermediate_size, 
-                                             dropout=dropout_prob, activation='gelu', batch_first=True)
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-    def forward(self, input_ids, attention_mask, segment_ids):
-        x = self.emb(input_ids, segment_ids)
-        return self.enc(x, src_key_padding_mask=(attention_mask == 0))
-
-class BERTLM(nn.Module):
-    def __init__(self, bert_base: BERTBaseModel, vocab_size, hidden_size):
-        super().__init__(); self.bert_base = bert_base
-        self.mlm_head = nn.Linear(hidden_size, vocab_size)
-    def forward(self, input_ids, attention_mask, segment_ids):
-        return self.mlm_head(self.bert_base(input_ids, attention_mask, segment_ids))
-
-# --- Bloco 7: Trainer Genérico ---
-print("\n--- Bloco 7: Definindo o Trainer Genérico ---")
-class GenericTrainer:
-    def __init__(self, model, train_dataloader, val_dataloader, optimizer, criterion, device, 
-                 model_save_path, task_type="mlm", vocab_size_for_loss=None, id2label=None, log_freq=20):
-        self.model, self.train_dl, self.val_dl = model.to(device), train_dataloader, val_dataloader
-        self.opt, self.crit, self.dev = optimizer, criterion, device
-        self.save_path = model_save_path
-        self.best_val_metric = float('inf') if task_type != "ner" else float('-inf') # Para NER, maior F1 é melhor
-        self.task_type, self.vocab_size, self.id2label = task_type, vocab_size_for_loss, id2label
-        self.log_freq = log_freq
-        if task_type == "ner" and id2label is None: raise ValueError("id2label é necessário para task_type='ner'")
-
-    def _run_epoch(self, epoch_num, is_training):
-        self.model.train(is_training); dl = self.train_dl if is_training else self.val_dl
-        if not dl: return None, {}
-        total_loss, all_preds_epoch, all_labels_epoch = 0, [], []
-        desc = f"Epoch {epoch_num+1} [{'Train' if is_training else 'Val'}] ({self.task_type})"
-        progress_bar = tqdm(dl, total=len(dl), desc=desc, file=sys.stdout)
-
-        for i_batch, batch in enumerate(progress_bar):
-            input_ids = batch["input_ids"].to(self.dev); attention_mask = batch["attention_mask"].to(self.dev)
-            segment_ids = batch.get("segment_ids", torch.zeros_like(input_ids)).to(self.dev)
-            labels = batch["labels"].to(self.dev)
-
-            if is_training: self.opt.zero_grad()
-            with torch.set_grad_enabled(is_training):
-                logits = self.model(input_ids, attention_mask, segment_ids)
-                if self.task_type in ["mlm", "ner"]:
-                    loss = self.crit(logits.view(-1, logits.size(-1)), labels.view(-1))
-                elif self.task_type == "nli":
-                    loss = self.crit(logits, labels)
-                else: loss = torch.tensor(0.0, device=self.dev) # Fallback
-            
-            if is_training: loss.backward(); self.opt.step()
-            total_loss += loss.item()
-            if (i_batch + 1) % self.log_freq == 0:
-                progress_bar.set_postfix({"loss": f"{total_loss / (i_batch + 1):.4f}"})
-
-            if not is_training:
-                if self.task_type == "nli":
-                    all_preds_epoch.extend(torch.argmax(logits, dim=-1).cpu().numpy())
-                    all_labels_epoch.extend(labels.cpu().numpy())
-                elif self.task_type == "ner":
-                    preds_ner = torch.argmax(logits, dim=-1).cpu().numpy()
-                    labels_ner = labels.cpu().numpy()
-                    for p_seq, l_seq, m_seq in zip(preds_ner, labels_ner, attention_mask.cpu().numpy()):
-                        all_preds_epoch.append([self.id2label[p] for p, l, m in zip(p_seq, l_seq, m_seq) if m == 1 and l != self.crit.ignore_index])
-                        all_labels_epoch.append([self.id2label[l] for l, m in zip(l_seq, m_seq) if m == 1 and l != self.crit.ignore_index])
+    # --- Carregando o dataset traduzido (Português) ---
+    print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
+    try:
+        with open(TRANSLATED_FILE, 'r', encoding='utf-8') as f:
+            translated_data = json.load(f)['data']
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
+        return
+    except json.JSONDecodeError as e:
+        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Erro: {e}")
+        return
         
-        avg_loss = total_loss / len(dl)
-        metrics = {"loss": avg_loss}
-        if not is_training:
-            if self.task_type == "nli" and all_labels_epoch:
-                metrics["accuracy"] = accuracy_score(all_labels_epoch, all_preds_epoch)
-                metrics["f1_w"] = f1_score(all_labels_epoch, all_preds_epoch, average='weighted', zero_division=0)
-            elif self.task_type == "ner" and all_labels_epoch:
-                preds_filt = [p for p in all_preds_epoch if p]; labels_filt = [l for l in all_labels_epoch if l]
-                if preds_filt and labels_filt:
-                    try: # Adicionado try-except para problemas com seqeval em listas vazias
-                        report = seqeval_classification_report(labels_filt, preds_filt, output_dict=True, zero_division=0, mode='strict', scheme=IOB2)
-                        metrics["f1_ner"] = report['micro avg']['f1-score']
-                    except Exception as e_seqeval: print(f"Erro no cálculo de métricas NER com seqeval: {e_seqeval}")
+    # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
+    print("📚 Baixando o dataset original em Inglês para comparação...")
+    en_context_map = {}  # Mapeia example_id -> contexto em inglês
+    en_sentence_map = {} # Mapeia sentence_id -> sentença em inglês
 
-        print_line = f"{desc} - Avg Loss: {avg_loss:.4f}"
-        for k, v in metrics.items():
-            if k != "loss": print_line += f", {k}: {v:.4f}"
-        print(print_line)
-        return avg_loss, metrics
-
-    def train(self, num_epochs):
-        metric_to_watch = "f1_ner" if self.task_type == "ner" else "loss"
-        print(f"Iniciando treinamento ({self.task_type}) por {num_epochs} épocas. Otimizando para '{metric_to_watch}'.")
-        for epoch in range(num_epochs):
-            self._run_epoch(epoch, is_training=True)
-            val_loss, val_metrics = self._run_epoch(epoch, is_training=False)
-            
-            current_metric_val = val_metrics.get(metric_to_watch) if val_metrics else None
-            if current_metric_val is not None:
-                improved = (current_metric_val < self.best_val_metric) if metric_to_watch == "loss" else \
-                           (current_metric_val > self.best_val_metric)
-                if improved:
-                    self.best_val_metric = current_metric_val
-                    print(f"Nova melhor métrica ({metric_to_watch}): {self.best_val_metric:.4f}. Salvando modelo em {self.save_path}")
-                    torch.save(self.model.state_dict(), self.save_path)
-            elif epoch == num_epochs - 1 and not self.val_dl: # Salva na última época se não houver validação
-                print(f"Treinamento ({self.task_type}) sem validação. Salvando modelo da última época em {self.save_path}")
-                torch.save(self.model.state_dict(), self.save_path)
-            print("-" * 30)
-        final_msg = f"Treinamento ({self.task_type}) concluído. Melhor métrica ({metric_to_watch}): {self.best_val_metric:.4f if self.best_val_metric != float('inf') and self.best_val_metric != float('-inf') else 'N/A'}"
-        if not self.val_dl and num_epochs > 0 : final_msg += f". Modelo final salvo em: {self.save_path}"
-        print(final_msg)
-
-
-# --- Bloco 8: Preparando e Executando o Pré-Treinamento MLM ---
-print("\n--- Bloco 8: Pré-Treinamento MLM ---")
-val_split_ratio_mlm = 0.1; num_val_mlm = int(len(all_aroeira_sentences) * val_split_ratio_mlm)
-if num_val_mlm < 1 and len(all_aroeira_sentences) > 1: num_val_mlm = 1
-train_sents_mlm = all_aroeira_sentences[num_val_mlm:]; val_sents_mlm = all_aroeira_sentences[:num_val_mlm]
-if not train_sents_mlm: train_sents_mlm = all_aroeira_sentences; val_sents_mlm = []
-
-train_ds_mlm = BERTMLMDataset(train_sents_mlm, tokenizer, max_len=MAX_LEN)
-train_dl_mlm = DataLoader(train_ds_mlm, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, num_workers=0)
-val_dl_mlm = None
-if val_sents_mlm:
-    val_ds_mlm = BERTMLMDataset(val_sents_mlm, tokenizer, max_len=MAX_LEN)
-    val_dl_mlm = DataLoader(val_ds_mlm, batch_size=BATCH_SIZE_PRETRAIN, shuffle=False, num_workers=0)
-
-bert_base_pt = BERTBaseModel(tokenizer.get_vocab_size(),MODEL_HIDDEN_SIZE,MODEL_NUM_LAYERS,MODEL_NUM_ATTENTION_HEADS,MODEL_INTERMEDIATE_SIZE,MAX_LEN,PAD_TOKEN_ID)
-bertlm_pt_model = BERTLM(bert_base_pt, tokenizer.get_vocab_size(), MODEL_HIDDEN_SIZE)
-opt_mlm = torch.optim.AdamW(bertlm_pt_model.parameters(), lr=LEARNING_RATE_PRETRAIN)
-crit_mlm = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-
-trainer_mlm = GenericTrainer(bertlm_pt_model, train_dl_mlm, val_dl_mlm, opt_mlm, crit_mlm, DEVICE, PRETRAINED_BERTLM_SAVE_FILENAME, "mlm", tokenizer.get_vocab_size())
-print("Componentes para pré-treinamento MLM prontos.")
-
-# --- Bloco 9: Executando o Pré-Treinamento MLM ---
-print("\n--- Bloco 9: Iniciando o Pré-Treinamento MLM ---")
-try:
-    trainer_mlm.train(num_epochs=EPOCHS_PRETRAIN)
-except Exception as e: print(f"Erro pré-treinamento MLM: {e}"); raise
-
-
-# --- Bloco 10: Fine-tuning e Avaliação no ASSIN (NLI/RTE) ---
-print("\n--- Bloco 10: Fine-tuning e Avaliação ASSIN (NLI/RTE) ---")
-ASSIN_NLI_MODEL_SAVE_FILENAME = "aroeira_assin_nli_model.pth"
-ASSIN_SUBSET_TRAIN = 500; ASSIN_SUBSET_VAL = 100
-
-class BERTForSequencePairClassification(nn.Module): # Definida aqui para encapsulamento do Bloco
-    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_classes):
-        super().__init__(); self.bert_base = bert_base; self.drop = nn.Dropout(0.1)
-        self.clf = nn.Linear(hidden_size, num_classes)
-    def forward(self, input_ids, attention_mask, segment_ids):
-        return self.clf(self.drop(self.bert_base(input_ids, attention_mask, segment_ids)[:, 0, :]))
-
-class ASSINNLIDataset(Dataset): # Definida aqui para encapsulamento do Bloco
-    def __init__(self, hf_ds, tokenizer, max_len):
-        self.tok, self.max_len = tokenizer, max_len; self.data = []
-        label_map = {"ENTAILMENT": 0, "NONE": 1, "PARAPHRASE": 2}; self.num_classes = 3
-        for ex in tqdm(hf_ds, desc="Processando ASSIN NLI", file=sys.stdout, mininterval=1.0):
-            p, h, j_val = ex.get("premise"), ex.get("hypothesis"), ex.get("entailment_judgment")
-            j_str = j_val if isinstance(j_val, str) else (hf_ds.features['entailment_judgment'].int2str(j_val) if isinstance(j_val, int) and hasattr(hf_ds, 'features') and 'entailment_judgment' in hf_ds.features else None)
-            if isinstance(p, str) and p.strip() and isinstance(h, str) and h.strip() and j_str in label_map:
-                self.data.append({"p": p.strip(), "h": h.strip(), "lbl": label_map[j_str]})
-        if not self.data and len(hf_ds) > 0: print("AVISO SÉRIO: Nenhum dado ASSIN NLI processado.")
-    def __len__(self): return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]; enc = self.tok.encode(item["p"], item["h"])
-        ids, seg_ids_list = enc.ids, [0]*len(enc.ids)
-        try:
-            sep_idx = ids.index(self.tok.token_to_id("</s>"),1)
-            for i in range(sep_idx + 1, len(ids)): 
-                if ids[i] != self.tok.token_to_id("<pad>"): seg_ids_list[i] = 1
-                else: break
-        except ValueError: pass
-        return {"input_ids": torch.tensor(ids), "attention_mask": torch.tensor(enc.attention_mask, dtype=torch.long),
-                "segment_ids": torch.tensor(seg_ids_list, dtype=torch.long), "labels": torch.tensor(item["lbl"], dtype=torch.long)}
-try:
-    assin_full = datasets.load_dataset("assin", name="ptbr", trust_remote_code=True)
-    raw_train_assin = assin_full["train"]; raw_val_assin = assin_full["validation"]
-    def filter_ej(ex): return ex.get('entailment_judgment') is not None # Assegura que a coluna existe
-    train_assin_ej = raw_train_assin.filter(filter_ej); val_assin_ej = raw_val_assin.filter(filter_ej)
-    train_assin_sub = train_assin_ej.select(range(min(ASSIN_SUBSET_TRAIN, len(train_assin_ej))))
-    val_assin_sub = val_assin_ej.select(range(min(ASSIN_SUBSET_VAL, len(val_assin_ej))))
-    print(f"ASSIN NLI Treino: {len(train_assin_sub)}, Val: {len(val_assin_sub)}")
-
-    if len(train_assin_sub) > 0:
-        ft_train_ds_nli = ASSINNLIDataset(train_assin_sub, tokenizer, MAX_LEN)
-        ft_train_dl_nli = DataLoader(ft_train_ds_nli, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
-        ft_val_dl_nli = None
-        if len(val_assin_sub) > 0:
-            ft_val_ds_nli = ASSINNLIDataset(val_assin_sub, tokenizer, MAX_LEN)
-            if len(ft_val_ds_nli) > 0: ft_val_dl_nli = DataLoader(ft_val_ds_nli, batch_size=FINETUNE_BATCH_SIZE, shuffle=False, num_workers=0)
-        
-        base_nli = BERTBaseModel(tokenizer.get_vocab_size(),MODEL_HIDDEN_SIZE,MODEL_NUM_LAYERS,MODEL_NUM_ATTENTION_HEADS,MODEL_INTERMEDIATE_SIZE,MAX_LEN,PAD_TOKEN_ID)
-        if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
-            state = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
-            base_state = {k.replace("bert_base.", ""):v for k,v in state.items() if k.startswith("bert_base.")}
-            if base_state: base_nli.load_state_dict(base_state); print("Backbone BERT carregado para NLI.")
-        
-        model_nli = BERTForSequencePairClassification(base_nli, MODEL_HIDDEN_SIZE, ft_train_ds_nli.num_classes).to(DEVICE)
-        opt_nli = torch.optim.AdamW(model_nli.parameters(), lr=FINETUNE_LR)
-        crit_nli = nn.CrossEntropyLoss()
-        trainer_nli = GenericTrainer(model_nli, ft_train_dl_nli, ft_val_dl_nli, opt_nli, crit_nli, DEVICE, ASSIN_NLI_MODEL_SAVE_FILENAME, "nli")
-        trainer_nli.train(num_epochs=FINETUNE_EPOCHS)
-    else: print("Nenhum dado de treino para ASSIN NLI. Pulando.")
-except Exception as e: print(f"Erro Bloco 10 (ASSIN NLI): {e}"); import traceback; traceback.print_exc()
-
-
-# --- Bloco 11: Fine-tuning e Avaliação no HAREM (NER) ---
-print("\n--- Bloco 11: Fine-tuning e Avaliação HAREM (NER) ---")
-HAREM_MODEL_SAVE_FILENAME = "aroeira_harem_ner_model.pth"
-HAREM_SUBSET_SIZE = 250
-PAD_TOKEN_LABEL_ID_NER = -100
-
-class BERTForTokenClassification(nn.Module): # Definida aqui para encapsulamento
-    def __init__(self, bert_base: BERTBaseModel, hidden_size, num_labels):
-        super().__init__(); self.bert_base = bert_base; self.drop = nn.Dropout(0.1)
-        self.clf = nn.Linear(hidden_size, num_labels)
-    def forward(self, input_ids, attention_mask, segment_ids):
-        return self.clf(self.drop(self.bert_base(input_ids, attention_mask, segment_ids)))
-
-class HAREMNERDataset(Dataset): # Definida aqui para encapsulamento
-    def __init__(self, hf_ds, tokenizer, id2label_map, max_len, pad_label_id):
-        self.tok, self.id2lbl, self.max_len, self.pad_lbl_id = tokenizer, id2label_map, max_len, pad_label_id
-        self.encs, self.lbls_aligned = [], []
-        proc_count, skip_count = 0,0
-        for i, ex in enumerate(tqdm(hf_ds, desc="Processando HAREM", file=sys.stdout, mininterval=1.0)):
-            orig_toks, orig_ner_ids = ex.get("tokens"), ex.get("ner_tags")
-            if not orig_toks or orig_ner_ids is None or len(orig_toks) != len(orig_ner_ids): skip_count+=1; continue
-            enc = self.tok.encode(" ".join(orig_toks)); word_ids = enc.word_ids; aligned_lbls = []
-            prev_word_idx = None; err_align = False
-            for word_idx in word_ids:
-                if word_idx is None: aligned_lbls.append(self.pad_lbl_id)
-                elif word_idx != prev_word_idx:
-                    if 0 <= word_idx < len(orig_ner_ids): aligned_lbls.append(orig_ner_ids[word_idx])
-                    else: aligned_lbls.append(self.pad_lbl_id); err_align=True; break
-                else: aligned_lbls.append(self.pad_lbl_id)
-                prev_word_idx = word_idx
-            if err_align or len(enc.ids) != len(aligned_lbls): skip_count+=1; continue
-            self.encs.append(enc); self.lbls_aligned.append(aligned_lbls); proc_count+=1
-        print(f"HAREM Dataset: {proc_count} processados, {skip_count} ignorados.")
-        if proc_count == 0 and len(hf_ds) > 0: print("AVISO SÉRIO: Nenhum dado HAREM processado.")
-    def __len__(self): return len(self.encs)
-    def __getitem__(self, idx):
-        enc, lbls = self.encs[idx], self.lbls_aligned[idx]
-        return {"input_ids":torch.tensor(enc.ids),"attention_mask":torch.tensor(enc.attention_mask,dtype=torch.long),
-                "segment_ids":torch.zeros(len(enc.ids),dtype=torch.long),"labels":torch.tensor(lbls,dtype=torch.long)}
-try:
-    harem_raw = datasets.load_dataset("harem", "selective", trust_remote_code=True)
-    ner_feat = harem_raw["train"].features["ner_tags"].feature
-    id2lbl_harem = {i:n for i,n in enumerate(ner_feat.names)}; NUM_NER_TAGS = len(id2lbl_harem)
-    print(f"HAREM Tags (primeiras 5 de {NUM_NER_TAGS}): {list(id2lbl_harem.items())[:5]}")
-    train_harem_full = harem_raw["train"]
-    train_harem_sub = train_harem_full
-    if HAREM_SUBSET_SIZE and len(train_harem_full) > HAREM_SUBSET_SIZE:
-        train_harem_sub = train_harem_full.select(range(HAREM_SUBSET_SIZE))
-    print(f"HAREM Treino (subset): {len(train_harem_sub)}")
+    for config in CONFIGS:
+        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        for example in en_dataset:
+            en_context_map[example['id']] = example['context']
+            for sentence_obj in example['sentences']:
+                en_sentence_map[sentence_obj['id']] = sentence_obj['sentence']
     
-    ft_train_ds_ner = HAREMNERDataset(train_harem_sub, tokenizer, id2lbl_harem, MAX_LEN, PAD_TOKEN_LABEL_ID_NER)
-    if len(ft_train_ds_ner) == 0: raise ValueError("Dataset HAREM vazio após processamento.")
-    ft_train_dl_ner = DataLoader(ft_train_ds_ner, batch_size=FINETUNE_BATCH_SIZE, shuffle=True, num_workers=0)
-    # Para HAREM selective, não há val split. Pode-se criar um a partir do train ou usar o test do 'total' config.
-    # Aqui, usaremos val_loader=None para simplicidade.
-    ft_val_dl_ner = None 
+    print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
 
-    base_ner = BERTBaseModel(tokenizer.get_vocab_size(),MODEL_HIDDEN_SIZE,MODEL_NUM_LAYERS,MODEL_NUM_ATTENTION_HEADS,MODEL_INTERMEDIATE_SIZE,MAX_LEN,PAD_TOKEN_ID)
-    if Path(PRETRAINED_BERTLM_SAVE_FILENAME).exists():
-        state = torch.load(PRETRAINED_BERTLM_SAVE_FILENAME, map_location=DEVICE)
-        base_state = {k.replace("bert_base.",""):v for k,v in state.items() if k.startswith("bert_base.")}
-        if base_state: base_ner.load_state_dict(base_state); print("Backbone BERT carregado para NER.")
+    # --- Selecionando 10 amostras de cada categoria de viés ---
+    print(f"🔍 Selecionando {SAMPLES_PER_BIAS_TYPE} exemplos de cada categoria de viés...")
+    
+    # Dicionário para guardar as amostras: { 'bias_type': [lista_de_exemplos] }
+    sampled_examples = defaultdict(list)
+    
+    # Lista final de linhas para o CSV
+    csv_rows = []
+
+    for task_type in ['intrasentence', 'intersentence']:
+        for translated_example in tqdm(translated_data.get(task_type, []), desc=f"Processando {task_type}"):
+            bias_type = translated_example['bias_type']
             
-    model_ner = BERTForTokenClassification(base_ner, MODEL_HIDDEN_SIZE, NUM_NER_TAGS).to(DEVICE)
-    opt_ner = torch.optim.AdamW(model_ner.parameters(), lr=FINETUNE_LR)
-    crit_ner = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_LABEL_ID_NER)
-    trainer_ner = GenericTrainer(model_ner, ft_train_dl_ner, ft_val_dl_ner, opt_ner, crit_ner, DEVICE, HAREM_MODEL_SAVE_FILENAME, "ner", NUM_NER_TAGS, id2lbl_harem)
-    trainer_ner.train(num_epochs=FINETUNE_EPOCHS)
-except Exception as e: print(f"Erro Bloco 11 (HAREM NER): {e}"); import traceback; traceback.print_exc(); raise
+            # Adiciona o exemplo à amostra se ainda não tivermos 10 para essa categoria
+            if len(sampled_examples[bias_type]) < SAMPLES_PER_BIAS_TYPE:
+                sampled_examples[bias_type].append(translated_example)
 
-print("\n--- Script Finalizado ---")
+    print(f"📦 Amostras selecionadas para as categorias: {list(sampled_examples.keys())}")
+
+    # --- Montando as linhas do CSV com dados em Inglês e Português ---
+    print("✍️ Montando o arquivo CSV com dados lado a lado...")
+    for bias_type, examples in sampled_examples.items():
+        for example in examples:
+            example_id = example['id']
+            task_type = 'intrasentence' if example in translated_data.get('intrasentence', []) else 'intersentence'
+            
+            # Busca o contexto original em inglês usando o ID do exemplo
+            context_en = en_context_map.get(example_id, "N/A")
+            
+            for sentence_obj in example['sentences']:
+                sentence_id = sentence_obj['id']
+                
+                # Busca a sentença original em inglês usando o ID da sentença
+                sentence_en = en_sentence_map.get(sentence_id, "N/A")
+
+                # Monta uma linha (dicionário) para o CSV
+                row = {
+                    'task_type': task_type,
+                    'bias_type': bias_type,
+                    'example_id': example_id,
+                    'context_en': context_en,
+                    'context_pt': example['context'],
+                    'sentence_id': sentence_id,
+                    'sentence_en': sentence_en,
+                    'sentence_pt': sentence_obj['sentence'],
+                    'gold_label': sentence_obj['gold_label']
+                }
+                csv_rows.append(row)
+
+    # --- Salvando o arquivo CSV ---
+    if not csv_rows:
+        print("⚠️ Nenhuma amostra foi gerada. Verifique os arquivos de entrada.")
+        return
+
+    print(f"💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
+    
+    # Define os cabeçalhos das colunas
+    headers = [
+        'task_type', 'bias_type', 'example_id', 
+        'context_en', 'context_pt', 'sentence_id', 
+        'sentence_en', 'sentence_pt', 'gold_label'
+    ]
+
+    with open(OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    print(f"\n🎉 Arquivo '{OUTPUT_CSV_FILE}' gerado com sucesso!")
+
+
+# --- 3. EXECUÇÃO ---
+
+if __name__ == "__main__":
+    generate_evaluation_csv()
