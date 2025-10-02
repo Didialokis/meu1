@@ -1,4 +1,150 @@
+import json
+import pandas as pd
+from datasets import load_dataset
+import random
+from tqdm import tqdm
 
+# --- 1. CONFIGURAÇÕES ---
+
+# ATENÇÃO: Verifique se este é o nome do arquivo gerado pelo seu script de tradução final
+TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json' 
+
+# Nome do arquivo XLSX (Excel) de saída que será gerado.
+OUTPUT_XLSX_FILE = 'amostra_avaliacao_aleatoria.xlsx'
+
+# Quantos exemplos (contextos) aleatórios selecionar para cada categoria de viés.
+SAMPLES_PER_BIAS_TYPE = 10
+
+# Quantas categorias de viés selecionar aleatoriamente para cada tarefa (5 * 10 = 50 contextos).
+NUM_BIAS_CATEGORIES_TO_SAMPLE = 5
+
+# Configurações do dataset original no Hugging Face.
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
+
+
+# --- 2. FUNÇÃO PRINCIPAL ---
+
+def generate_evaluation_xlsx():
+    """
+    Função principal para carregar os dados, realizar a amostragem aleatória
+    e gerar o arquivo XLSX (Excel) final.
+    """
+    print("🚀 Iniciando a geração do arquivo XLSX de amostra para avaliação.")
+
+    # --- Carregando o dataset traduzido (Português) ---
+    print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
+    try:
+        with open(TRANSLATED_FILE, 'r', encoding='utf-8') as f:
+            translated_data = json.load(f)['data']
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
+        return
+        
+    # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
+    print("📚 Baixando o dataset original em Inglês para comparação...")
+    en_context_map = {}
+    en_sentence_map = {}
+
+    for config in CONFIGS:
+        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        for example in en_dataset:
+            en_context_map[example['id']] = example['context']
+            for i in range(len(example['sentences']['id'])):
+                sent_id = example['sentences']['id'][i]
+                sent_text = example['sentences']['sentence'][i]
+                en_sentence_map[sent_id] = sent_text
+    
+    print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
+
+    # --- Montando uma lista completa com todos os dados antes da amostragem ---
+    all_rows = []
+    for task_type in ['intrasentence', 'intersentence']:
+        for translated_example in translated_data.get(task_type, []):
+            example_id = translated_example['id']
+            context_en = en_context_map.get(example_id, "N/A")
+            
+            for sentence_obj in translated_example['sentences']:
+                sentence_id = sentence_obj['id']
+                sentence_en = en_sentence_map.get(sentence_id, "N/A")
+                row = {
+                    'task_type': task_type,
+                    'bias_type': translated_example['bias_type'],
+                    'example_id': example_id,
+                    'context_en': context_en,
+                    'context_pt': translated_example['context'],
+                    'sentence_id': sentence_id,
+                    'sentence_en': sentence_en,
+                    'sentence_pt': sentence_obj['sentence'],
+                    'gold_label': sentence_obj['gold_label']
+                }
+                all_rows.append(row)
+    
+    # Converte todos os dados para um DataFrame do Pandas
+    df = pd.DataFrame(all_rows)
+    
+    # --- LÓGICA DE AMOSTRAGEM ALEATÓRIA ---
+    print("\n🎲 Realizando amostragem aleatória...")
+    final_sampled_df_list = []
+
+    for task_type in ['intrasentence', 'intersentence']:
+        print(f"\n--- Amostrando para a tarefa: {task_type} ---")
+        task_df = df[df['task_type'] == task_type]
+        
+        # Pega todas as categorias de viés únicas disponíveis nesta tarefa
+        available_bias_types = task_df['bias_type'].unique()
+        
+        # Seleciona aleatoriamente 5 categorias de viés (ou menos, se não houver 5)
+        num_to_select = min(NUM_BIAS_CATEGORIES_TO_SAMPLE, len(available_bias_types))
+        selected_bias_types = random.sample(list(available_bias_types), k=num_to_select)
+        print(f"  - Categorias de viés sorteadas: {selected_bias_types}")
+
+        task_samples = []
+        for bias_type in selected_bias_types:
+            # Filtra o DataFrame para a categoria de viés atual
+            bias_df = task_df[task_df['bias_type'] == bias_type]
+            
+            # Pega todos os IDs de contexto únicos para esta categoria
+            unique_example_ids = bias_df['example_id'].unique()
+            
+            # Seleciona aleatoriamente 10 IDs de contexto (ou menos, se não houver 10)
+            num_ids_to_sample = min(SAMPLES_PER_BIAS_TYPE, len(unique_example_ids))
+            sampled_ids = random.sample(list(unique_example_ids), k=num_ids_to_sample)
+            print(f"    - Categoria '{bias_type}': {len(sampled_ids)} contextos amostrados aleatoriamente.")
+            
+            # Adiciona todas as linhas correspondentes a esses IDs de contexto à lista de amostras
+            task_samples.append(bias_df[bias_df['example_id'].isin(sampled_ids)])
+        
+        # Combina os DataFrames amostrados para esta tarefa
+        if task_samples:
+            final_sampled_df_list.append(pd.concat(task_samples))
+
+    # Combina as amostras de intrasentence e intersentence
+    if not final_sampled_df_list:
+        print("⚠️ Nenhuma amostra foi gerada. Verifique os arquivos de entrada.")
+        return
+        
+    final_df = pd.concat(final_sampled_df_list)
+
+    # --- Salvando o arquivo XLSX (Excel) ---
+    print(f"\n💾 Salvando {len(final_df)} linhas de amostra em '{OUTPUT_XLSX_FILE}'...")
+    
+    # Ordena o DataFrame para melhor visualização
+    final_df.sort_values(by=['task_type', 'bias_type', 'example_id', 'sentence_id'], inplace=True)
+    
+    # Usa o Pandas para salvar em formato Excel
+    final_df.to_excel(OUTPUT_XLSX_FILE, index=False, engine='openpyxl')
+
+    print(f"\n🎉 Arquivo '{OUTPUT_XLSX_FILE}' gerado com sucesso!")
+
+
+# --- 3. EXECUÇÃO ---
+
+if __name__ == "__main__":
+    generate_evaluation_csv()
+
+////////////////////////////////////////
 
 import json
 import csv
