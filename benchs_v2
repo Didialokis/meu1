@@ -1,137 +1,130 @@
-import json
-import csv
+# -*- coding: utf-8 -*-
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from datasets import load_dataset
-from collections import defaultdict
+import re
+import json
 from tqdm import tqdm
 
 # --- 1. CONFIGURAÇÕES ---
 
-# Arquivo JSON traduzido, gerado pelo script de tradução definitivo.
-TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json'
-
-# Nome do arquivo CSV de saída que será gerado.
-OUTPUT_CSV_FILE = 'amostra_avaliacao.csv'
-
-# Quantos exemplos selecionar para cada categoria de viés.
-SAMPLES_PER_BIAS_TYPE = 10
-
-# Configurações do dataset original no Hugging Face.
+MODEL_NAME = "facebook/nllb-200-1.3B"
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
+SOURCE_LANG = "eng_Latn"
+TARGET_LANG = "por_Latn"
+BATCH_SIZE = 8
+
+# Mapeamento para o "gold_label" (3 classes)
+GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
+
+# Mapeamento para os labels internos (4 classes, incluindo 'related')
+INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
 
 
-# --- 2. FUNÇÃO PRINCIPAL ---
+# --- 2. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
 
-def generate_evaluation_csv():
+def traduzir_com_fidelidade_estrutural():
     """
-    Função principal para carregar os dados, criar os mapas de correspondência,
-    selecionar as amostras e gerar o arquivo CSV.
+    Executa o pipeline de tradução e recria a estrutura original do Stereoset
+    com precisão para garantir compatibilidade com o dataloader oficial.
     """
-    print("🚀 Iniciando a geração do arquivo CSV de amostra para avaliação.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Usando dispositivo: {device.upper()}")
 
-    # --- Carregando o dataset traduzido (Português) ---
-    print(f"📖 Lendo o arquivo traduzido: {TRANSLATED_FILE}")
-    try:
-        with open(TRANSLATED_FILE, 'r', encoding='utf-8') as f:
-            translated_data = json.load(f)['data']
-    except FileNotFoundError:
-        print(f"❌ ERRO: Arquivo traduzido '{TRANSLATED_FILE}' não encontrado.")
-        return
-    except json.JSONDecodeError as e:
-        print(f"❌ ERRO: Falha ao ler o arquivo JSON. Erro: {e}")
-        return
-        
-    # --- Carregando o dataset original (Inglês) e criando mapas para busca rápida ---
-    print("📚 Baixando o dataset original em Inglês para comparação...")
-    en_context_map = {}  # Mapeia example_id -> contexto em inglês
-    en_sentence_map = {} # Mapeia sentence_id -> sentença em inglês
+    print(f"💾 Carregando o modelo '{MODEL_NAME}'...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SOURCE_LANG)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    print("✅ Modelo carregado com sucesso.")
 
-    # --- INÍCIO DA CORREÇÃO ---
-    # A lógica foi ajustada para ler a estrutura de "dicionário de listas"
-    # que a biblioteca `datasets` do Hugging Face fornece.
+    # --- ETAPA DE EXTRAÇÃO ---
+    datasets_dict = {}
+    sentences_to_translate = []
     for config in CONFIGS:
-        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-        for example in en_dataset:
-            en_context_map[example['id']] = example['context']
-            
-            # Pega as listas paralelas de IDs e textos das sentenças
-            sentence_ids = example['sentences']['id']
-            sentence_texts = example['sentences']['sentence']
-            
-            # Itera sobre as listas para popular o mapa de sentenças
-            for i in range(len(sentence_ids)):
-                en_sentence_map[sentence_ids[i]] = sentence_texts[i]
-    # --- FIM DA CORREÇÃO ---
+        print(f"💿 Carregando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        datasets_dict[config] = dataset
+        for example in dataset:
+            sentences_to_translate.append(example['context'])
+            sentences_to_translate.extend(example['sentences']['sentence'])
     
-    print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
+    print(f"📊 Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    # --- Selecionando 10 amostras de cada categoria de viés ---
-    print(f"🔍 Selecionando {SAMPLES_PER_BIAS_TYPE} exemplos de cada categoria de viés...")
+    # --- ETAPA DE TRADUÇÃO ---
+    print("⏳ Iniciando a tradução em lotes...")
+    translated_sentences = []
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
+
+    for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo Lotes"):
+        batch = sentences_to_translate[i:i + BATCH_SIZE]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
+        generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
+        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        # Sanitização não é mais necessária pois não usamos placeholders
+        translated_sentences.extend(batch_translated_raw)
+    print("✅ Tradução finalizada.")
+
+    # --- ETAPA DE RECONSTRUÇÃO MANUAL (A PARTE CRÍTICA) ---
+    print("🏗️ Reconstruindo o dataset na estrutura original...")
+    translated_iter = iter(translated_sentences)
     
-    sampled_examples = defaultdict(list)
-    
-    for task_type in ['intrasentence', 'intersentence']:
-        for translated_example in tqdm(translated_data.get(task_type, []), desc=f"Processando {task_type}"):
-            bias_type = translated_example['bias_type']
+    reconstructed_data = {}
+    for config in CONFIGS:
+        original_dataset = datasets_dict[config]
+        new_examples_list = []
+        for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
+            new_example = {
+                "id": original_example['id'],
+                "bias_type": original_example['bias_type'],
+                "target": original_example['target'],
+                "context": next(translated_iter),
+                "sentences": []  # Esta será uma lista de dicionários
+            }
             
-            if len(sampled_examples[bias_type]) < SAMPLES_PER_BIAS_TYPE:
-                sampled_examples[bias_type].append(translated_example)
+            original_sents_data = original_example['sentences']
+            num_sentences = len(original_sents_data['sentence'])
 
-    print(f"📦 Amostras selecionadas para as categorias: {list(sampled_examples.keys())}")
+            for i in range(num_sentences):
+                # Recria a lista de dicionários para o campo 'labels'
+                recreated_labels = []
+                labels_data_for_one_sentence = original_sents_data['labels'][i]
+                human_ids = labels_data_for_one_sentence['human_id']
+                inner_int_labels = labels_data_for_one_sentence['label']
+                
+                # "Desfaz o pivô" dos dados, juntando as listas paralelas
+                for j in range(len(human_ids)):
+                    recreated_labels.append({
+                        "human_id": human_ids[j],
+                        "label": INNER_LABEL_MAP[inner_int_labels[j]]
+                    })
 
-    # --- Montando as linhas do CSV com dados em Inglês e Português ---
-    print("✍️ Montando o arquivo CSV com dados lado a lado...")
-    csv_rows = []
-    for bias_type, examples in sampled_examples.items():
-        for example in examples:
-            example_id = example['id']
-            # Determina o task_type baseado em qual lista o exemplo foi encontrado
-            task_type = 'intrasentence' if any(ex['id'] == example_id for ex in translated_data.get('intrasentence', [])) else 'intersentence'
-            
-            context_en = en_context_map.get(example_id, "N/A")
-            
-            # O loop abaixo agora funciona, pois `example['sentences']` do arquivo
-            # traduzido está no formato correto de "lista de dicionários".
-            for sentence_obj in example['sentences']:
-                sentence_id = sentence_obj['id']
-                sentence_en = en_sentence_map.get(sentence_id, "N/A")
-
-                row = {
-                    'task_type': task_type,
-                    'bias_type': bias_type,
-                    'example_id': example_id,
-                    'context_en': context_en,
-                    'context_pt': example['context'],
-                    'sentence_id': sentence_id,
-                    'sentence_en': sentence_en,
-                    'sentence_pt': sentence_obj['sentence'],
-                    'gold_label': sentence_obj['gold_label']
+                new_sentence_obj = {
+                    "id": original_sents_data['id'][i],
+                    "sentence": next(translated_iter),
+                    "labels": recreated_labels,  # Usa a lista de dicionários recriada
+                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
                 }
-                csv_rows.append(row)
+                new_example["sentences"].append(new_sentence_obj)
+            
+            new_examples_list.append(new_example)
+        reconstructed_data[config] = new_examples_list
 
-    # --- Salvando o arquivo CSV ---
-    if not csv_rows:
-        print("⚠️ Nenhuma amostra foi gerada. Verifique os arquivos de entrada.")
-        return
-
-    print(f"💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
+    # --- ETAPA DE SALVAMENTO ---
+    final_output_structure = {
+        "version": "1.1",
+        "data": reconstructed_data
+    }
     
-    headers = [
-        'task_type', 'bias_type', 'example_id', 
-        'context_en', 'context_pt', 'sentence_id', 
-        'sentence_en', 'sentence_pt', 'gold_label'
-    ]
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_nllb_formato_original_final.json"
+    print(f"💾 Salvando o dataset final em: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    with open(OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(csv_rows)
+    print("\n🎉 Sucesso! O arquivo de saída agora é 100% compatível com as ferramentas oficiais.")
 
-    print(f"\n🎉 Arquivo '{OUTPUT_CSV_FILE}' gerado com sucesso!")
-
-
-# --- 3. EXECUÇÃO ---
 
 if __name__ == "__main__":
-    generate_evaluation_csv()
+    traduzir_com_fidelidade_estrutural()
