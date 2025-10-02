@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 # --- 1. CONFIGURAÇÕES ---
 
-# Arquivo JSON traduzido que você gerou com o script de tradução.
+# Arquivo JSON traduzido, gerado pelo script de tradução definitivo.
 TRANSLATED_FILE = 'stereoset_validation_pt_nllb_formato_original_final.json'
 
 # Nome do arquivo CSV de saída que será gerado.
@@ -47,41 +47,34 @@ def generate_evaluation_csv():
     en_context_map = {}  # Mapeia example_id -> contexto em inglês
     en_sentence_map = {} # Mapeia sentence_id -> sentença em inglês
 
-    # --- Trecho de código corrigido e mais seguro ---
-for config in CONFIGS:
-    en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-    for example in en_dataset:
-        en_context_map[example['id']] = example['context']
-        for sentence_obj in example['sentences']:
-            # ADICIONAMOS UMA VERIFICAÇÃO AQUI
-            if isinstance(sentence_obj, dict):
-                # Este código só será executado se sentence_obj for um dicionário
-                sentence_id = sentence_obj.get('id')
-                sentence_text = sentence_obj.get('sentence')
-                
-                # Verificação adicional para garantir que as chaves existem
-                if sentence_id and sentence_text:
-                    en_sentence_map[sentence_id] = sentence_text
-            # else:
-                # Opcional: Imprimir um aviso se o formato for inesperado
-                # print(f"Aviso: formato de 'sentence_obj' inesperado e ignorado: {sentence_obj}")
+    # --- INÍCIO DA CORREÇÃO ---
+    # A lógica foi ajustada para ler a estrutura de "dicionário de listas"
+    # que a biblioteca `datasets` do Hugging Face fornece.
+    for config in CONFIGS:
+        en_dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        for example in en_dataset:
+            en_context_map[example['id']] = example['context']
+            
+            # Pega as listas paralelas de IDs e textos das sentenças
+            sentence_ids = example['sentences']['id']
+            sentence_texts = example['sentences']['sentence']
+            
+            # Itera sobre as listas para popular o mapa de sentenças
+            for i in range(len(sentence_ids)):
+                en_sentence_map[sentence_ids[i]] = sentence_texts[i]
+    # --- FIM DA CORREÇÃO ---
     
     print(f"✅ {len(en_context_map)} contextos e {len(en_sentence_map)} sentenças em Inglês foram mapeados.")
 
     # --- Selecionando 10 amostras de cada categoria de viés ---
     print(f"🔍 Selecionando {SAMPLES_PER_BIAS_TYPE} exemplos de cada categoria de viés...")
     
-    # Dicionário para guardar as amostras: { 'bias_type': [lista_de_exemplos] }
     sampled_examples = defaultdict(list)
     
-    # Lista final de linhas para o CSV
-    csv_rows = []
-
     for task_type in ['intrasentence', 'intersentence']:
         for translated_example in tqdm(translated_data.get(task_type, []), desc=f"Processando {task_type}"):
             bias_type = translated_example['bias_type']
             
-            # Adiciona o exemplo à amostra se ainda não tivermos 10 para essa categoria
             if len(sampled_examples[bias_type]) < SAMPLES_PER_BIAS_TYPE:
                 sampled_examples[bias_type].append(translated_example)
 
@@ -89,21 +82,20 @@ for config in CONFIGS:
 
     # --- Montando as linhas do CSV com dados em Inglês e Português ---
     print("✍️ Montando o arquivo CSV com dados lado a lado...")
+    csv_rows = []
     for bias_type, examples in sampled_examples.items():
         for example in examples:
             example_id = example['id']
             task_type = 'intrasentence' if example in translated_data.get('intrasentence', []) else 'intersentence'
             
-            # Busca o contexto original em inglês usando o ID do exemplo
             context_en = en_context_map.get(example_id, "N/A")
             
+            # O loop abaixo agora funciona, pois `example['sentences']` do arquivo
+            # traduzido está no formato correto de "lista de dicionários".
             for sentence_obj in example['sentences']:
                 sentence_id = sentence_obj['id']
-                
-                # Busca a sentença original em inglês usando o ID da sentença
                 sentence_en = en_sentence_map.get(sentence_id, "N/A")
 
-                # Monta uma linha (dicionário) para o CSV
                 row = {
                     'task_type': task_type,
                     'bias_type': bias_type,
@@ -124,7 +116,6 @@ for config in CONFIGS:
 
     print(f"💾 Salvando {len(csv_rows)} linhas de amostra em '{OUTPUT_CSV_FILE}'...")
     
-    # Define os cabeçalhos das colunas
     headers = [
         'task_type', 'bias_type', 'example_id', 
         'context_en', 'context_pt', 'sentence_id', 
