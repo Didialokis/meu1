@@ -1,3 +1,8 @@
+=SOMARPRODUTO(--(J2:J313="correto"); --(I2:I313="unrelated") + 2*(--(I2:I313="stereotype") + --(I2:I313="anti-stereotype")))
+
+
+
+
 import json
 import pandas as pd
 from datasets import load_dataset
