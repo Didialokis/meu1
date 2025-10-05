@@ -1,44 +1,34 @@
-Perfeito, obrigado pela nova imagem. Ela confirma a estrutura exata das colunas. Vejo que os nomes e as posições são um pouco diferentes da primeira imagem, e vou ajustar as fórmulas exatamente para essa nova tabela.
+Entendido\! Muito obrigado por esclarecer e enviar a imagem completa. A presença da coluna **`score` (Coluna K)** muda tudo e **simplifica o processo consideravelmente**\!
 
-Com base nesta imagem, vamos usar:
+Ótima notícia\! Como você já tem a coluna `score` com os pontos obtidos (0, 1 ou 2), não precisamos mais daquela primeira fórmula complexa para calcular os pontos. Só precisamos calcular o "Valor Máximo" para ter a nossa referência de 100%.
 
-  * Sua aba com os dados se chama **Plan1** (lembre-se de trocar se o nome for outro).
-  * **Coluna H**: `bias_type`
-  * **Coluna I**: `gold_label`
-  * **Coluna J**: `resposta` (com os valores "correto" e "incorreto")
+Vamos ajustar o plano. Ficará ainda mais fácil.
 
-O plano é o mesmo e continua bem simples. Vamos apenas ajustar as letras das colunas nas fórmulas.
+**Pode desconsiderar a resposta anterior. Siga estes passos atualizados:**
 
 -----
 
-### Passo 1: Adicionar Colunas de Cálculo na sua Aba de Dados ("Plan1")
+Com base na sua imagem final, vamos usar:
 
-Vá para a sua planilha de dados. Vamos adicionar duas colunas auxiliares ao lado dos seus dados, nas colunas K e L.
+  * Sua aba de dados: **Plan1**
+  * **Coluna H**: `bias_type`
+  * **Coluna I**: `gold_label`
+  * **Coluna K**: `score` (seus "Pontos Obtidos")
 
-1.  **Na célula K1**, digite o título: `Pontos Obtidos`
+### Passo 1: Adicionar APENAS UMA Coluna Auxiliar (Pontos Máximos)
 
-2.  **Na célula L1**, digite o título: `Pontos Máximos`
+Vá para a sua planilha de dados. Precisamos adicionar apenas uma coluna para saber qual seria a pontuação máxima de cada linha.
 
-3.  **Na célula K2**, cole a seguinte fórmula (ajustada para as novas colunas):
-
-    ```excel
-    =SE(J2="correto";SE(OU(I2="stereotype";I2="anti-stereotype");2;SE(I2="unrelated";1;0));0)
-    ```
-
-4.  **Na célula L2**, cole a seguinte fórmula (ajustada para a nova coluna):
-
+1.  **Na célula L1**, digite o título: `Pontos Máximos`
+2.  **Na célula L2**, cole a seguinte fórmula, que calcula o valor máximo possível apenas com base no `gold_label`:
     ```excel
     =SE(OU(I2="stereotype";I2="anti-stereotype");2;SE(I2="unrelated";1;0))
     ```
-
-5.  Agora, **selecione as células K2 e L2**, clique no pequeno quadrado no canto inferior direito da seleção e **arraste para baixo** até o final de todos os seus dados.
-
-Com isso, os cálculos de cada linha já estão prontos. Agora vamos para o resumo.
+3.  **Clique na célula L2**, pegue o pequeno quadrado no canto inferior direito e **arraste para baixo** até o final da sua tabela.
 
 ### Passo 2: Criar a Tabela de Resumo em uma Nova Aba
 
-1.  Crie uma nova aba e chame-a de **"Resumo"**.
-2.  Monte a mesma estrutura que planejamos antes:
+Esta parte não muda. Crie uma nova aba chamada **"Resumo"** com a seguinte estrutura:
 
 | | A | B | C | D |
 | :--- | :--- | :--- | :--- | :--- |
@@ -50,49 +40,40 @@ Com isso, os cálculos de cada linha já estão prontos. Agora vamos para o resu
 | **6** | profession | | | |
 | **7** | ... (etc) | | | |
 
-*Lembre-se de listar seus tipos de viés na Coluna A, a partir da célula A5.*
+### Passo 3: Inserir as Fórmulas Finais (Ainda Mais Simples)
 
-### Passo 3: Inserir as Fórmulas Corrigidas na Aba "Resumo"
-
-Agora, vamos usar as fórmulas de soma, apontando para as colunas corretas.
+Agora, na sua aba "Resumo", vamos usar as fórmulas que leem diretamente da sua coluna `score` (K) e da nossa nova coluna `Pontos Máximos` (L).
 
 #### Para o Total Geral:
 
-1.  **Na célula B2** (Total de Pontos Obtidos), cole:
+1.  **Na célula B2** (Total de Pontos Obtidos), a fórmula agora soma diretamente sua coluna de score:
     ```excel
     =SOMA(Plan1!K:K)
     ```
-2.  **Na célula C2** (Total de Pontos Máximos), cole:
+2.  **Na célula C2** (Total de Pontos Máximos), a fórmula soma nossa nova coluna auxiliar:
     ```excel
     =SOMA(Plan1!L:L)
     ```
-3.  **Na célula D2** (Aproveitamento Geral), cole e formate como porcentagem:
+3.  **Na célula D2** (Aproveitamento), a fórmula continua a mesma:
     ```excel
     =B2/C2
     ```
+    (Lembre-se de formatar esta célula como porcentagem).
 
 #### Para o Detalhamento por Viés:
 
-1.  **Na célula B5** (Pontos Obtidos para "gender"), cole a fórmula:
-
+1.  **Na célula B5** (Pontos Obtidos para "gender"), a fórmula soma os scores da coluna K apenas para o viés correspondente:
     ```excel
     =SOMASES(Plan1!K:K; Plan1!H:H; A5)
     ```
-
-2.  **Na célula C5** (Pontos Máximos para "gender"), cole a fórmula:
-
+2.  **Na célula C5** (Pontos Máximos para "gender"), a fórmula soma os valores da nossa coluna auxiliar L:
     ```excel
     =SOMASES(Plan1!L:L; Plan1!H:H; A5)
     ```
-
-    *(Observação: Como sua coluna `bias_type` agora está "limpa" (ex: "gender"), não precisamos mais do curinga `"*"` na fórmula. Ela ficou ainda mais simples\!)*
-
-3.  **Na célula D5** (Aproveitamento para "gender"), cole a fórmula:
-
+3.  **Na célula D5** (Aproveitamento), a fórmula é:
     ```excel
     =B5/C5
     ```
+4.  Por fim, **selecione as células B5, C5 e D5** e **arraste para baixo** para os outros tipos de viés.
 
-4.  Finalmente, **selecione B5, C5 e D5** e **arraste para baixo** para preencher as fórmulas para os outros tipos de viés.
-
-Pronto\! Agora sua tabela de resumo funcionará perfeitamente com a estrutura de dados da imagem que você enviou.
+Pronto\! Com a coluna `score` já existente, o processo fica muito mais direto e limpo. A lógica é a mesma, mas agora aproveitamos os cálculos que você já tinha, tornando tudo mais rápido e com menos chance de erro.
