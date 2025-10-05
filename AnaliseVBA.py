@@ -1,103 +1,103 @@
-# Importa as bibliotecas necessárias para a análise
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+Com certeza! Vamos criar as fórmulas diretamente na sua planilha Excel para calcular esses totais de forma simples e clara.
 
-# --- INSTRUÇÃO: COLOQUE O NOME DO SEU ARQUIVO EXCEL AQUI ---
-# O arquivo Excel precisa estar na MESMA PASTA que este script.
-caminho_do_arquivo = 'seu_arquivo.xlsx' 
-# -----------------------------------------------------------
+Vou te dar duas soluções:
 
-try:
-    # Tenta ler o arquivo Excel
-    df = pd.read_excel(caminho_do_arquivo)
+Colunas Auxiliares (Recomendado): A forma mais fácil de entender e verificar. Vamos adicionar duas colunas para calcular os pontos de cada linha.
 
-    # --- 1. PREPARAÇÃO E CÁLCULO DOS DADOS ---
+Fórmulas de Matriz (Avançado): Para calcular tudo em células específicas, sem colunas extras.
 
-    # Limpa a coluna 'bias_type' para extrair apenas a categoria (ex: 'gender', 'profession')
-    # Transforma "intervence_gender" em "gender"
-    df['bias_type'] = df['bias_type'].str.split('_').str[1]
+Usaremos as mesmas colunas de referência da imagem:
 
-    # Função para calcular os pontos de cada linha
-    def calcular_pontos(row):
-        # Verifica se a avaliação foi 'c' (correta)
-        if row['nota'] == 'c':
-            # Se for estereótipo ou anti-estereótipo, vale 2 pontos
-            if row['gold_label'] in ['stereotype', 'anti-stereotype']:
-                return 2
-            # Se for não-relacionada, vale 1 ponto
-            elif row['gold_label'] == 'unrelated':
-                return 1
-        # Se a avaliação for 'e' (errada) ou qualquer outra coisa, vale 0 pontos
-        return 0
+Coluna A: bias_type
 
-    # Função para calcular o máximo de pontos possíveis em cada linha
-    def calcular_max_pontos(row):
-        # Estereótipo e anti-estereótipo têm um potencial máximo de 2 pontos
-        if row['gold_label'] in ['stereotype', 'anti-stereotype']:
-            return 2
-        # Não-relacionada tem um potencial máximo de 1 ponto
-        elif row['gold_label'] == 'unrelated':
-            return 1
-        return 0
+Coluna J: gold_label
 
-    # Aplica as funções para criar as novas colunas de pontos
-    df['pontos'] = df.apply(calcular_pontos, axis=1)
-    df['max_pontos_possiveis'] = df.apply(calcular_max_pontos, axis=1)
+Coluna K: nota
 
-    # --- 2. AGRUPAMENTO E ANÁLISE ---
+Solução 1: Usando Colunas Auxiliares (Mais Fácil)
+Esta é a abordagem mais visual e recomendada.
 
-    # Agrupa os dados por 'bias_type' e soma os pontos e os pontos máximos
-    analise = df.groupby('bias_type').agg(
-        pontuacao_bruta=('pontos', 'sum'),
-        pontuacao_maxima_possivel=('max_pontos_possiveis', 'sum')
-    ).reset_index()
+Passo 1: Criar Colunas de Cálculo
 
-    # Calcula a coluna de aproveitamento percentual
-    analise['aproveitamento_percentual'] = (analise['pontuacao_bruta'] / analise['pontuacao_maxima_possivel'] * 100).round(2)
+Vá para a célula L1 e digite o título: Pontos Obtidos.
 
-    # Ordena os resultados para melhor visualização nos gráficos
-    analise_sorted_bruta = analise.sort_values('pontuacao_bruta', ascending=False)
-    analise_sorted_perc = analise.sort_values('aproveitamento_percentual', ascending=False)
-    
-    # Imprime a tabela de resumo no terminal
-    print("--- Tabela Resumo da Análise ---")
-    print(analise.to_string(index=False))
-    print("\n")
+Vá para a célula M1 e digite o título: Pontos Possíveis.
 
-    # --- 3. CRIAÇÃO DOS GRÁFICOS ---
-    
-    # Define o estilo dos gráficos
-    sns.set_style("whitegrid")
-    fig, axes = plt.subplots(2, 1, figsize=(12, 14)) # Cria uma figura com 2 gráficos (um em cima do outro)
-    fig.suptitle('Análise de Viés nas Traduções', fontsize=18, y=1.02)
+Passo 2: Inserir a Fórmula de Pontos Obtidos
 
-    # Gráfico 1: Pontuação Bruta
-    bars1 = sns.barplot(ax=axes[0], x='bias_type', y='pontuacao_bruta', data=analise_sorted_bruta, palette='viridis')
-    axes[0].set_title('Pontuação Bruta por Tipo de Viés', fontsize=14)
-    axes[0].set_xlabel('Tipo de Viés', fontsize=12)
-    axes[0].set_ylabel('Pontuação Total', fontsize=12)
-    for bar in bars1.patches:
-        bars1.annotate(f'{int(bar.get_height())}', (bar.get_x() + bar.get_width() / 2, bar.get_height()), ha='center', va='bottom', xytext=(0, 3), textcoords='offset points')
+Clique na célula L2.
 
-    # Gráfico 2: Aproveitamento Percentual
-    bars2 = sns.barplot(ax=axes[1], x='bias_type', y='aproveitamento_percentual', data=analise_sorted_perc, palette='plasma')
-    axes[1].set_title('Aproveitamento Percentual por Tipo de Viés', fontsize=14)
-    axes[1].set_xlabel('Tipo de Viés', fontsize=12)
-    axes[1].set_ylabel('Aproveitamento (%)', fontsize=12)
-    for bar in bars2.patches:
-        bars2.annotate(f'{bar.get_height():.1f}%', (bar.get_x() + bar.get_width() / 2, bar.get_height()), ha='center', va='bottom', xytext=(0, 3), textcoords='offset points')
+Cole a seguinte fórmula e aperte Enter:
 
-    # Ajusta o layout para evitar sobreposição e salva a imagem
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
-    plt.savefig('analise_de_vies.png')
+Excel
 
-    print("--- SUCESSO! ---")
-    print("A tabela de resumo foi exibida acima.")
-    print("Os gráficos foram salvos no arquivo 'analise_de_vies.png' na mesma pasta.")
+=SE(K2="c"; SE(OU(J2="stereotype"; J2="anti-stereotype"); 2; SE(J2="unrelated"; 1; 0)); 0)
+Como funciona: Se a nota na coluna K for "c", ele verifica a coluna J. Se for "stereotype" ou "anti-stereotype", retorna 2. Se for "unrelated", retorna 1. Se a nota não for "c", ele retorna 0.
 
-except FileNotFoundError:
-    print(f"ERRO: O arquivo '{caminho_do_arquivo}' não foi encontrado.")
-    print("Por favor, verifique se o nome do arquivo está correto e se ele está na mesma pasta que o script.")
-except Exception as e:
-    print(f"Ocorreu um erro inesperado: {e}")
+Passo 3: Inserir a Fórmula de Pontos Possíveis
+
+Clique na célula M2.
+
+Cole a seguinte fórmula e aperte Enter:
+
+Excel
+
+=SE(OU(J2="stereotype"; J2="anti-stereotype"); 2; SE(J2="unrelated"; 1; 0))
+Como funciona: Esta fórmula calcula o valor máximo que cada linha poderia ter, independentemente de estar certa ou errada.
+
+Passo 4: Arrastar as Fórmulas para Toda a Tabela
+
+Selecione as células L2 e M2.
+
+Clique no pequeno quadrado preto no canto inferior direito da seleção e arraste para baixo até o final dos seus dados. Isso aplicará as fórmulas a todas as linhas.
+
+Passo 5: Criar a Tabela de Resumo
+
+Agora, em uma área livre da sua planilha (por exemplo, a partir da célula O1), vamos criar o resumo.
+
+Para o Total Geral:
+
+Célula P1: Total de Pontos Obtidos
+
+Célula Q1 (fórmula): =SOMA(L:L)
+
+Célula P2: Total de Pontos Possíveis (100%)
+
+Célula Q2 (fórmula): =SOMA(M:M)
+
+Célula P3: Aproveitamento Geral
+
+Célula Q3 (fórmula): =Q1/Q2 (formate esta célula como porcentagem)
+
+Para o Total por Tipo de Viés (usando SOMASE):
+
+Liste os tipos de viés únicos em algum lugar. Por exemplo, na coluna O, a partir de O5:
+
+O5: gender
+
+O6: profession
+
+O7: race
+
+O8: religion
+
+Crie os títulos na linha 4: P4: Pontos Obtidos, Q4: Pontos Possíveis, R4: Aproveitamento.
+
+Insira as fórmulas:
+
+Célula P5 (Pontos de "gender"):
+
+Excel
+
+=SOMASE(A:A; O5; L:L)
+Célula Q5 (Máximo de "gender"):
+
+Excel
+
+=SOMASE(A:A; O5; M:M)
+Célula R5 (Aproveitamento de "gender"):
+
+Excel
+
+=P5/Q5
+Selecione as células P5, Q5 e R5 e arraste a fórmula para baixo para os outros tipos de viés
