@@ -1,103 +1,97 @@
-Com certeza! Vamos criar as fórmulas diretamente na sua planilha Excel para calcular esses totais de forma simples e clara.
+Com certeza! Para criar um resumo simples com os totais gerais e os valores separados por tipo de viés, usando apenas fórmulas do Excel, a melhor abordagem é criar uma pequena tabela de resumo.
 
-Vou te dar duas soluções:
+Vamos usar as funções CONT.SES (para contar com múltiplos critérios) e CONT.SE (para contar com um critério).
 
-Colunas Auxiliares (Recomendado): A forma mais fácil de entender e verificar. Vamos adicionar duas colunas para calcular os pontos de cada linha.
+Siga estes passos:
 
-Fórmulas de Matriz (Avançado): Para calcular tudo em células específicas, sem colunas extras.
+Passo 1: Prepare a Tabela de Resumo
+Crie uma nova aba (planilha) no seu arquivo e chame-a de "Resumo".
 
-Usaremos as mesmas colunas de referência da imagem:
+Nesta nova aba, monte a seguinte estrutura. Você precisará digitar os cabeçalhos e os tipos de viés manualmente na primeira coluna.
 
-Coluna A: bias_type
+A	B	C	D
+1	Tipo de Viés	Total de Acertos (Contagem 'c')	Pontuação Obtida	Pontuação Máxima Possível
+2	gender	(Fórmula aqui)	(Fórmula aqui)	(Fórmula aqui)
+3	profession	(Fórmula aqui)	(Fórmula aqui)	(Fórmula aqui)
+4	race	(Fórmula aqui)	(Fórmula aqui)	(Fórmula aqui)
+5	religion	(Fórmula aqui)	(Fórmula aqui)	(Fórmula aqui)
+6				
+7	Total Geral	(Fórmula aqui)	(Fórmula aqui)	(Fórmula aqui)
 
-Coluna J: gold_label
+Exportar para as Planilhas
+Importante: Vou assumir que sua planilha com os dados brutos se chama "Dados". Se tiver outro nome, apenas substitua "Dados" pelo nome correto nas fórmulas.
 
-Coluna K: nota
+Passo 2: Fórmulas para cada Tipo de Viés
+Agora, vamos preencher as células da linha 2 (referente a "gender"). Depois, você poderá simplesmente arrastar as fórmulas para baixo para as outras categorias.
 
-Solução 1: Usando Colunas Auxiliares (Mais Fácil)
-Esta é a abordagem mais visual e recomendada.
+1. Total de Acertos (Célula B2)
+Esta fórmula conta quantas vezes a nota "c" aparece para o tipo de viés "gender".
 
-Passo 1: Criar Colunas de Cálculo
-
-Vá para a célula L1 e digite o título: Pontos Obtidos.
-
-Vá para a célula M1 e digite o título: Pontos Possíveis.
-
-Passo 2: Inserir a Fórmula de Pontos Obtidos
-
-Clique na célula L2.
-
-Cole a seguinte fórmula e aperte Enter:
-
-Excel
-
-=SE(K2="c"; SE(OU(J2="stereotype"; J2="anti-stereotype"); 2; SE(J2="unrelated"; 1; 0)); 0)
-Como funciona: Se a nota na coluna K for "c", ele verifica a coluna J. Se for "stereotype" ou "anti-stereotype", retorna 2. Se for "unrelated", retorna 1. Se a nota não for "c", ele retorna 0.
-
-Passo 3: Inserir a Fórmula de Pontos Possíveis
-
-Clique na célula M2.
-
-Cole a seguinte fórmula e aperte Enter:
+Clique na célula B2 e insira:
 
 Excel
 
-=SE(OU(J2="stereotype"; J2="anti-stereotype"); 2; SE(J2="unrelated"; 1; 0))
-Como funciona: Esta fórmula calcula o valor máximo que cada linha poderia ter, independentemente de estar certa ou errada.
+=CONT.SES(Dados!A:A;"*"&A2&"*";Dados!K:K;"c")
+Dados!A:A;"*"&A2&"*": Procura na coluna A (bias_type) por qualquer texto que contenha a palavra da célula A2 (neste caso, "gender").
 
-Passo 4: Arrastar as Fórmulas para Toda a Tabela
+Dados!K:K;"c": Adiciona a condição de que a coluna K (nota) seja igual a "c".
 
-Selecione as células L2 e M2.
+2. Pontuação Máxima Possível (Célula D2)
+Esta fórmula calcula qual seria a pontuação total para "gender" se todas as respostas fossem corretas.
 
-Clique no pequeno quadrado preto no canto inferior direito da seleção e arraste para baixo até o final dos seus dados. Isso aplicará as fórmulas a todas as linhas.
-
-Passo 5: Criar a Tabela de Resumo
-
-Agora, em uma área livre da sua planilha (por exemplo, a partir da célula O1), vamos criar o resumo.
-
-Para o Total Geral:
-
-Célula P1: Total de Pontos Obtidos
-
-Célula Q1 (fórmula): =SOMA(L:L)
-
-Célula P2: Total de Pontos Possíveis (100%)
-
-Célula Q2 (fórmula): =SOMA(M:M)
-
-Célula P3: Aproveitamento Geral
-
-Célula Q3 (fórmula): =Q1/Q2 (formate esta célula como porcentagem)
-
-Para o Total por Tipo de Viés (usando SOMASE):
-
-Liste os tipos de viés únicos em algum lugar. Por exemplo, na coluna O, a partir de O5:
-
-O5: gender
-
-O6: profession
-
-O7: race
-
-O8: religion
-
-Crie os títulos na linha 4: P4: Pontos Obtidos, Q4: Pontos Possíveis, R4: Aproveitamento.
-
-Insira as fórmulas:
-
-Célula P5 (Pontos de "gender"):
+Clique na célula D2 e insira:
 
 Excel
 
-=SOMASE(A:A; O5; L:L)
-Célula Q5 (Máximo de "gender"):
+=(CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"stereotype")*2)+(CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"anti-stereotype")*2)+CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"unrelated")
+Ela conta todos os "stereotype" e "anti-stereotype" para "gender" e multiplica por 2, e depois soma a contagem de todos os "unrelated".
+
+3. Pontuação Obtida (Célula C2)
+Esta é a pontuação real, baseada apenas nos acertos ("c").
+
+Clique na célula C2 e insira:
 
 Excel
 
-=SOMASE(A:A; O5; M:M)
-Célula R5 (Aproveitamento de "gender"):
+=(CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"stereotype";Dados!K:K;"c")*2)+(CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"anti-stereotype";Dados!K:K;"c")*2)+CONT.SES(Dados!A:A;"*"&A2&"*";Dados!J:J;"unrelated";Dados!K:K;"c")
+É a mesma lógica da fórmula anterior, mas com o critério extra de que a coluna K (nota) deve ser "c".
+
+Agora, para preencher o resto: Selecione as células B2, C2 e D2, clique no pequeno quadrado no canto inferior direito da seleção e arraste para baixo até a linha 5.
+
+Passo 3: Fórmulas para o "Total Geral"
+Estas fórmulas são mais simples, pois não precisam filtrar por tipo de viés.
+
+1. Total de Acertos (Célula B7)
+Clique na célula B7 e insira:
 
 Excel
 
-=P5/Q5
-Selecione as células P5, Q5 e R5 e arraste a fórmula para baixo para os outros tipos de viés
+=CONT.SE(Dados!K:K;"c")
+2. Pontuação Máxima Possível (Célula D7)
+Clique na célula D7 e insira:
+
+Excel
+
+=(CONT.SE(Dados!J:J;"stereotype")*2)+(CONT.SE(Dados!J:J;"anti-stereotype")*2)+CONT.SE(Dados!J:J;"unrelated")
+3. Pontuação Obtida (Célula C7)
+Clique na célula C7 e insira:
+
+Excel
+
+=(CONT.SES(Dados!J:J;"stereotype";Dados!K:K;"c")*2)+(CONT.SES(Dados!J:J;"anti-stereotype";Dados!K:K;"c")*2)+CONT.SES(Dados!J:J;"unrelated";Dados!K:K;"c")
+Resultado Final
+Sua tabela de resumo ficará parecida com esta, preenchida automaticamente com os valores corretos da sua planilha de dados:
+
+A	B	C	D
+1	Tipo de Viés	Total de Acertos (Contagem 'c')	Pontuação Obtida	Pontuação Máxima Possível
+2	gender	14	25	32
+3	profession	8	14	20
+4	race	5	8	11
+5	religion	4	6	7
+6				
+7	Total Geral	31	53	70
+
+Exportar para as Planilhas
+(Nota: Os números no exemplo acima são ilustrativos, os seus serão calculados com base nos seus dados reais.)
+
+Esta abordagem usa apenas fórmulas, é atualizada automaticamente se você alterar os dados brutos e fornece exatamente o resumo simples que você pediu.
