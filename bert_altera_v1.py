@@ -15,7 +15,7 @@ CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 SOURCE_LANG = "eng_Latn"
 TARGET_LANG = "por_Latn"
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 
 GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
@@ -37,20 +37,41 @@ def traduzir_e_recriar_estrutura_corretamente():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- ETAPA DE EXTRAÇÃO (SEM MUDANÇAS, JÁ ESTAVA CORRETA) ---
+    # --- ETAPA DE EXTRAÇÃO (AJUSTADA PARA NÃO TRADUZIR 'BLANK') ---
     datasets_dict = {}
     sentences_to_translate = []
+    # Usaremos esta lista para rastrear os pedaços do contexto intrasentence
+    intrasentence_context_parts = []
+
     for config in CONFIGS:
         print(f"Carregando a configuração '{config}' do dataset...")
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         datasets_dict[config] = dataset
         for example in dataset:
-            # A chave 'context' existe tanto em 'intra' quanto 'inter' no dataset original
-            if 'context' in example and example['context']:
-                sentences_to_translate.append(example['context'])
+            if config == 'intersentence':
+                # Para intersentence, a lógica é simples: traduzir tudo
+                if 'context' in example and example['context']:
+                    sentences_to_translate.append(example['context'])
+            else: # config == 'intrasentence'
+                # <--- MUDANÇA CRUCIAL: Dividir o contexto em 'BLANK' --->
+                # Em vez de traduzir a frase inteira com "BLANK" nela...
+                context_str = example.get('context', '')
+                if 'BLANK' in context_str:
+                    parts = context_str.split('BLANK', 1)
+                    prefix = parts[0]
+                    suffix = parts[1]
+                    # Adicionamos os pedaços para serem traduzidos separadamente
+                    sentences_to_translate.append(prefix)
+                    sentences_to_translate.append(suffix)
+                else:
+                    # Caso de borda: se não houver BLANK, adiciona textos vazios para manter a ordem
+                    sentences_to_translate.append('')
+                    sentences_to_translate.append('')
+
+            # As frases de exemplo sempre são traduzidas por inteiro
             sentences_to_translate.extend(example['sentences']['sentence'])
     
-    print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
+    print(f"Total de {len(sentences_to_translate)} textos extraídos para tradução.")
 
     # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
     print("Iniciando a tradução em lotes...")
@@ -59,14 +80,16 @@ def traduzir_e_recriar_estrutura_corretamente():
 
     for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo Lotes"):
         batch = sentences_to_translate[i:i + BATCH_SIZE]
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
+        # Garante que o lote não contenha Nones ou outros tipos
+        batch = [str(b) for b in batch]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
         generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
         batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO (AJUSTADA) ---
+    # --- ETAPA DE RECONSTRUÇÃO (AJUSTADA PARA REMONTAR 'BLANK') ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
     
@@ -82,11 +105,15 @@ def traduzir_e_recriar_estrutura_corretamente():
                 "sentences": []
             }
             
-            # <--- MUDANÇA PRINCIPAL AQUI --->
-            # Se o exemplo original tinha um 'context', pegamos a próxima tradução e a adicionamos de volta.
-            # Isso agora funciona tanto para 'intrasentence' quanto para 'intersentence'.
-            if 'context' in original_example and original_example['context']:
-                new_example["context"] = next(translated_iter)
+            if config == 'intersentence':
+                if 'context' in original_example and original_example['context']:
+                    new_example["context"] = next(translated_iter)
+            else: # config == 'intrasentence'
+                # <--- MUDANÇA CRUCIAL: Remontar o contexto com 'BLANK' --->
+                translated_prefix = next(translated_iter).strip()
+                translated_suffix = next(translated_iter).strip()
+                # Recria o contexto, garantindo um espaço ao redor do BLANK
+                new_example["context"] = f"{translated_prefix} BLANK {translated_suffix}".strip()
             
             original_sents_data = original_example['sentences']
             num_sentences = len(original_sents_data['sentence'])
@@ -114,7 +141,7 @@ def traduzir_e_recriar_estrutura_corretamente():
             new_examples_list.append(new_example)
         reconstructed_data[config] = new_examples_list
 
-    # --- ETAPA DE SALVAMENTO (SEM MUDANÇAS) ---
+    # --- ETAPA DE SALVAMENTO ---
     final_output_structure = {
         "version": "1.1",
         "data": {
@@ -129,7 +156,8 @@ def traduzir_e_recriar_estrutura_corretamente():
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível com o dataloader.")
+    print("\n✅ Sucesso! O arquivo agora é estruturalmente robusto e à prova de erros de tradução.")
+
 
 if __name__ == "__main__":
     traduzir_e_recriar_estrutura_corretamente()
