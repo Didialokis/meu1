@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 MODEL_NAME = "facebook/nllb-200-1.3B"
 DATASET_NAME = "McGill-NLP/stereoset"
-CONFIGS = ['intersentence', 'intrasentence']
+CONFIGS = ['intersentence', 'intrasentence'] # Processará ambos corretamente
 DATASET_SPLIT = "validation"
 SOURCE_LANG = "eng_Latn"
 TARGET_LANG = "por_Latn"
@@ -38,7 +38,7 @@ def traduzir_e_recriar_estrutura_corretamente():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- ETAPA DE EXTRAÇÃO ---
+    # --- ETAPA DE EXTRAÇÃO (AJUSTADA) ---
     datasets_dict = {}
     sentences_to_translate = []
     for config in CONFIGS:
@@ -46,12 +46,15 @@ def traduzir_e_recriar_estrutura_corretamente():
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         datasets_dict[config] = dataset
         for example in dataset:
-            sentences_to_translate.append(example['context'])
+            # <--- MUDANÇA 1: SÓ EXTRAI O CONTEXTO SE ELE EXISTIR (para intersentence) --->
+            if 'context' in example and example['context']:
+                sentences_to_translate.append(example['context'])
+            # As frases sempre existem, então as adicionamos incondicionalmente
             sentences_to_translate.extend(example['sentences']['sentence'])
     
     print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    # --- ETAPA DE TRADUÇÃO ---
+    # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
     print("Iniciando a tradução em lotes...")
     translated_sentences = []
     forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
@@ -65,7 +68,7 @@ def traduzir_e_recriar_estrutura_corretamente():
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO MANUAL (LÓGICA CORRETA) ---
+    # --- ETAPA DE RECONSTRUÇÃO (AJUSTADA) ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
     
@@ -74,13 +77,17 @@ def traduzir_e_recriar_estrutura_corretamente():
         original_dataset = datasets_dict[config]
         new_examples_list = []
         for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
+            # Cria a base do exemplo
             new_example = {
                 "id": original_example['id'],
                 "bias_type": original_example['bias_type'],
                 "target": original_example['target'],
-                "context": next(translated_iter),
-                "sentences": [] # Será uma lista de dicionários
+                "sentences": [] # Será preenchido a seguir
             }
+            
+            # <--- MUDANÇA 2: SÓ ADICIONA A CHAVE 'context' SE FOR UM EXEMPLO 'intersentence' --->
+            if config == 'intersentence':
+                new_example["context"] = next(translated_iter)
             
             original_sents_data = original_example['sentences']
             num_sentences = len(original_sents_data['sentence'])
@@ -101,7 +108,7 @@ def traduzir_e_recriar_estrutura_corretamente():
                 new_sentence_obj = {
                     "id": original_sents_data['id'][i],
                     "sentence": next(translated_iter),
-                    "labels": recreated_labels, # Usa a lista de dicionários recriada
+                    "labels": recreated_labels,
                     "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
                 }
                 new_example["sentences"].append(new_sentence_obj)
@@ -109,19 +116,23 @@ def traduzir_e_recriar_estrutura_corretamente():
             new_examples_list.append(new_example)
         reconstructed_data[config] = new_examples_list
 
-    # --- ETAPA DE SALVAMENTO ---
+    # --- ETAPA DE SALVAMENTO (SEM MUDANÇAS) ---
     final_output_structure = {
         "version": "1.1",
-        "data": reconstructed_data
+        "data": {
+            # O arquivo final terá ambas as seções, como o original dev.json
+            "intrasentence": reconstructed_data.get('intrasentence', []),
+            "intersentence": reconstructed_data.get('intersentence', [])
+        }
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT}_pt_nllb_formato_original.json"
+    output_path = f"dev_pt.json" # Nome mais padronizado
     print(f"Salvando o dataset final em: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível com a estrutura original.")
+    print("\n✅ Sucesso! O arquivo de saída agora contém ambas as estruturas (intra/inter) e é compatível com o script de avaliação.")
 
 
 if __name__ == "__main__":
