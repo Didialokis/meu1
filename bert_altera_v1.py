@@ -1,163 +1,22 @@
-# -*- coding: utf-8 -*-
+# ... (início da função)
+                # Nova lógica robusta para encontrar a palavra-alvo
+                context_words = set(example['context'].replace("BLANK", "").translate(str.maketrans('', '', string.punctuation)).split())
+                sentence_words = set(sentence['sentence'].translate(str.maketrans('', '', string.punctuation)).split())
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from datasets import load_dataset
-import re
-import json
-from tqdm import tqdm
+                # A palavra-alvo é a que está no conjunto da sentença, mas não no do contexto
+                difference = sentence_words.difference(context_words)
 
-# --- 1. CONFIGURAÇÕES ---
+                if len(difference) != 1:
+                    # Se a diferença não for exatamente uma palavra, algo deu errado na tradução ou na lógica.
+                    # Isso ajuda a depurar casos estranhos.
+                    print(f"AVISO: Não foi possível encontrar uma única palavra de diferença para o ID {sentence['id']}.")
+                    print(f"Contexto: {example['context']}")
+                    print(f"Sentença: {sentence['sentence']}")
+                    print(f"Diferença encontrada: {difference}")
+                    # Pular este exemplo problemático para não quebrar a execução
+                    continue 
 
-MODEL_NAME = "facebook/nllb-200-1.3B"
-DATASET_NAME = "McGill-NLP/stereoset"
-CONFIGS = ['intersentence', 'intrasentence']
-DATASET_SPLIT = "validation"
-SOURCE_LANG = "eng_Latn"
-TARGET_LANG = "por_Latn"
-BATCH_SIZE = 32
-
-GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
-INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
-
-# --- 2. FUNÇÃO AUXILIAR ---
-
-def sanitize_text(text):
-    """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
-    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-
-# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
-
-def traduzir_e_recriar_estrutura_corretamente():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}")
-
-    print(f"Carregando o modelo '{MODEL_NAME}'...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SOURCE_LANG)
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
-    print("Modelo carregado com sucesso.")
-
-    # --- ETAPA DE EXTRAÇÃO (AJUSTADA PARA NÃO TRADUZIR 'BLANK') ---
-    datasets_dict = {}
-    sentences_to_translate = []
-    # Usaremos esta lista para rastrear os pedaços do contexto intrasentence
-    intrasentence_context_parts = []
-
-    for config in CONFIGS:
-        print(f"Carregando a configuração '{config}' do dataset...")
-        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-        datasets_dict[config] = dataset
-        for example in dataset:
-            if config == 'intersentence':
-                # Para intersentence, a lógica é simples: traduzir tudo
-                if 'context' in example and example['context']:
-                    sentences_to_translate.append(example['context'])
-            else: # config == 'intrasentence'
-                # <--- MUDANÇA CRUCIAL: Dividir o contexto em 'BLANK' --->
-                # Em vez de traduzir a frase inteira com "BLANK" nela...
-                context_str = example.get('context', '')
-                if 'BLANK' in context_str:
-                    parts = context_str.split('BLANK', 1)
-                    prefix = parts[0]
-                    suffix = parts[1]
-                    # Adicionamos os pedaços para serem traduzidos separadamente
-                    sentences_to_translate.append(prefix)
-                    sentences_to_translate.append(suffix)
-                else:
-                    # Caso de borda: se não houver BLANK, adiciona textos vazios para manter a ordem
-                    sentences_to_translate.append('')
-                    sentences_to_translate.append('')
-
-            # As frases de exemplo sempre são traduzidas por inteiro
-            sentences_to_translate.extend(example['sentences']['sentence'])
-    
-    print(f"Total de {len(sentences_to_translate)} textos extraídos para tradução.")
-
-    # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
-    print("Iniciando a tradução em lotes...")
-    translated_sentences = []
-    forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
-
-    for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo Lotes"):
-        batch = sentences_to_translate[i:i + BATCH_SIZE]
-        # Garante que o lote não contenha Nones ou outros tipos
-        batch = [str(b) for b in batch]
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-        generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
-        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
-        translated_sentences.extend(batch_sanitized)
-    print("Tradução finalizada.")
-
-    # --- ETAPA DE RECONSTRUÇÃO (AJUSTADA PARA REMONTAR 'BLANK') ---
-    print("Reconstruindo o dataset na estrutura original...")
-    translated_iter = iter(translated_sentences)
-    
-    reconstructed_data = {}
-    for config in CONFIGS:
-        original_dataset = datasets_dict[config]
-        new_examples_list = []
-        for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
-            new_example = {
-                "id": original_example['id'],
-                "bias_type": original_example['bias_type'],
-                "target": original_example['target'],
-                "sentences": []
-            }
-            
-            if config == 'intersentence':
-                if 'context' in original_example and original_example['context']:
-                    new_example["context"] = next(translated_iter)
-            else: # config == 'intrasentence'
-                # <--- MUDANÇA CRUCIAL: Remontar o contexto com 'BLANK' --->
-                translated_prefix = next(translated_iter).strip()
-                translated_suffix = next(translated_iter).strip()
-                # Recria o contexto, garantindo um espaço ao redor do BLANK
-                new_example["context"] = f"{translated_prefix} BLANK {translated_suffix}".strip()
-            
-            original_sents_data = original_example['sentences']
-            num_sentences = len(original_sents_data['sentence'])
-
-            for i in range(num_sentences):
-                recreated_labels = []
-                labels_data_for_one_sentence = original_sents_data['labels'][i]
-                human_ids = labels_data_for_one_sentence['human_id']
-                inner_int_labels = labels_data_for_one_sentence['label']
-                
-                for j in range(len(human_ids)):
-                    recreated_labels.append({
-                        "human_id": human_ids[j],
-                        "label": INNER_LABEL_MAP[inner_int_labels[j]]
-                    })
-
-                new_sentence_obj = {
-                    "id": original_sents_data['id'][i],
-                    "sentence": next(translated_iter),
-                    "labels": recreated_labels,
-                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
-                }
-                new_example["sentences"].append(new_sentence_obj)
-            
-            new_examples_list.append(new_example)
-        reconstructed_data[config] = new_examples_list
-
-    # --- ETAPA DE SALVAMENTO ---
-    final_output_structure = {
-        "version": "1.1",
-        "data": {
-            "intrasentence": reconstructed_data.get('intrasentence', []),
-            "intersentence": reconstructed_data.get('intersentence', [])
-        }
-    }
-    
-    output_path = "dev_pt.json"
-    print(f"Salvando o dataset final em: {output_path}")
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
-
-    print("\n✅ Sucesso! O arquivo agora é estruturalmente robusto e à prova de erros de tradução.")
-
-
-if __name__ == "__main__":
-    traduzir_e_recriar_estrutura_corretamente()
+                template_word = difference.pop()
+                sentence_obj.template_word = template_word
+                sentences.append(sentence_obj)
+# ... (resto da função)
