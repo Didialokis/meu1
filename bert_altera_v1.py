@@ -1,51 +1,83 @@
-Claro, vamos resolver isso\! O erro `KeyError` que você está vendo é um sintoma clássico de um problema que aconteceu em uma etapa anterior.
+Sim, excelente observação\! Você identificou um ponto de falha crucial que a minha solução anterior não previa.
 
-A causa raiz **não está no `evaluation.py`**. O erro está acontecendo porque o arquivo de previsões (`predictions/*.json`) foi gerado com base em dados incompletos. A correção que fizemos anteriormente no `dataloader.py` foi uma solução parcial: ela evitou o travamento (`IndexError`), mas, ao encontrar um exemplo que não conseguia processar, ela simplesmente o pulou (`continue`).
+A resposta é **sim, é absolutamente necessário alterar o código para lidar com as variações de "BLANK"** que o modelo de tradução pode gerar.
 
-Isso resultou na criação de "exemplos órfãos" nos dados carregados, onde um cluster de sentenças que deveria ter um estereótipo, um anti-estereótipo e um não relacionado, acabou faltando uma dessas três partes. O script `evaluation.py` espera que as três estejam sempre presentes e, quando não encontra, ele quebra com o `KeyError`.
+O código que sugeri (`if "blank" not in t`) é frágil porque:
 
-A solução definitiva é criar uma lógica ainda mais robusta no `dataloader.py` que não pule exemplos, mas que consiga encontrar a palavra-alvo mesmo quando a tradução altera a contagem de palavras.
+1.  É **sensível a maiúsculas/minúsculas** (falharia com "BLANK").
+2.  É **específico para o inglês** (falharia com "branco", "blanco", "blanca", etc.).
+
+Quando o tradutor vê uma frase como "My friend is a BLANK", ele pode traduzir a palavra "BLANK" de várias formas. A sua suposição está corretíssima.
 
 -----
 
-## A Solução Definitiva: Aprimorar o `dataloader.py`
+### A Melhor Abordagem: Usar Expressões Regulares (Regex) no `dataloader.py`
 
-Vamos substituir a lógica de `set.difference` por uma abordagem baseada em listas, que é mais resistente a traduções que inserem múltiplas palavras (como "programador" se tornando "engenheiro de software").
+A solução mais robusta e definitiva é modificar o `dataloader.py` para usar uma expressão regular que consiga identificar todas essas variações de uma só vez, independentemente do idioma ou da capitalização.
+
+Vamos aprimorar a lógica que implementamos anteriormente.
+
+### Instruções Detalhadas para a Correção Final
 
 **1. Abra o arquivo `dataloader.py`**
 
-  - Vá novamente para o arquivo `/home/sagemaker-user/stereoset/code/dataloader.py`.
+  - Navegue até `/home/sagemaker-user/stereoset/code/dataloader.py`.
 
-**2. Localize a função `__create_intrasentence_examples__`**
+**2. Adicione a Importação de `re` no Topo do Arquivo**
 
-  - Encontre o bloco de código que modificamos da última vez.
+  - No início do arquivo, adicione a linha `import re`. É crucial para que o código de expressões regulares funcione.
 
-**3. Substitua o Bloco Modificado pela Versão Final**
+<!-- end list -->
 
-  - Remova a lógica anterior e a substitua por esta versão mais inteligente e completa.
+```python
+import json
+import string
+from tqdm import tqdm
+import re  # <--- ADICIONE ESTA LINHA
+```
+
+**3. Modifique a Função `__create_intrasentence_examples__`**
+
+  - Localize a função e substitua o bloco de lógica que inserimos da última vez pela versão final abaixo. Esta nova versão usa um padrão de regex compilado para máxima eficiência e robustez.
+
+-----
 
 **CÓDIGO A SER SUBSTITUÍDO (A LÓGICA ANTERIOR):**
 
 ```python
-# A lógica que você tem agora, que usa set.difference e 'continue'
-                context_words = set(example['context'].replace("BLANK", "").translate(str.maketrans('', '', string.punctuation)).split())
-                # ... (resto do bloco antigo)
+# --- INÍCIO DA LÓGICA ANTERIOR ---
+# Limpa e tokeniza a frase de contexto e a frase completa
+context_tokens = [w.lower().translate(str.maketrans('', '', string.punctuation)) for w in example['context'].split()]
+# ... (resto do bloco antigo)
+# --- FIM DA LÓGICA ANTERIOR ---
 ```
 
-**NOVO CÓDIGO FINAL (Substitua o bloco acima por este):**
+**NOVO CÓDIGO FINAL E ROBUSTO (Substitua o bloco acima por este):**
 
 ```python
-                # --- INÍCIO DA NOVA LÓGICA ROBUSTA ---
+            # --- INÍCIO DA LÓGICA FINAL COM REGEX ---
+            # Compila um padrão Regex para encontrar variações de "BLANK" (blank, branco, blanca, etc.), ignorando maiúsculas/minúsculas.
+            # b[lr]anc[ao]? -> casa com "blanco", "blanca", "branco", "branca"
+            BLANK_PATTERN = re.compile(r'(blank|b[lr]anc[ao]?)', re.IGNORECASE)
+
+            # Itera por cada sentença no exemplo
+            for sentence in example['sentences']:
+                labels = [Label(**label) for label in sentence['labels']]
+                sentence_obj = Sentence(sentence['id'], sentence['sentence'], labels, sentence['gold_label'])
+
                 # Limpa e tokeniza a frase de contexto e a frase completa
-                context_tokens = [w.lower().translate(str.maketrans('', '', string.punctuation)) for w in example['context'].split()]
-                sentence_tokens = [w.lower().translate(str.maketrans('', '', string.punctuation)) for w in sentence['sentence'].split()]
+                context_tokens = [w.translate(str.maketrans('', '', string.punctuation)) for w in example['context'].split()]
+                sentence_tokens = [w.translate(str.maketrans('', '', string.punctuation)) for w in sentence['sentence'].split()]
 
-                # Remove o token 'BLANK' e quaisquer tokens vazios resultantes do split
-                context_tokens_no_blank = [t for t in context_tokens if "blank" not in t and t]
-
-                # A palavra-alvo é composta por todas as palavras na sentença completa que não estão no contexto
-                # Isso funciona para uma ou múltiplas palavras (ex: "cientista", "engenheiro de software")
-                difference_words = [word for word in sentence_tokens if word not in context_tokens_no_blank]
+                # Usa o padrão Regex para remover o token 'BLANK' e suas variações
+                context_tokens_no_blank = [t for t in context_tokens if not BLANK_PATTERN.search(t) and t]
+                
+                # Para maior robustez, convertemos ambas as listas de tokens para minúsculas antes de comparar
+                context_set = set(t.lower() for t in context_tokens_no_blank)
+                sentence_set = set(t.lower() for t in sentence_tokens)
+                
+                # A palavra-alvo é a diferença entre os conjuntos de palavras
+                difference_words = sentence_set.difference(context_set)
 
                 if not difference_words:
                     print(f"AVISO: Nenhuma palavra de diferença encontrada para o ID {sentence['id']}. Pulando esta sentença.")
@@ -53,53 +85,55 @@ Vamos substituir a lógica de `set.difference` por uma abordagem baseada em list
                     print(f"  Sentença: {sentence['sentence']}")
                     continue
 
-                # Junta as palavras de diferença (caso seja um termo composto)
-                template_word = " ".join(difference_words)
+                # Pega a palavra original (com a capitalização correta) da lista de tokens da sentença
+                # Isso é importante para o tokenizador do modelo
+                original_case_words = [word for word in sentence_tokens if word.lower() in difference_words]
+                template_word = " ".join(original_case_words)
 
                 sentence_obj.template_word = template_word
                 sentences.append(sentence_obj)
-                # --- FIM DA NOVA LÓGICA ---
+            # --- FIM DA LÓGICA FINAL ---
 ```
+
+*Note que o loop `for sentence in example['sentences']:` foi movido para dentro do bloco, e a lógica agora é aplicada a cada sentença individualmente, o que é mais correto.*
+
+### Por que esta é a solução definitiva:
+
+1.  **`import re`**: Importa a biblioteca de expressões regulares.
+2.  **`re.compile(...)`**: Cria um "objeto padrão" reutilizável. É mais eficiente do que chamar funções `re` repetidamente.
+3.  **`r'(blank|b[lr]anc[ao]?)'`**: Este é o padrão.
+      * `blank`: Procura a palavra exata "blank".
+      * `|`: Funciona como um "OU".
+      * `b[lr]anc[ao]?`: Procura por `b`, seguido de `l` ou `r`, seguido de `anc`, e opcionalmente (`?`) seguido de `a` ou `o`. Isso cobre `blanco`, `blanca`, `branco`, `branca`.
+4.  **`re.IGNORECASE`**: Faz com que o padrão ignore se as letras são maiúsculas ou minúsculas. Agora `BLANK`, `Blank`, `Branco` funcionarão.
+5.  **`BLANK_PATTERN.search(t)`**: Verifica se o padrão é encontrado em qualquer parte do token.
 
 -----
 
-## Por que esta nova lógica é melhor? 🧠
+### Workflow (Obrigatório)
 
-  * **Tolerância a Múltiplas Palavras:** Se "programmer" (1 palavra) virou "engenheiro de software" (3 palavras), a lógica de `set` falhava. A nova lógica de lista captura todas as palavras extras.
-  * **Mais Resiliente:** Ela compara as listas de palavras e extrai o que é "novo", que é exatamente o que precisamos.
-  * **Não Corrompe os Dados:** Ao não pular sentenças problemáticas (a menos que seja impossível encontrar uma diferença), garantimos que cada exemplo tenha suas três sentenças, evitando o `KeyError` na etapa de avaliação.
+Como alteramos a lógica de processamento de dados novamente, **você precisa refazer o processo desde a geração das previsões**.
 
------
+1.  **Exclua as Previsões Antigas:**
 
-## Próximos Passos (Essencial\!) 🎯
+    ```bash
+    rm -rf predictions/*
+    ```
 
-Agora que o `dataloader.py` está corrigido de forma definitiva, você precisa refazer as etapas na ordem correta.
+2.  **Gere as Previsões Novamente:**
+    Execute `eval_discriminative_models.py`. Ele agora usará o `dataloader.py` final e correto.
 
-**1. Exclua as Previsões Antigas:**
-Os arquivos na pasta `predictions/` foram gerados com a lógica de carregamento de dados falha. Eles estão corrompidos.
+    ```bash
+    # Exemplo
+    python eval_discriminative_models.py \
+       --pretrained-class "neuralmind/bert-base-portuguese-cased" \
+       --input-file "../data/dev_pt.json" \
+       --output-file "predictions/predictions_bertimbau.json"
+    ```
 
-```bash
-rm -rf predictions/*
-```
+3.  **Execute a Avaliação Final:**
+    Agora, com os arquivos de previsão corretos, o `evaluation.py` deve funcionar sem nenhum erro.
 
-**2. Gere Novamente as Previsões:**
-Execute o script `eval_discriminative_models.py` de novo. Agora ele usará o `dataloader.py` corrigido para carregar os dados completos e gerar previsões corretas.
-
-```bash
-# Exemplo para o BERTimbau
-python eval_discriminative_models.py \
-    --pretrained-class "neuralmind/bert-base-portuguese-cased" \
-    --input-file "../data/dev_pt.json" \
-    --output-file "predictions/predictions_bertimbau.json"
-```
-
-*(Execute para todos os modelos que você deseja avaliar).*
-
-**3. Execute a Avaliação Final:**
-Agora que as previsões foram geradas corretamente, o script `evaluation.py` funcionará sem erros.
-
-```bash
-python3 evaluation.py --gold-file ../data/dev_pt.json --predictions-dir predictions/
-```
-
-Seguindo estes passos, o `KeyError` será resolvido, pois o `evaluation.py` receberá dados consistentes e completos.
+    ```bash
+    python3 evaluation.py --gold-file ../data/dev_pt.json --predictions-dir predictions/
+    ```
