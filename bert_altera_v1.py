@@ -66,7 +66,7 @@ def traduzir_e_recriar_estrutura_corretamente():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- ETAPA DE EXTRAÇÃO (CORRIGIDA E ROBUSTA) ---
+    # --- ETAPA DE EXTRAÇÃO (SEM MUDANÇAS) ---
     datasets_dict = {}
     sentences_to_translate = []
     for config in CONFIGS:
@@ -74,8 +74,6 @@ def traduzir_e_recriar_estrutura_corretamente():
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         datasets_dict[config] = dataset
         for example in dataset:
-            # A chave 'context' existe tanto em 'intra' quanto 'inter' no dataset original.
-            # Esta lógica garante que a ordem das sentenças seja preservada para a reconstrução.
             if 'context' in example and example['context']:
                 sentences_to_translate.append(example['context'])
             sentences_to_translate.extend(example['sentences']['sentence'])
@@ -96,13 +94,13 @@ def traduzir_e_recriar_estrutura_corretamente():
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO (CORRIGIDA E ROBUSTA) ---
+    # --- ETAPA DE RECONSTRUÇÃO (LÓGICA FINAL) ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
     
-    # MUDANÇA 2: PADRÃO REGEX PARA ENCONTRAR E PADRONIZAR "BLANK"
-    # \b garante que estamos pegando a palavra inteira. Cobre "branco", "branca", "em branco", etc.
-    BLANK_PATTERN = re.compile(r'\b(branco|branca|blanco|blanca|em branco)\b', re.IGNORECASE)
+    # MUDANÇA PRINCIPAL: Padrão Regex para encontrar e padronizar "BLANK"
+    # \b garante que estamos pegando a palavra inteira. Cobre "branco", "branca", "blanco", "em branco", etc.
+    BLANK_PATTERN = re.compile(r'\b(branco|branca|blanco|blanca|em branco|lacuna)\b', re.IGNORECASE)
 
     reconstructed_data = {}
     for config in CONFIGS:
@@ -116,10 +114,10 @@ def traduzir_e_recriar_estrutura_corretamente():
                 "sentences": []
             }
             
-            # MUDANÇA 1: GARANTE QUE O CONTEXTO SEJA PRESERVADO PARA AMBOS OS TIPOS
+            # Garante que o contexto seja preservado para ambos os tipos
             if 'context' in original_example and original_example['context']:
                 translated_context = next(translated_iter)
-                # Se for um exemplo intrasentence, padroniza a tradução de "BLANK" de volta
+                # Se for um exemplo intrasentence, padroniza a tradução de "BLANK" de volta para o original.
                 if config == 'intrasentence':
                     translated_context = BLANK_PATTERN.sub("BLANK", translated_context)
                 new_example["context"] = translated_context
