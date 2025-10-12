@@ -21,62 +21,25 @@ python eval_discriminative_models.py \
     --output-file "predictions_mbert.json"
 //////////////////////////////////////////////////////////////
 
+def __create_intrasentence_examples__(self, examples):
+        created_examples = []
+        # Loop externo: itera sobre cada CLUSTER de sentenças
+        for example in examples:
+            sentences = []
+            
+            # Loop interno: itera sobre cada SENTENÇA dentro do cluster
+            for sentence in example['sentences']:
+                # Cria o objeto Sentença básico
+                labels = [Label(**label) for label in sentence['labels']]
+                sentence_obj = Sentence(
+                    sentence['id'], sentence['sentence'], labels, sentence['gold_label'])
 
-Excelente pergunta\! Sim, é totalmente possível diminuir drasticamente o número desses avisos e, consequentemente, fazer com que mais exemplos sejam avaliados.
-
-Sua observação está perfeita. O problema é que a nossa lógica atual no `dataloader.py` é muito restritiva. Ela só funciona se a única diferença entre a frase de contexto e a frase preenchida for a adição de *exatamente uma palavra*.
-
-Como vimos nos seus logs, a tradução é muito mais complexa. Um exemplo claro é:
-
-  * **Contexto:** `Sou enfermeira BLANK.`
-  * **Sentença:** `Sou um enfermeiro.`
-
-Aqui, a tradução mudou o gênero (`enfermeira` -\> `enfermeiro`) e adicionou um artigo (`um`). A nossa lógica atual se confunde e descarta o exemplo.
-
------
-
-### A Solução: Uma Lógica de "Diff" Inteligente no `dataloader.py`
-
-A melhor abordagem é implementar uma lógica muito mais sofisticada que funcione como um "diff" de texto (semelhante ao que o Git faz para comparar arquivos). Em vez de apenas procurar palavras que foram adicionadas, vamos encontrar a **sequência mais longa de palavras em comum** entre as duas frases e assumir que o que sobrou é a palavra-alvo que preencheu o `BLANK`.
-
-Usaremos a biblioteca `difflib` do Python, que é perfeita para isso.
-
-### Passo 1: Modificar o `dataloader.py` com a Lógica Final
-
-Esta alteração será mais robusta e deve capturar a grande maioria dos exemplos que antes eram descartados.
-
-1.  **Abra o arquivo** `/home/sagemaker-user/stereoset/code/dataloader.py`.
-2.  **Adicione duas novas importações** no topo do arquivo.
-    ```python
-    import json
-    import string
-    from tqdm import tqdm
-    import re
-    from difflib import SequenceMatcher # <--- ADICIONE ESTA LINHA
-    ```
-3.  **Localize a função** `__create_intrasentence_examples__` dentro da classe `StereoSet`.
-4.  **Substitua o bloco de lógica** que começa com `# --- INÍCIO DA NOVA LÓGICA ---` pela versão final e mais poderosa abaixo.
-
------
-
-**SUBSTITUA ESTE BLOCO DE CÓDIGO:**
-
-```python
-                # --- INÍCIO DA LÓGICA ANTERIOR ---
-                # Remove a pontuação e divide as frases em conjuntos de palavras em minúsculas
-                context_words = set(example['context'].replace("BLANK", "").lower().translate(str.maketrans('', '', string.punctuation)).split())
-                # ... (resto do bloco antigo) ...
-```
-
-**POR ESTE NOVO BLOCO DE CÓDIGO FINAL:**
-
-```python
-                # --- INÍCIO DA LÓGICA FINAL E MAIS ROBUSTA COM DIFF ---
+                # --- INÍCIO DA LÓGICA CORRIGIDA COM DIFF ---
                 # Limpa e tokeniza a frase de contexto, removendo a palavra BLANK
                 context_tokens = [w for w in example['context'].lower().split() if 'blank' not in w]
                 
-                # Limpa e tokeniza a frase completa
-                sentence_tokens = example['sentence'].lower().split()
+                # Limpa e tokeniza a frase completa (usando o dict 'sentence' do loop interno)
+                sentence_tokens = sentence['sentence'].lower().split()
 
                 # Usa o SequenceMatcher para encontrar a maior sequência de palavras em comum
                 matcher = SequenceMatcher(None, context_tokens, sentence_tokens)
@@ -85,7 +48,8 @@ Esta alteração será mais robusta e deve capturar a grande maioria dos exemplo
                 diff_words = []
                 for tag, i1, i2, j1, j2 in matcher.get_opcodes():
                     if tag != 'equal': # Captura inserções ('insert') e substituições ('replace')
-                        diff_words.extend(example['sentence'].split()[j1:j2]) # Pega as palavras com a capitalização original
+                        # Pega as palavras com a capitalização original da sentença correta
+                        diff_words.extend(sentence['sentence'].split()[j1:j2]) 
 
                 if diff_words:
                     template_word = " ".join(diff_words)
@@ -96,47 +60,15 @@ Esta alteração será mais robusta e deve capturar a grande maioria dos exemplo
                     print(f"AVISO: Não foi possível encontrar a diferença para o ID {sentence['id']}.")
                     print(f"  Contexto: {example['context']}")
                     print(f"  Sentença: {sentence['sentence']}")
-                # --- FIM DA LÓGICA FINAL ---
-```
+                # --- FIM DA LÓGICA CORRIGIDA ---
 
------
-
-### Por que esta nova lógica é muito superior?
-
-  * **Entende a Ordem:** Ao contrário dos `sets`, o `SequenceMatcher` respeita a ordem das palavras.
-  * **Tolerante a Múltiplas Palavras:** Se "programmer" virou "engenheiro de software", ele corretamente identificará "engenheiro de software" como a diferença.
-  * **Tolerante a Mudanças:** No caso `Sou enfermeira BLANK` vs. `Sou um enfermeiro`, ele encontrará `Sou` como a parte em comum e identificará `um enfermeiro` como a parte "nova", resolvendo o problema perfeitamente.
-  * **Capitalização Original:** A lógica foi aprimorada para extrair as palavras da sentença original, preservando a capitalização correta (ex: "EUA" em vez de "eua"), o que é melhor para o modelo.
-
-### Workflow (Obrigatório)
-
-Como alteramos fundamentalmente a forma como os dados são processados, é **essencial** refazer o processo desde a geração das previsões.
-
-1.  **Exclua as Previsões Antigas:** Elas foram geradas com a lógica antiga e são incompatíveis.
-
-    ```bash
-    rm -rf predictions/*
-    ```
-
-2.  **Gere as Previsões Novamente:** Execute o `eval_discriminative_models.py` para todos os seus modelos. Agora ele usará o `dataloader.py` aprimorado e processará muito mais exemplos.
-
-    ```bash
-    # Exemplo para o BERTimbau
-    python eval_discriminative_models.py \
-       --pretrained-class "neuralmind/bert-base-portuguese-cased" \
-       --input-file "../data/dev_pt.json" \
-       --output-file "predictions/predictions_bertimbau.json"
-    ```
-
-    Você notará que o número de "AVISOS" durante esta etapa irá **reduzir drasticamente**.
-
-3.  **Execute a Avaliação Final:** Agora que os arquivos de previsão são muito mais completos, o `evaluation.py` terá mais dados para analisar e os resultados serão mais representativos do dataset inteiro.
-
-    ```bash
-    python3 evaluation.py --gold-file ../data/dev_pt.json --predictions-dir predictions/
-    ```
-
-Com esta alteração, você terá uma avaliação muito mais completa e robusta, refletindo uma porção significativamente maior do seu dataset traduzido.
+            # Cria o objeto Exemplo com a lista de sentenças processadas
+            created_example = IntrasentenceExample(
+                example['id'], example['bias_type'], 
+                example['target'], example['context'], sentences) 
+            created_examples.append(created_example)
+            
+        return created_examples
 
 ///////////////////////////////////////////////////
 
