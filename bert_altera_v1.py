@@ -25,7 +25,91 @@ python eval_discriminative_models.py \
 
 
 
+///////////////////////////////////////////////////
 
+        Com certeza\! Analisando o seu traceback, o problema fica bem claro. A solução é **modificar o arquivo `dataloader.py`** para torná-lo mais robusto à tradução.
+
+-----
+
+### Diagnóstico do Erro 💡
+
+O erro `IndexError: list index out of range` acontece na linha:
+`template_word = sentence['sentence'].split(" ")[word_idx]`
+
+O problema é um pressuposto frágil no código original do Stereoset:
+
+1.  O script primeiro encontra o índice da palavra `"BLANK"` na frase de contexto (ex: "Meu amigo é um BLANK."). Vamos dizer que o índice (`word_idx`) seja `4`.
+2.  Em seguida, ele assume que a palavra-alvo (ex: "cientista") estará **exatamente no mesmo índice** na frase preenchida (ex: "Meu amigo é cientista.").
+3.  **A tradução quebra isso.** Em português, a frase "Meu amigo é cientista" tem apenas 4 palavras (índices 0 a 3). Quando o código tenta acessar o índice `4`, a lista é menor que o esperado, causando o erro `IndexError`.
+
+Tentar consertar isso no script de tradução é inviável. A solução correta é tornar o `dataloader.py` mais inteligente.
+
+-----
+
+### A Solução: Modificar o `dataloader.py`
+
+Vamos alterar a lógica para que, em vez de depender de um índice, ele encontre a palavra-alvo descobrindo qual palavra é a **diferença** entre a frase de contexto e a frase preenchida.
+
+#### Passo 1: Abra o arquivo `dataloader.py`
+
+Navegue até o arquivo `/home/sagemaker-user/stereoset/code/dataloader.py`.
+
+#### Passo 2: Localize a função `__create_intrasentence_examples__`
+
+Dentro da classe `StereoSet`, encontre esta função.
+
+#### Passo 3: Substitua a lógica de busca por índice
+
+Você substituirá um bloco de código dentro do loop `for sentence in example['sentences']:` por uma versão mais robusta.
+
+**SUBSTITUA ESTE BLOCO DE CÓDIGO ORIGINAL:**
+
+```python
+                word_idx = None
+                for idx, word in enumerate(example['context'].split(" ")):
+                    if "BLANK" in word: 
+                        word_idx = idx
+                if word_idx is None:
+                    raise Exception("No blank word found.")
+                template_word = sentence['sentence'].split(" ")[word_idx]
+                sentence_obj.template_word = template_word.translate(str.maketrans('', '', string.punctuation))
+                sentences.append(sentence_obj)
+```
+
+**POR ESTE NOVO BLOCO DE CÓDIGO ROBUSTO:**
+
+```python
+                # --- INÍCIO DA NOVA LÓGICA ---
+                # Remove a pontuação e divide as frases em conjuntos de palavras em minúsculas
+                context_words = set(example['context'].replace("BLANK", "").lower().translate(str.maketrans('', '', string.punctuation)).split())
+                sentence_words = set(sentence['sentence'].lower().translate(str.maketrans('', '', string.punctuation)).split())
+
+                # A palavra-alvo é a que está no conjunto da sentença, mas não no do contexto
+                difference = sentence_words.difference(context_words)
+
+                # Verifica se encontrou exatamente uma palavra de diferença
+                if len(difference) == 1:
+                    template_word = difference.pop()
+                    sentence_obj.template_word = template_word
+                    sentences.append(sentence_obj)
+                else:
+                    # Se a lógica falhar para um exemplo, imprime um aviso em vez de quebrar a execução
+                    print(f"AVISO: Não foi possível encontrar uma única palavra de diferença para o ID {sentence['id']}.")
+                    print(f"  Contexto: {example['context']}")
+                    print(f"  Sentença: {sentence['sentence']}")
+                    # Isso permite que o script continue com os outros exemplos
+```
+
+-----
+
+### Próximos Passos ✅
+
+1.  **Aplique a alteração** no seu arquivo `dataloader.py`.
+2.  **Não é necessário** gerar novamente o arquivo `dev_pt.json`. O problema estava na leitura do arquivo, não no arquivo em si.
+3.  **Execute o script `eval_discriminative_models.py` novamente.**
+
+O erro `IndexError` será resolvido, pois o programa não depende mais da frágil suposição de que a contagem de palavras permanece a mesma após a tradução.
+        
 ///////////////////////////////////////////////////
 # -*- coding: utf-8 -*-
 
