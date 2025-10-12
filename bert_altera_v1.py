@@ -1,3 +1,32 @@
+Bash
+
+python eval_discriminative_models.py \
+    --pretrained-class "neuralmind/bert-base-portuguese-cased" \
+    --tokenizer "BertTokenizer" \
+    --intrasentence-model "BertLM" \
+    --intersentence-model "BertNextSentence" \
+    --input-file "../data/dev_pt.json" \
+    --output-file "predictions_bertimbau.json"
+Para Avaliar o BERT Multilingual:
+O comando é quase idêntico, apenas mudando o nome do modelo e o arquivo de saída.
+
+Bash
+
+python eval_discriminative_models.py \
+    --pretrained-class "bert-base-multilingual-cased" \
+    --tokenizer "BertTokenizer" \
+    --intrasentence-model "BertLM" \
+    --intersentence-model "BertNextSentence" \
+    --input-file "../data/dev_pt.json" \
+    --output-file "predictions_mbert.json"
+
+
+
+
+
+
+
+///////////////////////////////////////////////////
 # -*- coding: utf-8 -*-
 
 import torch
