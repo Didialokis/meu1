@@ -1,139 +1,143 @@
-Sim, excelente observação\! Você identificou um ponto de falha crucial que a minha solução anterior não previa.
+# -*- coding: utf-8 -*-
 
-A resposta é **sim, é absolutamente necessário alterar o código para lidar com as variações de "BLANK"** que o modelo de tradução pode gerar.
-
-O código que sugeri (`if "blank" not in t`) é frágil porque:
-
-1.  É **sensível a maiúsculas/minúsculas** (falharia com "BLANK").
-2.  É **específico para o inglês** (falharia com "branco", "blanco", "blanca", etc.).
-
-Quando o tradutor vê uma frase como "My friend is a BLANK", ele pode traduzir a palavra "BLANK" de várias formas. A sua suposição está corretíssima.
-
------
-
-### A Melhor Abordagem: Usar Expressões Regulares (Regex) no `dataloader.py`
-
-A solução mais robusta e definitiva é modificar o `dataloader.py` para usar uma expressão regular que consiga identificar todas essas variações de uma só vez, independentemente do idioma ou da capitalização.
-
-Vamos aprimorar a lógica que implementamos anteriormente.
-
-### Instruções Detalhadas para a Correção Final
-
-**1. Abra o arquivo `dataloader.py`**
-
-  - Navegue até `/home/sagemaker-user/stereoset/code/dataloader.py`.
-
-**2. Adicione a Importação de `re` no Topo do Arquivo**
-
-  - No início do arquivo, adicione a linha `import re`. É crucial para que o código de expressões regulares funcione.
-
-<!-- end list -->
-
-```python
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from datasets import load_dataset
+import re
 import json
-import string
 from tqdm import tqdm
-import re  # <--- ADICIONE ESTA LINHA
-```
 
-**3. Modifique a Função `__create_intrasentence_examples__`**
+# --- 1. CONFIGURAÇÕES ---
 
-  - Localize a função e substitua o bloco de lógica que inserimos da última vez pela versão final abaixo. Esta nova versão usa um padrão de regex compilado para máxima eficiência e robustez.
+MODEL_NAME = "facebook/nllb-200-1.3B"
+DATASET_NAME = "McGill-NLP/stereoset"
+CONFIGS = ['intersentence', 'intrasentence']
+DATASET_SPLIT = "validation"
+SOURCE_LANG = "eng_Latn"
+TARGET_LANG = "por_Latn"
+BATCH_SIZE = 8
 
------
+GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
+INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
 
-**CÓDIGO A SER SUBSTITUÍDO (A LÓGICA ANTERIOR):**
+# --- 2. FUNÇÃO AUXILIAR ---
 
-```python
-# --- INÍCIO DA LÓGICA ANTERIOR ---
-# Limpa e tokeniza a frase de contexto e a frase completa
-context_tokens = [w.lower().translate(str.maketrans('', '', string.punctuation)) for w in example['context'].split()]
-# ... (resto do bloco antigo)
-# --- FIM DA LÓGICA ANTERIOR ---
-```
+def sanitize_text(text):
+    """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
-**NOVO CÓDIGO FINAL E ROBUSTO (Substitua o bloco acima por este):**
+# --- 3. FUNÇÃO PRINCIPAL DE TRADUÇÃO ---
 
-```python
-            # --- INÍCIO DA LÓGICA FINAL COM REGEX ---
-            # Compila um padrão Regex para encontrar variações de "BLANK" (blank, branco, blanca, etc.), ignorando maiúsculas/minúsculas.
-            # b[lr]anc[ao]? -> casa com "blanco", "blanca", "branco", "branca"
-            BLANK_PATTERN = re.compile(r'(blank|b[lr]anc[ao]?)', re.IGNORECASE)
+def traduzir_e_recriar_estrutura_corretamente():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando dispositivo: {device}")
 
-            # Itera por cada sentença no exemplo
-            for sentence in example['sentences']:
-                labels = [Label(**label) for label in sentence['labels']]
-                sentence_obj = Sentence(sentence['id'], sentence['sentence'], labels, sentence['gold_label'])
+    print(f"Carregando o modelo '{MODEL_NAME}'...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SOURCE_LANG)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    print("Modelo carregado com sucesso.")
 
-                # Limpa e tokeniza a frase de contexto e a frase completa
-                context_tokens = [w.translate(str.maketrans('', '', string.punctuation)) for w in example['context'].split()]
-                sentence_tokens = [w.translate(str.maketrans('', '', string.punctuation)) for w in sentence['sentence'].split()]
+    # --- ETAPA DE EXTRAÇÃO (CORRIGIDA E ROBUSTA) ---
+    datasets_dict = {}
+    sentences_to_translate = []
+    for config in CONFIGS:
+        print(f"Carregando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
+        datasets_dict[config] = dataset
+        for example in dataset:
+            # A chave 'context' existe tanto em 'intra' quanto 'inter' no dataset original.
+            # Esta lógica garante que a ordem das sentenças seja preservada para a reconstrução.
+            if 'context' in example and example['context']:
+                sentences_to_translate.append(example['context'])
+            sentences_to_translate.extend(example['sentences']['sentence'])
+    
+    print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-                # Usa o padrão Regex para remover o token 'BLANK' e suas variações
-                context_tokens_no_blank = [t for t in context_tokens if not BLANK_PATTERN.search(t) and t]
+    # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
+    print("Iniciando a tradução em lotes...")
+    translated_sentences = []
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
+
+    for i in tqdm(range(0, len(sentences_to_translate), BATCH_SIZE), desc="Traduzindo Lotes"):
+        batch = sentences_to_translate[i:i + BATCH_SIZE]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
+        generated_tokens = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_length=128)
+        batch_translated_raw = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        batch_sanitized = [sanitize_text(text) for text in batch_translated_raw]
+        translated_sentences.extend(batch_sanitized)
+    print("Tradução finalizada.")
+
+    # --- ETAPA DE RECONSTRUÇÃO (CORRIGIDA E ROBUSTA) ---
+    print("Reconstruindo o dataset na estrutura original...")
+    translated_iter = iter(translated_sentences)
+    
+    # MUDANÇA 2: PADRÃO REGEX PARA ENCONTRAR E PADRONIZAR "BLANK"
+    # \b garante que estamos pegando a palavra inteira. Cobre "branco", "branca", "em branco", etc.
+    BLANK_PATTERN = re.compile(r'\b(branco|branca|blanco|blanca|em branco)\b', re.IGNORECASE)
+
+    reconstructed_data = {}
+    for config in CONFIGS:
+        original_dataset = datasets_dict[config]
+        new_examples_list = []
+        for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
+            new_example = {
+                "id": original_example['id'],
+                "bias_type": original_example['bias_type'],
+                "target": original_example['target'],
+                "sentences": []
+            }
+            
+            # MUDANÇA 1: GARANTE QUE O CONTEXTO SEJA PRESERVADO PARA AMBOS OS TIPOS
+            if 'context' in original_example and original_example['context']:
+                translated_context = next(translated_iter)
+                # Se for um exemplo intrasentence, padroniza a tradução de "BLANK" de volta
+                if config == 'intrasentence':
+                    translated_context = BLANK_PATTERN.sub("BLANK", translated_context)
+                new_example["context"] = translated_context
+            
+            original_sents_data = original_example['sentences']
+            num_sentences = len(original_sents_data['sentence'])
+
+            for i in range(num_sentences):
+                recreated_labels = []
+                labels_data_for_one_sentence = original_sents_data['labels'][i]
+                human_ids = labels_data_for_one_sentence['human_id']
+                inner_int_labels = labels_data_for_one_sentence['label']
                 
-                # Para maior robustez, convertemos ambas as listas de tokens para minúsculas antes de comparar
-                context_set = set(t.lower() for t in context_tokens_no_blank)
-                sentence_set = set(t.lower() for t in sentence_tokens)
-                
-                # A palavra-alvo é a diferença entre os conjuntos de palavras
-                difference_words = sentence_set.difference(context_set)
+                for j in range(len(human_ids)):
+                    recreated_labels.append({
+                        "human_id": human_ids[j],
+                        "label": INNER_LABEL_MAP[inner_int_labels[j]]
+                    })
 
-                if not difference_words:
-                    print(f"AVISO: Nenhuma palavra de diferença encontrada para o ID {sentence['id']}. Pulando esta sentença.")
-                    print(f"  Contexto: {example['context']}")
-                    print(f"  Sentença: {sentence['sentence']}")
-                    continue
+                new_sentence_obj = {
+                    "id": original_sents_data['id'][i],
+                    "sentence": next(translated_iter),
+                    "labels": recreated_labels,
+                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
+                }
+                new_example["sentences"].append(new_sentence_obj)
+            
+            new_examples_list.append(new_example)
+        reconstructed_data[config] = new_examples_list
 
-                # Pega a palavra original (com a capitalização correta) da lista de tokens da sentença
-                # Isso é importante para o tokenizador do modelo
-                original_case_words = [word for word in sentence_tokens if word.lower() in difference_words]
-                template_word = " ".join(original_case_words)
+    # --- ETAPA DE SALVAMENTO ---
+    final_output_structure = {
+        "version": "1.1",
+        "data": {
+            "intrasentence": reconstructed_data.get('intrasentence', []),
+            "intersentence": reconstructed_data.get('intersentence', [])
+        }
+    }
+    
+    output_path = "dev_pt.json"
+    print(f"Salvando o dataset final em: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-                sentence_obj.template_word = template_word
-                sentences.append(sentence_obj)
-            # --- FIM DA LÓGICA FINAL ---
-```
+    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível com a estrutura original do Stereoset.")
 
-*Note que o loop `for sentence in example['sentences']:` foi movido para dentro do bloco, e a lógica agora é aplicada a cada sentença individualmente, o que é mais correto.*
 
-### Por que esta é a solução definitiva:
-
-1.  **`import re`**: Importa a biblioteca de expressões regulares.
-2.  **`re.compile(...)`**: Cria um "objeto padrão" reutilizável. É mais eficiente do que chamar funções `re` repetidamente.
-3.  **`r'(blank|b[lr]anc[ao]?)'`**: Este é o padrão.
-      * `blank`: Procura a palavra exata "blank".
-      * `|`: Funciona como um "OU".
-      * `b[lr]anc[ao]?`: Procura por `b`, seguido de `l` ou `r`, seguido de `anc`, e opcionalmente (`?`) seguido de `a` ou `o`. Isso cobre `blanco`, `blanca`, `branco`, `branca`.
-4.  **`re.IGNORECASE`**: Faz com que o padrão ignore se as letras são maiúsculas ou minúsculas. Agora `BLANK`, `Blank`, `Branco` funcionarão.
-5.  **`BLANK_PATTERN.search(t)`**: Verifica se o padrão é encontrado em qualquer parte do token.
-
------
-
-### Workflow (Obrigatório)
-
-Como alteramos a lógica de processamento de dados novamente, **você precisa refazer o processo desde a geração das previsões**.
-
-1.  **Exclua as Previsões Antigas:**
-
-    ```bash
-    rm -rf predictions/*
-    ```
-
-2.  **Gere as Previsões Novamente:**
-    Execute `eval_discriminative_models.py`. Ele agora usará o `dataloader.py` final e correto.
-
-    ```bash
-    # Exemplo
-    python eval_discriminative_models.py \
-       --pretrained-class "neuralmind/bert-base-portuguese-cased" \
-       --input-file "../data/dev_pt.json" \
-       --output-file "predictions/predictions_bertimbau.json"
-    ```
-
-3.  **Execute a Avaliação Final:**
-    Agora, com os arquivos de previsão corretos, o `evaluation.py` deve funcionar sem nenhum erro.
-
-    ```bash
-    python3 evaluation.py --gold-file ../data/dev_pt.json --predictions-dir predictions/
-    ```
+if __name__ == "__main__":
+    traduzir_e_recriar_estrutura_corretamente()
