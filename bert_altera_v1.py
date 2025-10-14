@@ -19,6 +19,15 @@ python eval_discriminative_models.py \
     --intersentence-model "BertNextSentence" \
     --input-file "../data/dev_pt.json" \
     --output-file "predictions_mbert.json"
+
+//////////////////////////////////////////////////////////////python eval_discriminative_models.py \
+    --pretrained-class "xlm-roberta-base" \
+    --tokenizer "RobertaTokenizer" \
+    --intrasentence-model "RoBERTaLM" \
+    --intersentence-model "RoBERTaLM" \
+    --input-file "../data/dev_pt.json" \
+    --output-file "predictions/predictions_xlm-roberta-base.json"
+    
 //////////////////////////////////////////////////////////////
 
 def __create_intrasentence_examples__(self, examples):
