@@ -312,54 +312,56 @@ if __name__ == "__main__":
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
-    import json
-import re
+def __create_intrasentence_examples__(self, examples):
+        created_examples = []
+        # Loop externo: itera sobre cada CLUSTER de sentenças
+        for example in examples:
+            sentences = []
+            
+            # Loop interno: itera sobre cada SENTENÇA dentro do cluster
+            for sentence in example['sentences']:
+                # Cria o objeto Sentença básico
+                labels = [Label(**label) for label in sentence['labels']]
+                sentence_obj = Sentence(
+                    sentence['id'], sentence['sentence'], labels, sentence['gold_label'])
 
-# --- CONFIGURAÇÕES ---
-JSON_FILE_PATH = '../data/dev_pt.json' # Verifique se o caminho está correto
+                # --- INÍCIO DA LÓGICA FINAL (CORRIGIDA PARA INDEXERROR) ---
+                
+                # 1. Tokeniza o contexto (em minúsculas)
+                context_tokens = [w for w in example['context'].lower().split() if 'blank' not in w]
+                
+                # 2. Tokeniza a sentença, MAS MANTÉM A CAPITALIZAÇÃO ORIGINAL
+                original_sentence_tokens = sentence['sentence'].split()
+                
+                # 3. Cria a versão em minúsculas PARA COMPARAÇÃO
+                sentence_tokens_lower = [w.lower() for w in original_sentence_tokens]
 
-def find_missing_blanks():
-    """
-    Lê o arquivo JSON do Stereoset e verifica quais exemplos 'intrasentence'
-    não contêm a palavra "BLANK" em seu contexto.
-    """
-    print(f"🔍 Verificando o arquivo: {JSON_FILE_PATH}")
-    
-    try:
-        with open(JSON_FILE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ ERRO: Arquivo não encontrado em '{JSON_FILE_PATH}'. Verifique o caminho.")
-        return
+                # 4. Compara o contexto (minúsculo) com a sentença (minúscula)
+                matcher = SequenceMatcher(None, context_tokens, sentence_tokens_lower)
+                
+                diff_words = []
+                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                    if tag != 'equal':
+                        # 5. Usa os índices da comparação para extrair da LISTA ORIGINAL (com capitalização)
+                        #    Isso agora é seguro, pois original_sentence_tokens e sentence_tokens_lower
+                        #    têm o mesmo comprimento garantido.
+                        diff_words.extend(original_sentence_tokens[j1:j2]) 
 
-    intrasentence_examples = data.get('data', {}).get('intrasentence', [])
-    
-    if not intrasentence_examples:
-        print("⚠️ A seção 'intrasentence' não foi encontrada ou está vazia.")
-        return
+                if diff_words:
+                    template_word = " ".join(diff_words)
+                    sentence_obj.template_word = template_word.translate(str.maketrans('', '', string.punctuation))
+                    sentences.append(sentence_obj)
+                else:
+                    # Se ainda assim falhar, imprime o aviso
+                    print(f"AVISO: Não foi possível encontrar a diferença para o ID {sentence['id']}.")
+                    print(f"  Contexto: {example['context']}")
+                    print(f"  Sentença: {sentence['sentence']}")
+                # --- FIM DA LÓGICA FINAL ---
 
-    problematic_examples = []
-    
-    for example in intrasentence_examples:
-        context = example.get('context', '')
-        # Usamos .upper() para garantir que a verificação não falhe com "blank" minúsculo
-        if "BLANK" not in context.upper():
-            problematic_examples.append({
-                'id': example.get('id'),
-                'context': context
-            })
-
-    if not problematic_examples:
-        print("\n✅ Sucesso! Todos os exemplos 'intrasentence' contêm 'BLANK' em seu contexto.")
-    else:
-        print(f"\n❌ Encontrados {len(problematic_examples)} exemplos problemáticos:")
-        print("-" * 40)
-        for ex in problematic_examples:
-            print(f"  ID do Exemplo: {ex['id']}")
-            print(f"  Contexto com erro: '{ex['context']}'")
-            print("-" * 40)
-        print("\n💡 Ação Recomendada: Analise os contextos acima e adicione as palavras traduzidas")
-        print("   (ex: 'vazio', 'espaço') ao padrão Regex no seu script de tradução.")
-
-if __name__ == "__main__":
-    find_missing_blanks()
+            # Cria o objeto Exemplo com a lista de sentenças processadas
+            created_example = IntrasentenceExample(
+                example['id'], example['bias_type'], 
+                example['target'], example['context'], sentences) 
+            created_examples.append(created_example)
+            
+        return created_examples
