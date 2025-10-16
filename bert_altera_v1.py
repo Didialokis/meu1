@@ -306,3 +306,60 @@ def traduzir_e_recriar_estrutura_corretamente():
 
 if __name__ == "__main__":
     traduzir_e_recriar_estrutura_corretamente()
+
+
+    /
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+    import json
+import re
+
+# --- CONFIGURAÇÕES ---
+JSON_FILE_PATH = '../data/dev_pt.json' # Verifique se o caminho está correto
+
+def find_missing_blanks():
+    """
+    Lê o arquivo JSON do Stereoset e verifica quais exemplos 'intrasentence'
+    não contêm a palavra "BLANK" em seu contexto.
+    """
+    print(f"🔍 Verificando o arquivo: {JSON_FILE_PATH}")
+    
+    try:
+        with open(JSON_FILE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"❌ ERRO: Arquivo não encontrado em '{JSON_FILE_PATH}'. Verifique o caminho.")
+        return
+
+    intrasentence_examples = data.get('data', {}).get('intrasentence', [])
+    
+    if not intrasentence_examples:
+        print("⚠️ A seção 'intrasentence' não foi encontrada ou está vazia.")
+        return
+
+    problematic_examples = []
+    
+    for example in intrasentence_examples:
+        context = example.get('context', '')
+        # Usamos .upper() para garantir que a verificação não falhe com "blank" minúsculo
+        if "BLANK" not in context.upper():
+            problematic_examples.append({
+                'id': example.get('id'),
+                'context': context
+            })
+
+    if not problematic_examples:
+        print("\n✅ Sucesso! Todos os exemplos 'intrasentence' contêm 'BLANK' em seu contexto.")
+    else:
+        print(f"\n❌ Encontrados {len(problematic_examples)} exemplos problemáticos:")
+        print("-" * 40)
+        for ex in problematic_examples:
+            print(f"  ID do Exemplo: {ex['id']}")
+            print(f"  Contexto com erro: '{ex['context']}'")
+            print("-" * 40)
+        print("\n💡 Ação Recomendada: Analise os contextos acima e adicione as palavras traduzidas")
+        print("   (ex: 'vazio', 'espaço') ao padrão Regex no seu script de tradução.")
+
+if __name__ == "__main__":
+    find_missing_blanks()
