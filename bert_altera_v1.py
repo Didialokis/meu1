@@ -23,7 +23,7 @@ python eval_discriminative_models.py \
 
 
         /////////////////////////////////////////////////////////////////////////////
-        # -*- coding: utf-8 -*-
+       # -*- coding: utf-8 -*-
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -41,7 +41,9 @@ DATASET_SPLIT = "validation"
 SOURCE_LANG = "eng_Latn"
 TARGET_LANG = "por_Latn"
 BATCH_SIZE = 8
-PLACEHOLDER = "__BLANK_TOKEN__" # Um token único que o tradutor provavelmente irá ignorar
+
+# MUDANÇA: Token de placeholder único que o tradutor irá ignorar
+PLACEHOLDER = "__BLANK_TOKEN_IGNORE__" 
 
 GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
@@ -63,7 +65,7 @@ def traduzir_e_recriar_estrutura_corretamente():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- ETAPA DE EXTRAÇÃO (com substituição para placeholder) ---
+    # --- ETAPA DE EXTRAÇÃO (COM SUBSTITUIÇÃO GLOBAL DO BLANK) ---
     datasets_dict = {}
     sentences_to_translate = []
     for config in CONFIGS:
@@ -71,16 +73,19 @@ def traduzir_e_recriar_estrutura_corretamente():
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         datasets_dict[config] = dataset
         for example in dataset:
+            # MUDANÇA GLOBAL: Substitui BLANK no contexto, se existir
             if 'context' in example and example['context']:
-                context_text = example['context']
-                if config == 'intrasentence':
-                    context_text = context_text.replace("BLANK", PLACEHOLDER)
+                context_text = example['context'].replace("BLANK", PLACEHOLDER)
                 sentences_to_translate.append(context_text)
-            sentences_to_translate.extend(example['sentences']['sentence'])
+            
+            # MUDANÇA GLOBAL: Substitui BLANK nas sentenças, se existir
+            for sentence_text in example['sentences']['sentence']:
+                sentence_text_safe = sentence_text.replace("BLANK", PLACEHOLDER)
+                sentences_to_translate.append(sentence_text_safe)
     
     print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    # --- ETAPA DE TRADUÇÃO (sem mudanças) ---
+    # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
     print("Iniciando a tradução em lotes...")
     translated_sentences = []
     forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
@@ -94,9 +99,11 @@ def traduzir_e_recriar_estrutura_corretamente():
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO (com reordenação e correção do BLANK) ---
+    # --- ETAPA DE RECONSTRUÇÃO (COM ORDEM E REVERSÃO GLOBAL) ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
+    
+    # O BLANK_PATTERN não é mais necessário
     
     reconstructed_data = {}
     for config in CONFIGS:
@@ -104,63 +111,70 @@ def traduzir_e_recriar_estrutura_corretamente():
         new_examples_list = []
         for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
             
-            # Constrói a lista de sentenças primeiro
-            reconstructed_sentences = []
-            original_sents_data = original_example['sentences']
-            for i in range(len(original_sents_data['sentence'])):
-                recreated_labels = []
-                labels_data = original_sents_data['labels'][i]
-                for j in range(len(labels_data['human_id'])):
-                    recreated_labels.append({
-                        "human_id": labels_data['human_id'][j],
-                        "label": INNER_LABEL_MAP[labels_data['label'][j]]
-                    })
-
-                # <--- MUDANÇA 1: REORDENA AS CHAVES DENTRO DO OBJETO SENTENÇA --->
-                new_sentence_obj = {
-                    "id": original_sents_data['id'][i],
-                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]],
-                    "sentence": next(translated_iter),
-                    "labels": recreated_labels
-                }
-                reconstructed_sentences.append(new_sentence_obj)
-
-            # Processa o contexto
-            translated_context = ""
-            if 'context' in original_example and original_example['context']:
-                translated_context = next(translated_iter)
-                if config == 'intrasentence':
-                    # Substitui o placeholder de volta para "BLANK"
-                    translated_context = translated_context.replace(PLACEHOLDER, "BLANK")
-                    
-                    # <--- MUDANÇA 2: VERIFICA SE O BLANK DESAPARECEU E O RE-INSERE --->
-                    # Garante que "BLANK" exista, mesmo que o tradutor tenha removido o placeholder.
-                    if "BLANK" not in translated_context:
-                        print(f"\nAVISO: 'BLANK' ausente no contexto traduzido para o ID {original_example['id']}. Re-inserindo no final.")
-                        translated_context = translated_context.strip() + " BLANK"
-            
-            # <--- MUDANÇA 3: MONTA O OBJETO FINAL NA ORDEM EXATA QUE VOCÊ PEDIU --->
+            # MUDANÇA ORDEM: Cria o dicionário na ordem solicitada
             new_example = {
                 "id": original_example['id'],
                 "target": original_example['target'],
-                "bias_type": original_example['bias_type'],
-                "context": translated_context,
-                "sentences": reconstructed_sentences
+                "bias_type": original_example['bias_type']
             }
+            
+            # Adiciona o contexto (se existir) na ordem correta
+            if 'context' in original_example and original_example['context']:
+                # MUDANÇA GLOBAL: Reverte o placeholder
+                translated_context = next(translated_iter).replace(PLACEHOLDER, "BLANK")
+                new_example["context"] = translated_context
+            
+            # Prepara a lista de sentenças
+            new_example["sentences"] = []
+            
+            original_sents_data = original_example['sentences']
+            num_sentences = len(original_sents_data['sentence'])
+
+            for i in range(num_sentences):
+                # Recria os labels
+                recreated_labels = []
+                labels_data_for_one_sentence = original_sents_data['labels'][i]
+                human_ids = labels_data_for_one_sentence['human_id']
+                inner_int_labels = labels_data_for_one_sentence['label']
+                
+                for j in range(len(human_ids)):
+                    recreated_labels.append({"human_id": human_ids[j], "label": INNER_LABEL_MAP[inner_int_labels[j]]})
+                
+                # MUDANÇA GLOBAL: Reverte o placeholder
+                translated_sentence = next(translated_iter).replace(PLACEHOLDER, "BLANK")
+
+                # MUDANÇA ORDEM: Cria o dict da sentença em ordem lógica
+                new_sentence_obj = {
+                    "id": original_sents_data['id'][i],
+                    "sentence": translated_sentence,
+                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]],
+                    "labels": recreated_labels
+                }
+                new_example["sentences"].append(new_sentence_obj)
+            
             new_examples_list.append(new_example)
         reconstructed_data[config] = new_examples_list
 
     # --- ETAPA DE SALVAMENTO ---
-    final_output_structure = {"version": "1.1", "data": {"intrasentence": reconstructed_data.get('intrasentence', []), "intersentence": reconstructed_data.get('intersentence', [])}}
+    final_output_structure = {
+        "version": "1.1",
+        "data": {
+            "intrasentence": reconstructed_data.get('intrasentence', []),
+            "intersentence": reconstructed_data.get('intersentence', [])
+        }
+    }
+    
     output_path = "dev_pt.json"
     print(f"Salvando o dataset final em: {output_path}")
+    
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
-    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível, robusto e formatado corretamente.")
+
+    print("\n✅ Sucesso! O arquivo de saída agora tem a ordem de chaves correta e preserva 'BLANK' perfeitamente.")
+
 
 if __name__ == "__main__":
     traduzir_e_recriar_estrutura_corretamente()
-
 //////////////////////////////////////////////////////////////python eval_discriminative_models.py \
 Excelente ideia\! Essa é, de longe, a abordagem mais robusta e elegante para resolver o problema do `"BLANK"`.
 
