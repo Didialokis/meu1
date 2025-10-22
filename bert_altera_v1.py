@@ -23,11 +23,10 @@ python eval_discriminative_models.py \
 
 
         /////////////////////////////////////////////////////////////////////////////
-       # -*- coding: utf-8 -*-
+      # -*- coding: utf-8 -*-
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from datasets import load_dataset
 import re
 import json
 from tqdm import tqdm
@@ -35,17 +34,14 @@ from tqdm import tqdm
 # --- 1. CONFIGURAÇÕES ---
 
 MODEL_NAME = "facebook/nllb-200-1.3B"
-DATASET_NAME = "McGill-NLP/stereoset"
-CONFIGS = ['intersentence', 'intrasentence']
-DATASET_SPLIT = "validation"
+CONFIGS = ['intersentence', 'intrasentence'] # Quais seções do JSON processar
 SOURCE_LANG = "eng_Latn"
 TARGET_LANG = "por_Latn"
 BATCH_SIZE = 8
-# Um token único que o tradutor não modificará
-PLACEHOLDER = "__BLANK_TOKEN_99__" 
 
-GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
-INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
+# --- Arquivos de Entrada/Saída ---
+INPUT_FILE = "dev.json"
+OUTPUT_FILE = "dev_pt.json"
 
 # --- 2. FUNÇÃO AUXILIAR ---
 
@@ -64,26 +60,45 @@ def traduzir_e_recriar_estrutura_corretamente():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
     print("Modelo carregado com sucesso.")
 
-    # --- ETAPA DE EXTRAÇÃO (COM SUBSTITUIÇÃO GLOBAL DO PLACEHOLDER) ---
-    datasets_dict = {}
+    # --- ETAPA DE EXTRAÇÃO (Lendo do JSON local) ---
+    print(f"Carregando o arquivo local '{INPUT_FILE}'...")
+    try:
+        with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+            stereoset_data = json.load(f)
+    except FileNotFoundError:
+        print(f"ERRO: Arquivo de entrada '{INPUT_FILE}' não encontrado.")
+        print("Por favor, certifique-se que o arquivo 'dev.json' está no mesmo diretório.")
+        return
+    except json.JSONDecodeError:
+        print(f"ERRO: O arquivo '{INPUT_FILE}' não é um JSON válido.")
+        return
+
+    datasets_dict = stereoset_data.get('data', {})
     sentences_to_translate = []
+
     for config in CONFIGS:
-        print(f"Carregando a configuração '{config}' do dataset...")
-        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-        datasets_dict[config] = dataset
-        for example in dataset:
+        if config not in datasets_dict:
+            print(f"Aviso: Seção '{config}' não encontrada no arquivo JSON. Pulando.")
+            continue
+        
+        print(f"Extraindo sentenças de '{config}'...")
+        for example in datasets_dict[config]:
+            # Adiciona o contexto à lista de tradução (se existir)
             if 'context' in example and example['context']:
-                # MUDANÇA: Aplica o placeholder no 'context' antes de adicionar
-                context_text = example['context'].replace("BLANK", PLACEHOLDER)
-                sentences_to_translate.append(context_text)
+                sentences_to_translate.append(example['context'])
             
-            # MUDANÇA: Aplica o placeholder em todas as 'sentences' antes de adicionar
-            sentences_with_placeholder = [s.replace("BLANK", PLACEHOLDER) for s in example['sentences']['sentence']]
-            sentences_to_translate.extend(sentences_with_placeholder)
+            # Adiciona cada sentença individual à lista de tradução
+            if 'sentences' in example:
+                for sentence_dict in example['sentences']:
+                    sentences_to_translate.append(sentence_dict['sentence'])
     
+    if not sentences_to_translate:
+        print("ERRO: Nenhuma sentença encontrada para traduzir. Verifique o formato do 'dev.json'.")
+        return
+
     print(f"Total de {len(sentences_to_translate)} sentenças extraídas para tradução.")
 
-    # --- ETAPA DE TRADUÇÃO (SEM MUDANÇAS) ---
+    # --- ETAPA DE TRADUÇÃO (Sem Mudanças) ---
     print("Iniciando a tradução em lotes...")
     translated_sentences = []
     forced_bos_token_id = tokenizer.convert_tokens_to_ids(TARGET_LANG)
@@ -97,12 +112,15 @@ def traduzir_e_recriar_estrutura_corretamente():
         translated_sentences.extend(batch_sanitized)
     print("Tradução finalizada.")
 
-    # --- ETAPA DE RECONSTRUÇÃO (COM ORDEM CORRETA E RESTAURAÇÃO GLOBAL) ---
+    # --- ETAPA DE RECONSTRUÇÃO (Ordem de chaves corrigida, sem lógica de BLANK) ---
     print("Reconstruindo o dataset na estrutura original...")
     translated_iter = iter(translated_sentences)
     
     reconstructed_data = {}
     for config in CONFIGS:
+        if config not in datasets_dict:
+            continue
+            
         original_dataset = datasets_dict[config]
         new_examples_list = []
         for original_example in tqdm(original_dataset, desc=f"Reconstruindo {config}"):
@@ -113,33 +131,31 @@ def traduzir_e_recriar_estrutura_corretamente():
             new_example["target"] = original_example['target']
             new_example["bias_type"] = original_example['bias_type']
 
+            # Adiciona o contexto traduzido (se existir)
             if 'context' in original_example and original_example['context']:
-                # MUDANÇA: Restaura o "BLANK" no 'context' após a tradução
-                translated_context = next(translated_iter).replace(PLACEHOLDER, "BLANK")
+                translated_context = next(translated_iter)
                 new_example["context"] = translated_context
             
-            new_example["sentences"] = [] # Adiciona a chave 'sentences' por último
+            # Adiciona as sentenças traduzidas (deve ser a última chave)
+            new_example["sentences"] = []
             
-            original_sents_data = original_example['sentences']
-            num_sentences = len(original_sents_data['sentence'])
-
-            for i in range(num_sentences):
+            original_sents_data_list = original_example['sentences']
+            
+            for original_sentence_dict in original_sents_data_list:
+                # Reconstrói os labels (copiando do original)
                 recreated_labels = []
-                labels_data_for_one_sentence = original_sents_data['labels'][i]
-                human_ids = labels_data_for_one_sentence['human_id']
-                inner_int_labels = labels_data_for_one_sentence['label']
-                
-                for j in range(len(human_ids)):
-                    recreated_labels.append({"human_id": human_ids[j], "label": INNER_LABEL_MAP[inner_int_labels[j]]})
+                for label_dict in original_sentence_dict['labels']:
+                    recreated_labels.append({
+                        "human_id": label_dict['human_id'],
+                        "label": label_dict['label']
+                    })
 
-                # MUDANÇA: Restaura o "BLANK" nas 'sentences' após a tradução
-                translated_sentence = next(translated_iter).replace(PLACEHOLDER, "BLANK")
-
+                # Cria o novo objeto de sentença com o texto traduzido
                 new_sentence_obj = {
-                    "id": original_sents_data['id'][i],
-                    "sentence": translated_sentence,
+                    "id": original_sentence_dict['id'],
+                    "sentence": next(translated_iter), # Pega a próxima sentença traduzida
                     "labels": recreated_labels,
-                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
+                    "gold_label": original_sentence_dict['gold_label']
                 }
                 new_example["sentences"].append(new_sentence_obj)
             
@@ -147,12 +163,20 @@ def traduzir_e_recriar_estrutura_corretamente():
         reconstructed_data[config] = new_examples_list
 
     # --- ETAPA DE SALVAMENTO ---
-    final_output_structure = {"version": "1.1", "data": {"intrasentence": reconstructed_data.get('intrasentence', []), "intersentence": reconstructed_data.get('intersentence', [])}}
-    output_path = "dev_pt.json"
-    print(f"Salvando o dataset final em: {output_path}")
-    with open(output_path, 'w', encoding='utf-8') as f:
+    final_output_structure = {
+        "version": "1.1",
+        "data": {
+            "intrasentence": reconstructed_data.get('intrasentence', []),
+            "intersentence": reconstructed_data.get('intersentence', [])
+        }
+    }
+    
+    print(f"Salvando o dataset final em: {OUTPUT_FILE}")
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
-    print("\n✅ Sucesso! O arquivo de saída agora é 100% compatível, com a ordem de chaves correta e 'BLANK' preservado.")
+
+    print(f"\n✅ Sucesso! O arquivo '{OUTPUT_FILE}' foi criado.")
+    print("Próximo passo: Abra o arquivo e substitua manualmente seus placeholders de volta para 'BLANK'.")
 
 
 if __name__ == "__main__":
