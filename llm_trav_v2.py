@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-import torch # Necessário para o device, mas a lógica de GPU foi removida
 import boto3
+import botocore.exceptions
 import json
 import re
 import time
@@ -11,267 +11,201 @@ from tqdm import tqdm
 
 # --- 1. CONFIGURAÇÕES ---
 
-# Configurações do AWS Bedrock
-BEDROCK_REGION = 'us-east-1' # CONFIRA E MUDE SUA REGIÃO SE NECESSÁRIO
-MODEL_ID = 'meta.llama3-8b-instruct-v1:0' # Modelo Llama 3 8B
-MAX_RETRIES = 5 # Tentativas em caso de rate limit
-RETRY_DELAY_SECONDS = 10 # Tempo de espera entre tentativas
+MODEL_ID = 'meta.llama3-8b-instruct-v1:0'
+REGION_NAME = 'us-east-1'
+client = boto3.client(service_name='bedrock-runtime', region_name=REGION_NAME)
 
-# Configurações do Dataset (como antes)
 DATASET_NAME = "McGill-NLP/stereoset"
 CONFIGS = ['intersentence', 'intrasentence']
 DATASET_SPLIT = "validation"
 
-# Mapeamentos de Label (como antes)
 GOLD_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated'}
 INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 'related'}
 
-# Configura logging para o Boto3
-logging.basicConfig(level=logging.INFO)
-logging.getLogger('botocore').setLevel(logging.WARNING)
-logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 2. INICIALIZAÇÃO DO CLIENTE BEDROCK ---
 
-try:
-    client = boto3.client(
-        service_name='bedrock-runtime',
-        region_name=BEDROCK_REGION
+# --- 2. FUNÇÃO DE CHAMADA DO BEDROCK (Totalmente Nova) ---
+
+def translate_example_with_context(example_in):
+    """
+    Chama o Llama 3 no Bedrock para traduzir um EXEMPLO INTEIRO (contexto + 3 alvos).
+    Instrui o modelo a retornar um JSON estruturado.
+    """
+    
+    # Extrai os textos em inglês do exemplo original
+    context_en = example_in['context']
+    # O 'sentences' é um dicionário de listas paralelas
+    sentences_en = example_in['sentences']['sentence']
+
+    # Prompt de sistema que instrui o modelo a ser um tradutor e a retornar JSON
+    system_prompt = (
+        "Você é um tradutor especialista de Inglês para Português do Brasil. "
+        "Sua tarefa é traduzir o contexto e a lista de frases-alvo, mantendo a "
+        "relação semântica entre eles. "
+        "Responda *apenas* com um objeto JSON válido, seguindo o esquema fornecido."
     )
-    print(f"✅ Cliente Bedrock inicializado na região: {BEDROCK_REGION}")
-except Exception as e:
-    print(f"❌ ERRO: Não foi possível inicializar o cliente Bedrock. Verifique suas credenciais e região. {e}")
-    exit()
-
-
-# --- 3. FUNÇÕES AUXILIARES ---
-
-def find_blank_index(context_str):
-    """Encontra o índice da palavra 'BLANK' no contexto."""
-    words = context_str.split()
-    for i, word in enumerate(words):
-        if "BLANK" in word:
-            return i
-    return None
-
-def sanitize_text(text):
-    """Limpa o texto de caracteres de controle."""
-    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-
-def invoke_llama_translation(prompt_text):
-    """
-    Envia o prompt para o Llama 3 via Bedrock, com lógica de retry
-    e parsing de JSON.
-    """
-    # Llama 3 usa um formato de prompt específico
-    # Usamos <|begin_of_text|> e <|eot_id|> para delimitar
-    system_prompt = "You are a precise, technical translator. Your task is to translate English text to Brazilian Portuguese, following instructions exactly. You must return ONLY a valid JSON object as your response, without any introductory text."
     
-    # Formato do Llama 3 Instruct
-    formatted_prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt_text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    # O prompt do usuário agora envia todos os dados de uma vez
+    user_prompt = f"""Traduza o seguinte conjunto de textos:
+
+Contexto em Inglês:
+"{context_en}"
+
+Frases-Alvo em Inglês:
+1. "{sentences_en[0]}"
+2. "{sentences_en[1]}"
+3. "{sentences_en[2]}"
+
+Formato de Saída JSON Obrigatório:
+{{
+  "contexto_traduzido": "...",
+  "alvos_traduzidos": [
+    "tradução do alvo 1",
+    "tradução do alvo 2",
+    "tradução do alvo 3"
+  ]
+}}"""
     
+    # Formato do prompt Llama 3 Instruct
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
+{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+{{""" # Inicia a resposta com "{" para forçar o JSON
+
     body = json.dumps({
-        "prompt": formatted_prompt,
-        "max_gen_len": 2048, # Aumentar para garantir que caiba a tradução
-        "temperature": 0.0, # Temperatura 0.0 para tradução determinística
+        "prompt": prompt,
+        "max_gen_len": 1024, # Aumenta o tamanho para caber o JSON completo
+        "temperature": 0.1,
         "top_p": 0.9
     })
 
-    for attempt in range(MAX_RETRIES):
+    retries = 3
+    delay = 5
+    for i in range(retries):
         try:
-            response = client.invoke_model(
-                modelId=MODEL_ID,
-                body=body
-            )
+            response = client.invoke_model(modelId=MODEL_ID, body=body)
             response_body = json.loads(response['body'].read().decode('utf-8'))
             
-            # O Llama 3 retorna a resposta em 'generation'
-            generated_text = response_body['generation']
+            # Limpa e tenta decodificar a resposta JSON do LLM
+            # A resposta do Llama 3 pode ser: `{"contexto_traduzido": ... }}`
+            json_response_str = "{" + response_body['generation']
+            translated_data = json.loads(json_response_str)
             
-            # Tenta extrair o JSON do texto gerado
-            try:
-                # O LLM pode, às vezes, adicionar "```json ... ```"
-                json_match = re.search(r'\{.*\}', generated_text, re.DOTALL)
-                if not json_match:
-                    raise json.JSONDecodeError("Nenhum JSON encontrado na resposta do LLM.", generated_text, 0)
-                
-                return json.loads(json_match.group(0))
-            except json.JSONDecodeError as json_e:
-                print(f"  ⚠️ Erro de parsing do JSON do LLM (Tentativa {attempt + 1}): {json_e}")
-                print(f"  Resposta recebida: {generated_text}")
-                continue # Tenta novamente
-                
-        except client.exceptions.ProvisionedThroughputExceededException as e:
-            print(f"  ⏳ Rate limit atingido. Aguardando {RETRY_DELAY_SECONDS}s... (Tentativa {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(RETRY_DELAY_SECONDS)
+            # Valida se a estrutura está correta
+            if 'contexto_traduzido' in translated_data and len(translated_data.get('alvos_traduzidos', [])) == 3:
+                return translated_data
+            else:
+                raise Exception(f"JSON retornado com estrutura inválida: {translated_data}")
+
+        except botocore.exceptions.ClientError as e:
+            if "ThrottlingException" in str(e):
+                logging.warning(f"Throttling... retentativa em {delay}s.")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                logging.error(f"Erro do cliente Bedrock: {e}")
+                return None
         except Exception as e:
-            print(f"  ❌ Erro ao invocar o modelo (Tentativa {attempt + 1}): {e}")
-            time.sleep(RETRY_DELAY_SECONDS)
+            logging.error(f"Erro ao processar exemplo (ID: {example_in['id']}): {e}")
+            logging.error(f"Resposta JSON inválida: {response_body['generation']}")
+            return None # Retorna None em caso de falha
     
-    print(f"  ❌ FALHA: Não foi possível traduzir o prompt após {MAX_RETRIES} tentativas.")
-    return None # Falha após todas as tentativas
+    logging.error(f"Excedeu retentativas para o exemplo (ID: {example_in['id']}).")
+    return None
+
+
+# --- 3. FUNÇÃO AUXILIAR (COMO ANTES) ---
+
+def sanitize_text(text):
+    """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
 
 # --- 4. FUNÇÃO PRINCIPAL DE TRADUÇÃO (MODIFICADA) ---
 
-def traduzir_com_llama():
-    
-    # Carrega os datasets originais (como antes)
-    datasets_dict = {}
-    for config in CONFIGS:
-        print(f"Carregando a configuração '{config}' do dataset...")
-        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
-        datasets_dict[config] = dataset
-
-    print("--- Iniciando Tradução via Llama 3 no Bedrock ---")
+def traduzir_e_recriar_estrutura_com_llm():
+    """
+    Executa o pipeline completo de tradução usando o Bedrock
+    e recria a estrutura original do Stereoset.
+    """
     
     reconstructed_data = {}
     
-    # --- Loop 1: INTERSENTENCE (Tradução simples) ---
-    config_inter = 'intersentence'
-    if config_inter in datasets_dict:
-        original_dataset_inter = datasets_dict[config_inter]
-        new_examples_list = []
-        print(f"Reconstruindo {config_inter}...")
+    # Itera sobre 'intersentence' e 'intrasentence'
+    for config in CONFIGS:
+        print(f"Carregando e processando a configuração '{config}' do dataset...")
+        dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         
-        for original_example in tqdm(original_dataset_inter, desc=f"Traduzindo {config_inter}"):
-            # Pega as sentenças originais
-            original_sentences = [s['sentence'] for s in original_example['sentences']]
-            
-            # Constrói o prompt de tradução simples
-            prompt = f"""
-            Por favor, traduza o seguinte JSON de inglês para português do Brasil.
-            Mantenha a estrutura JSON de saída exatamente como solicitado.
-
-            JSON de Entrada:
-            {{
-                "context": {json.dumps(original_example['context'])},
-                "sentences": {json.dumps(original_sentences)}
-            }}
-
-            Retorne APENAS o JSON traduzido com as chaves "translated_context" e "translated_sentences".
-            """
-            
-            # Chama o LLM
-            parsed_response = invoke_llama_translation(prompt)
-            if not parsed_response:
-                continue # Pula este exemplo se a tradução falhar
-
-            # Inicia a reconstrução do exemplo
-            new_example = original_example.copy() # Preserva IDs, bias_type, etc.
-            new_example['context'] = sanitize_text(parsed_response.get('translated_context', ''))
-            
-            translated_sentences = parsed_response.get('translated_sentences', [])
-            
-            # Recria a estrutura interna das sentenças (Lógica CRÍTICA)
-            rebuilt_sentences = []
-            original_sents_data = original_example['sentences']
-            for i in range(len(original_sents_data['id'])):
-                rebuilt_labels = []
-                labels_data = original_sents_data['labels'][i]
-                for j in range(len(labels_data['human_id'])):
-                    rebuilt_labels.append({
-                        "human_id": labels_data['human_id'][j],
-                        "label": INNER_LABEL_MAP[labels_data['label'][j]]
-                    })
-
-                new_sentence_obj = {
-                    "id": original_sents_data['id'][i],
-                    "sentence": sanitize_text(translated_sentences[i]) if i < len(translated_sentences) else "",
-                    "labels": rebuilt_labels,
-                    "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
-                }
-                rebuilt_sentences.append(new_sentence_obj)
-                
-            new_example['sentences'] = rebuilt_sentences
-            new_examples_list.append(new_example)
-            
-        reconstructed_data[config_inter] = new_examples_list
-
-    # --- Loop 2: INTRASENTENCE (Tradução com regra "BLANK") ---
-    config_intra = 'intrasentence'
-    if config_intra in datasets_dict:
-        original_dataset_intra = datasets_dict[config_intra]
         new_examples_list = []
-        print(f"Reconstruindo {config_intra}...")
         
-        for original_example in tqdm(original_dataset_intra, desc=f"Traduzindo {config_intra}"):
-            original_context = original_example['context']
-            original_sentences = [s['sentence'] for s in original_example['sentences']]
+        # --- ETAPA DE TRADUÇÃO E RECONSTRUÇÃO (TUDO EM UMA) ---
+        for original_example in tqdm(dataset, desc=f"Traduzindo {config}"):
             
-            # Encontra a posição do BLANK
-            blank_idx = find_blank_index(original_context)
-            if blank_idx is None:
-                print(f"  AVISO: Não foi possível encontrar 'BLANK' no contexto: {original_context}. Pulando...")
+            # Chama a API para traduzir o exemplo completo
+            translated_data = translate_example_with_context(original_example)
+            
+            # Pula o exemplo se a tradução falhar
+            if translated_data is None:
                 continue
                 
-            # Constrói o prompt de tradução complexo com as regras
-            prompt = f"""
-            Por favor, traduza o seguinte JSON de inglês para português do Brasil, seguindo regras MUITO estritas.
+            # Extrai os textos traduzidos
+            context_pt = sanitize_text(translated_data['contexto_traduzido'])
+            alvos_pt = [sanitize_text(t) for t in translated_data['alvos_traduzidos']]
             
-            REGRAS CRÍTICAS:
-            1. A palavra "BLANK" NÃO DEVE ser traduzida. Deve permanecer "BLANK".
-            2. No "context" original, "BLANK" é a palavra de índice {blank_idx} (contando a partir de 0).
-            3. Na tradução do "context", "BLANK" DEVE OBRIGATORIAMENTE ser a palavra de índice {blank_idx}.
-            4. As "sentences" traduzidas também DEVEM ter a palavra que substitui "BLANK" no índice {blank_idx}.
-            5. Retorne APENAS o JSON traduzido com as chaves "translated_context" e "translated_sentences".
-
-            JSON de Entrada:
-            {{
-                "context": {json.dumps(original_context)},
-                "sentences": {json.dumps(original_sentences)}
-            }}
-            """
+            # Monta a nova estrutura do exemplo mantendo os dados originais
+            new_example = {
+                "id": original_example['id'],
+                "bias_type": original_example['bias_type'],
+                "target": original_example['target'],
+                "context": context_pt,
+                "sentences": []
+            }
             
-            # Chama o LLM
-            parsed_response = invoke_llama_translation(prompt)
-            if not parsed_response:
-                continue
-
-            # Inicia a reconstrução do exemplo (lógica idêntica à anterior)
-            new_example = original_example.copy()
-            new_example['context'] = sanitize_text(parsed_response.get('translated_context', ''))
-            
-            translated_sentences = parsed_response.get('translated_sentences', [])
-            
-            rebuilt_sentences = []
             original_sents_data = original_example['sentences']
-            for i in range(len(original_sents_data['id'])):
-                rebuilt_labels = []
-                labels_data = original_sents_data['labels'][i]
-                for j in range(len(labels_data['human_id'])):
-                    rebuilt_labels.append({
-                        "human_id": labels_data['human_id'][j],
-                        "label": INNER_LABEL_MAP[labels_data['label'][j]]
+            num_sentences = len(original_sents_data['sentence'])
+
+            for i in range(num_sentences):
+                # Recria a estrutura interna de 'labels'
+                recreated_labels = []
+                labels_data_for_one_sentence = original_sents_data['labels'][i]
+                human_ids = labels_data_for_one_sentence['human_id']
+                inner_int_labels = labels_data_for_one_sentence['label']
+                
+                for j in range(len(human_ids)):
+                    recreated_labels.append({
+                        "human_id": human_ids[j],
+                        "label": INNER_LABEL_MAP[inner_int_labels[j]]
                     })
 
+                # Cria o novo objeto de sentença com o texto traduzido
                 new_sentence_obj = {
                     "id": original_sents_data['id'][i],
-                    "sentence": sanitize_text(translated_sentences[i]) if i < len(translated_sentences) else "",
-                    "labels": rebuilt_labels,
+                    "sentence": alvos_pt[i], # Usa o texto da lista de alvos traduzidos
+                    "labels": recreated_labels,
                     "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
                 }
-                rebuilt_sentences.append(new_sentence_obj)
-                
-            new_example['sentences'] = rebuilt_sentences
-            new_examples_list.append(new_example)
+                new_example["sentences"].append(new_sentence_obj)
             
-        reconstructed_data[config_intra] = new_examples_list
+            new_examples_list.append(new_example)
+        
+        reconstructed_data[config] = new_examples_list
 
-    # --- ETAPA DE SALVAMENTO ---
+    # --- ETAPA DE SALVAMENTO (COMO ANTES) ---
     final_output_structure = {
         "version": "1.1",
         "data": reconstructed_data
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_formato_original.json"
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_contexto_correto.json"
     print(f"Salvando o dataset final em: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    print("\n✅ Sucesso! O arquivo de saída (traduzido via Llama 3) é 100% compatível com o dataloader.py.")
+    print("\n✅ Sucesso! O arquivo de saída (traduzido via LLM) é compatível com o dataloader.py.")
 
 
+# --- 5. EXECUÇÃO ---
 if __name__ == "__main__":
-    traduzir_com_llama()
+    traduzir_e_recriar_estrutura_com_llm()
