@@ -25,31 +25,38 @@ INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 're
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-# --- 2. FUNÇÃO DE CHAMADA DO BEDROCK (TAREFA "INTRASENTENCE") ---
+# --- 2. FUNÇÃO DE CHAMADA DO BEDROCK (COM LÓGICA CONDICIONAL) ---
 
-def translate_intrasentence_example(example_in):
+# A função agora aceita 'task_type' para saber qual prompt usar
+def translate_example_with_context(example_in, task_type):
     """
-    Chama o Llama 3 para traduzir um exemplo INTRASENTENCE.
-    Esta tarefa é do tipo "preenchimento de lacuna".
+    Chama o Llama 3 no Bedrock para traduzir um EXEMPLO INTEIRO.
+    Usa um prompt específico dependendo do tipo de tarefa (intra ou intersentence).
     """
     
     context_en = example_in['context']
     sentences_en = example_in['sentences']['sentence']
-
-    system_prompt = (
-        "Você é um tradutor especialista de Inglês para Português do Brasil. "
-        "Sua tarefa é traduzir o contexto e a lista de frases-alvo, mantendo a "
-        "relação semântica entre eles. "
-        "Responda *apenas* com um objeto JSON válido, seguindo o esquema fornecido."
-    )
     
-    user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intrasentence):
-O "contexto" é uma frase com uma lacuna, e as "frases-alvo" são os preenchimentos dessa lacuna.
+    system_prompt = ""
+    user_prompt = ""
 
-Contexto em Inglês:
+    # --- INÍCIO DA MODIFICAÇÃO: Prompts Condicionais ---
+    if task_type == 'intrasentence':
+        # Prompt otimizado para a tarefa de "preencher lacuna"
+        system_prompt = (
+            "Você é um tradutor especialista de Inglês para Português do Brasil. "
+            "Sua tarefa é traduzir um *modelo de frase* (contexto) e uma lista de *frases completas* (alvos) que usam esse modelo. "
+            "O contexto geralmente contém 'BLANK', que é substituído nos alvos. "
+            "Traduza todos os textos, mantendo essa relação de modelo-preenchimento. "
+            "Responda *apenas* com um objeto JSON válido, seguindo o esquema."
+        )
+        
+        user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intrasentence):
+
+Modelo de Frase (Contexto):
 "{context_en}"
 
-Frases-Alvo em Inglês:
+Frases-Alvo Completas:
 1. "{sentences_en[0]}"
 2. "{sentences_en[1]}"
 3. "{sentences_en[2]}"
@@ -63,7 +70,41 @@ Formato de Saída JSON Obrigatório:
     "tradução do alvo 3"
   ]
 }}"""
-    
+
+    elif task_type == 'intersentence':
+        # Prompt otimizado para a tarefa de "continuação" (o prompt original)
+        system_prompt = (
+            "Você é um tradutor especialista de Inglês para Português do Brasil. "
+            "Sua tarefa é traduzir uma *frase de contexto* e uma lista de *frases de continuação* (alvos) que se referem a ela. "
+            "Traduza todos os textos, mantendo a relação semântica entre o contexto e cada alvo. "
+            "Responda *apenas* com um objeto JSON válido, seguindo o esquema."
+        )
+        
+        user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intersentence):
+
+Frase de Contexto:
+"{context_en}"
+
+Frases de Continuação (Alvos):
+1. "{sentences_en[0]}"
+2. "{sentences_en[1]}"
+3. "{sentences_en[2]}"
+
+Formato de Saída JSON Obrigatório:
+{{
+  "contexto_traduzido": "...",
+  "alvos_traduzidos": [
+    "tradução do alvo 1",
+    "tradução do alvo 2",
+    "tradução do alvo 3"
+  ]
+}}"""
+    else:
+        logging.error(f"Tipo de tarefa desconhecido: {task_type}")
+        return None
+    # --- FIM DA MODIFICAÇÃO ---
+
+    # Formato do prompt Llama 3 Instruct
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 {system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
 {user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
@@ -76,7 +117,6 @@ Formato de Saída JSON Obrigatório:
         "top_p": 0.9
     })
 
-    # (Lógica de retry e chamada do Bedrock - idêntica para ambas as funções)
     retries = 3
     delay = 5
     for i in range(retries):
@@ -109,99 +149,14 @@ Formato de Saída JSON Obrigatório:
     return None
 
 
-# --- 3. FUNÇÃO DE CHAMADA DO BEDROCK (TAREFA "INTERSENTENCE") ---
-
-def translate_intersentence_example(example_in):
-    """
-    Chama o Llama 3 para traduzir um exemplo INTERSENTENCE.
-    Esta tarefa é do tipo "continuação de contexto".
-    """
-    
-    context_en = example_in['context']
-    sentences_en = example_in['sentences']['sentence']
-
-    system_prompt = (
-        "Você é um tradutor especialista de Inglês para Português do Brasil. "
-        "Sua tarefa é traduzir o contexto e a lista de frases-alvo, mantendo a "
-        "relação semântica entre eles. "
-        "Responda *apenas* com um objeto JSON válido, seguindo o esquema fornecido."
-    )
-    
-    # --- PROMPT DO USUÁRIO MODIFICADO ---
-    user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intersentence):
-O "contexto" é uma frase inicial, e as "frases-alvo" são três continuações independentes para esse contexto.
-
-Contexto em Inglês:
-"{context_en}"
-
-Frases-Alvo (Continuações) em Inglês:
-1. "{sentences_en[0]}"
-2. "{sentences_en[1]}"
-3. "{sentences_en[2]}"
-
-Formato de Saída JSON Obrigatório:
-{{
-  "contexto_traduzido": "...",
-  "alvos_traduzidos": [
-    "tradução do alvo 1",
-    "tradução do alvo 2",
-    "tradução do alvo 3"
-  ]
-}}"""
-    
-    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
-{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-{{"""
-
-    body = json.dumps({
-        "prompt": prompt,
-        "max_gen_len": 1024,
-        "temperature": 0.1,
-        "top_p": 0.9
-    })
-
-    # (Lógica de retry e chamada do Bedrock - idêntica para ambas as funções)
-    retries = 3
-    delay = 5
-    for i in range(retries):
-        try:
-            response = client.invoke_model(modelId=MODEL_ID, body=body)
-            response_body = json.loads(response['body'].read().decode('utf-8'))
-            
-            json_response_str = "{" + response_body['generation']
-            translated_data = json.loads(json_response_str)
-            
-            if 'contexto_traduzido' in translated_data and len(translated_data.get('alvos_traduzidos', [])) == 3:
-                return translated_data
-            else:
-                raise Exception(f"JSON retornado com estrutura inválida: {translated_data}")
-
-        except botocore.exceptions.ClientError as e:
-            if "ThrottlingException" in str(e):
-                logging.warning(f"Throttling... retentativa em {delay}s.")
-                time.sleep(delay)
-                delay *= 2
-            else:
-                logging.error(f"Erro do cliente Bedrock: {e}")
-                return None
-        except Exception as e:
-            logging.error(f"Erro ao processar exemplo (ID: {example_in['id']}): {e}")
-            logging.error(f"Resposta JSON inválida: {response_body['generation']}")
-            return None
-    
-    logging.error(f"Excedeu retentativas para o exemplo (ID: {example_in['id']}).")
-    return None
-
-
-# --- 4. FUNÇÃO AUXILIAR (COMO ANTES) ---
+# --- 3. FUNÇÃO AUXILIAR (COMO ANTES) ---
 
 def sanitize_text(text):
     """Limpa o texto, removendo caracteres de controle que podem quebrar o JSON."""
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
 
-# --- 5. FUNÇÃO PRINCIPAL DE TRADUÇÃO (MODIFICADA) ---
+# --- 4. FUNÇÃO PRINCIPAL DE TRADUÇÃO (MODIFICADA) ---
 
 def traduzir_e_recriar_estrutura_com_llm():
     """
@@ -211,7 +166,7 @@ def traduzir_e_recriar_estrutura_com_llm():
     
     reconstructed_data = {}
     
-    for config in CONFIGS:
+    for config in CONFIGS: # 'config' aqui será 'intersentence' ou 'intrasentence'
         print(f"Carregando e processando a configuração '{config}' do dataset...")
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         
@@ -219,24 +174,15 @@ def traduzir_e_recriar_estrutura_com_llm():
         
         for original_example in tqdm(dataset, desc=f"Traduzindo {config}"):
             
-            # --- INÍCIO DA MODIFICAÇÃO PRINCIPAL ---
-            # Roteia o exemplo para a função de tradução correta
-            if config == 'intrasentence':
-                translated_data = translate_intrasentence_example(original_example)
-            elif config == 'intersentence':
-                translated_data = translate_intersentence_example(original_example)
-            else:
-                logging.error(f"Configuração desconhecida: {config}")
-                continue
-            # --- FIM DA MODIFICAÇÃO PRINCIPAL ---
-
+            # --- MODIFICAÇÃO: Passa o 'config' para a função de tradução ---
+            translated_data = translate_example_with_context(original_example, config)
+            
             if translated_data is None:
                 continue
                 
             context_pt = sanitize_text(translated_data['contexto_traduzido'])
             alvos_pt = [sanitize_text(t) for t in translated_data['alvos_traduzidos']]
             
-            # (Lógica de reconstrução do JSON - idêntica e correta)
             new_example = {
                 "id": original_example['id'],
                 "bias_type": original_example['bias_type'],
@@ -278,7 +224,7 @@ def traduzir_e_recriar_estrutura_com_llm():
         "data": reconstructed_data
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_prompts_especificos.json"
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_contexto_correto.json"
     print(f"Salvando o dataset final em: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -287,6 +233,6 @@ def traduzir_e_recriar_estrutura_com_llm():
     print("\n✅ Sucesso! O arquivo de saída (traduzido via LLM) é compatível com o dataloader.py.")
 
 
-# --- 6. EXECUÇÃO ---
+# --- 5. EXECUÇÃO ---
 if __name__ == "__main__":
     traduzir_e_recriar_estrutura_com_llm()
