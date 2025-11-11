@@ -25,94 +25,33 @@ INNER_LABEL_MAP = {0: 'stereotype', 1: 'anti-stereotype', 2: 'unrelated', 3: 're
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-# --- 2. FUNÇÃO DE CHAMADA DO BEDROCK (COM LÓGICA CONDICIONAL) ---
+# --- 2. FUNÇÃO DE CHAMADA DO BEDROCK (Modificada para tradução simples) ---
 
-# A função agora aceita 'task_type' para saber qual prompt usar
-def translate_example_with_context(example_in, task_type):
+def translate_text(text_en):
     """
-    Chama o Llama 3 no Bedrock para traduzir um EXEMPLO INTEIRO.
-    Usa um prompt específico dependendo do tipo de tarefa (intra ou intersentence).
+    Chama o Llama 3 no Bedrock para traduzir um ÚNICO trecho de texto.
     """
     
-    context_en = example_in['context']
-    sentences_en = example_in['sentences']['sentence']
+    # Prompt de sistema simples para tradução literal
+    system_prompt = (
+        "Você é um tradutor especialista de Inglês para Português do Brasil. "
+        "Sua tarefa é traduzir o texto fornecido de forma literal, sem adicionar "
+        "comentários ou contexto adicional. Responda *apenas* com a tradução."
+    )
     
-    system_prompt = ""
-    user_prompt = ""
-
-    # --- INÍCIO DA MODIFICAÇÃO: Prompts Condicionais ---
-    if task_type == 'intrasentence':
-        # Prompt otimizado para a tarefa de "preencher lacuna"
-        system_prompt = (
-            "Você é um tradutor especialista de Inglês para Português do Brasil. "
-            "Sua tarefa é traduzir um *modelo de frase* (contexto) e uma lista de *frases completas* (alvos) que usam esse modelo. "
-            "O contexto geralmente contém 'BLANK', que é substituído nos alvos. "
-            "Traduza todos os textos, mantendo essa relação de modelo-preenchimento. "
-            "Responda *apenas* com um objeto JSON válido, seguindo o esquema."
-        )
-        
-        user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intrasentence):
-
-Modelo de Frase (Contexto):
-"{context_en}"
-
-Frases-Alvo Completas:
-1. "{sentences_en[0]}"
-2. "{sentences_en[1]}"
-3. "{sentences_en[2]}"
-
-Formato de Saída JSON Obrigatório:
-{{
-  "contexto_traduzido": "...",
-  "alvos_traduzidos": [
-    "tradução do alvo 1",
-    "tradução do alvo 2",
-    "tradução do alvo 3"
-  ]
-}}"""
-
-    elif task_type == 'intersentence':
-        # Prompt otimizado para a tarefa de "continuação" (o prompt original)
-        system_prompt = (
-            "Você é um tradutor especialista de Inglês para Português do Brasil. "
-            "Sua tarefa é traduzir uma *frase de contexto* e uma lista de *frases de continuação* (alvos) que se referem a ela. "
-            "Traduza todos os textos, mantendo a relação semântica entre o contexto e cada alvo. "
-            "Responda *apenas* com um objeto JSON válido, seguindo o esquema."
-        )
-        
-        user_prompt = f"""Traduza o seguinte conjunto de textos (tarefa intersentence):
-
-Frase de Contexto:
-"{context_en}"
-
-Frases de Continuação (Alvos):
-1. "{sentences_en[0]}"
-2. "{sentences_en[1]}"
-3. "{sentences_en[2]}"
-
-Formato de Saída JSON Obrigatório:
-{{
-  "contexto_traduzido": "...",
-  "alvos_traduzidos": [
-    "tradução do alvo 1",
-    "tradução do alvo 2",
-    "tradução do alvo 3"
-  ]
-}}"""
-    else:
-        logging.error(f"Tipo de tarefa desconhecido: {task_type}")
-        return None
-    # --- FIM DA MODIFICAÇÃO ---
-
+    user_prompt = f"""Traduza o seguinte texto:
+"{text_en}"
+"""
+    
     # Formato do prompt Llama 3 Instruct
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 {system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
 {user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-{{"""
+""" # O modelo responderá apenas com o texto traduzido
 
     body = json.dumps({
         "prompt": prompt,
-        "max_gen_len": 1024,
+        "max_gen_len": 512,
         "temperature": 0.1,
         "top_p": 0.9
     })
@@ -124,13 +63,13 @@ Formato de Saída JSON Obrigatório:
             response = client.invoke_model(modelId=MODEL_ID, body=body)
             response_body = json.loads(response['body'].read().decode('utf-8'))
             
-            json_response_str = "{" + response_body['generation']
-            translated_data = json.loads(json_response_str)
+            # Pega a tradução e remove aspas extras que o modelo pode adicionar
+            translated_text = response_body['generation'].strip().strip('"')
             
-            if 'contexto_traduzido' in translated_data and len(translated_data.get('alvos_traduzidos', [])) == 3:
-                return translated_data
+            if translated_text:
+                return translated_text
             else:
-                raise Exception(f"JSON retornado com estrutura inválida: {translated_data}")
+                raise Exception("Tradução retornou vazia.")
 
         except botocore.exceptions.ClientError as e:
             if "ThrottlingException" in str(e):
@@ -139,13 +78,13 @@ Formato de Saída JSON Obrigatório:
                 delay *= 2
             else:
                 logging.error(f"Erro do cliente Bedrock: {e}")
-                return None
+                return None # Falha na tradução deste texto
         except Exception as e:
-            logging.error(f"Erro ao processar exemplo (ID: {example_in['id']}): {e}")
-            logging.error(f"Resposta JSON inválida: {response_body['generation']}")
+            logging.error(f"Erro ao processar texto '{text_en[:50]}...': {e}")
+            logging.error(f"Resposta inválida: {response_body.get('generation', 'N/A')}")
             return None
     
-    logging.error(f"Excedeu retentativas para o exemplo (ID: {example_in['id']}).")
+    logging.error(f"Excedeu retentativas para o texto '{text_en[:50]}...'.")
     return None
 
 
@@ -156,17 +95,17 @@ def sanitize_text(text):
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
 
 
-# --- 4. FUNÇÃO PRINCIPAL DE TRADUÇÃO (MODIFICADA) ---
+# --- 4. FUNÇÃO PRINCIPAL DE TRADUÇÃO (LÓGICA CORRIGIDA) ---
 
 def traduzir_e_recriar_estrutura_com_llm():
     """
     Executa o pipeline completo de tradução usando o Bedrock
-    e recria a estrutura original do Stereoset.
+    com chamadas ISOLADAS para preservar a integridade do teste.
     """
     
     reconstructed_data = {}
     
-    for config in CONFIGS: # 'config' aqui será 'intersentence' ou 'intrasentence'
+    for config in CONFIGS:
         print(f"Carregando e processando a configuração '{config}' do dataset...")
         dataset = load_dataset(DATASET_NAME, config, split=DATASET_SPLIT, keep_in_memory=True)
         
@@ -174,27 +113,42 @@ def traduzir_e_recriar_estrutura_com_llm():
         
         for original_example in tqdm(dataset, desc=f"Traduzindo {config}"):
             
-            # --- MODIFICAÇÃO: Passa o 'config' para a função de tradução ---
-            translated_data = translate_example_with_context(original_example, config)
+            # --- INÍCIO DA LÓGICA CORRIGIDA ---
+            # 1. Traduz o contexto de forma isolada
+            context_pt = translate_text(original_example['context'])
+            if context_pt is None:
+                continue # Pula o exemplo se o contexto falhar
             
-            if translated_data is None:
-                continue
-                
-            context_pt = sanitize_text(translated_data['contexto_traduzido'])
-            alvos_pt = [sanitize_text(t) for t in translated_data['alvos_traduzidos']]
+            # 2. Traduz cada alvo de forma isolada
+            original_sents_data = original_example['sentences']
+            alvos_en = original_sents_data['sentence']
+            alvos_pt = []
             
+            translation_failed = False
+            for alvo_en in alvos_en:
+                alvo_pt = translate_text(alvo_en)
+                if alvo_pt is None:
+                    translation_failed = True
+                    break # Se um alvo falhar, o exemplo todo é inválido
+                alvos_pt.append(alvo_pt)
+            
+            if translation_failed:
+                continue # Pula o exemplo
+            # --- FIM DA LÓGICA CORRIGIDA ---
+
+            # Monta a nova estrutura do exemplo
             new_example = {
                 "id": original_example['id'],
                 "bias_type": original_example['bias_type'],
                 "target": original_example['target'],
-                "context": context_pt,
+                "context": sanitize_text(context_pt),
                 "sentences": []
             }
             
-            original_sents_data = original_example['sentences']
             num_sentences = len(original_sents_data['sentence'])
 
             for i in range(num_sentences):
+                # Recria a estrutura interna de 'labels'
                 recreated_labels = []
                 labels_data_for_one_sentence = original_sents_data['labels'][i]
                 human_ids = labels_data_for_one_sentence['human_id']
@@ -208,7 +162,7 @@ def traduzir_e_recriar_estrutura_com_llm():
 
                 new_sentence_obj = {
                     "id": original_sents_data['id'][i],
-                    "sentence": alvos_pt[i],
+                    "sentence": sanitize_text(alvos_pt[i]), # Usa o texto da lista de alvos traduzidos
                     "labels": recreated_labels,
                     "gold_label": GOLD_LABEL_MAP[original_sents_data['gold_label'][i]]
                 }
@@ -218,19 +172,19 @@ def traduzir_e_recriar_estrutura_com_llm():
         
         reconstructed_data[config] = new_examples_list
 
-    # --- ETAPA DE SALVAMENTO (COMO ANTES) ---
+    # --- ETAPA DE SALVAMENTO ---
     final_output_structure = {
         "version": "1.1",
         "data": reconstructed_data
     }
     
-    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_contexto_correto.json"
+    output_path = f"stereoset_{DATASET_SPLIT}_pt_llama3_isolado.json"
     print(f"Salvando o dataset final em: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(final_output_structure, f, ensure_ascii=False, indent=2)
 
-    print("\n✅ Sucesso! O arquivo de saída (traduzido via LLM) é compatível com o dataloader.py.")
+    print("\n✅ Sucesso! O arquivo de saída (traduzido isoladamente) é compatível com o dataloader.py.")
 
 
 # --- 5. EXECUÇÃO ---
