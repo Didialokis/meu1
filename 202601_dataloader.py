@@ -2,8 +2,34 @@ pip install aider-chat
 export OPENAI_API_KEY=sua-chave-aqui
 cd pasta-do-seu-projeto
 aider
+//////////////
+# --- Essenciais para OpenAI & API ---
+openai>=1.0.0       # A biblioteca oficial (versão mais recente)
+python-dotenv       # Para gerenciar sua API Key via arquivo .env (segurança)
+tiktoken            # Para contar tokens antes de enviar (economiza dinheiro)
+requests            # Para chamadas HTTP genéricas (útil para testar APIs)
 
+# --- Data Science & Analytics (Seus estudos e StereoSet) ---
+numpy               # Cálculos matemáticos de alta performance
+pandas              # Manipulação de CSV, JSON e tabelas (essencial)
+openpyxl            # Dependência do Pandas para ler/escrever arquivos Excel (.xlsx)
+matplotlib          # Criação de gráficos básicos
+seaborn             # Gráficos estatísticos mais bonitos (baseado no matplotlib)
+scikit-learn        # Machine Learning clássico (regressão, clustering para analytics)
+tqdm                # Barra de progresso (ótimo para loops longos de processamento)
 
+# --- Deep Learning & NLP (PyTorch e Textos) ---
+# Nota: Veja a seção abaixo sobre a instalação do PyTorch
+torch               # O framework de Deep Learning
+torchvision         # Processamento de imagem (para seu projeto da balança/câmera)
+transformers        # Hugging Face (padrão ouro para lidar com datasets como StereoSet)
+
+# --- Hardware & IoT (ESP32) ---
+pyserial            # Comunicação via porta USB/Serial com o ESP32
+pillow              # Manipulação de imagens (redimensionar, converter antes de enviar)
+
+# --- Cloud & Infra ---
+boto3               # SDK da AWS (se for usar S3 ou outros serviços)
 /////////////
 def __create_intrasentence_examples__(self, examples):
         created_examples = []
