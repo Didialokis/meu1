@@ -1,3 +1,10 @@
+pip install aider-chat
+export OPENAI_API_KEY=sua-chave-aqui
+cd pasta-do-seu-projeto
+aider
+
+
+/////////////
 def __create_intrasentence_examples__(self, examples):
         created_examples = []
         # Contador para não poluir o terminal (mostra apenas os 5 primeiros logs)
