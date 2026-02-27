@@ -1,68 +1,84 @@
-import pandas as pd
-import json
-import numpy as np
+def build_intrasentence(df_intra: pd.DataFrame, gold_intra_by_key: Dict[Tuple[str, str, tuple], dict]) -> List[dict]:
+    # 1. Pré-calcula as colunas base ANTES do loop (Evita buscas repetidas)
+    c_bias = find_col(df_intra, "Viés", "Vies", "bias_type", "bias")
+    c_target = find_col(df_intra, "Target", "target")
+    c_target_pt = find_col(df_intra, "Target_PT", "target_pt")
+    c_ctx_pt = find_col(df_intra, "Contexto_PT", "Contexto PT", "context_pt", "context")
 
-# --- CONFIGURAÇÕES ---
-ARQUIVO_EXCEL = 'verificacao_amostra_25_porcento.xlsx'
-ARQUIVO_JSON_SAIDA = 'stereoset_reconstruido.json'
+    # 2. Pré-calcula as colunas das 3 sentenças ANTES do loop
+    sent_cols = []
+    for i in (1, 2, 3):
+        c_lab = find_col(df_intra, f"Frase_{i}_Label")
+        c_en = find_col(df_intra, f"Frase_{i}_EN")
+        c_pt = find_col(df_intra, f"Frase_{i}_PT")
+        sent_cols.append((c_lab, c_en, c_pt))
 
-def converter_excel_para_json():
-    print(f"📂 Lendo: {ARQUIVO_EXCEL}...")
-    
-    # Lê o Excel e substitui NaN por string vazia para evitar erros
-    df = pd.read_excel(ARQUIVO_EXCEL).replace({np.nan: None})
-    
-    # Estrutura raiz do StereoSet
-    dados_json = {
-        "version": "1.1",
-        "data": {
-            "intersentence": [],
-            "intrasentence": []
-        }
-    }
+    out = []
+    # 3. Loop principal de iteração nas linhas
+    for _, r in df_intra.iterrows():
+        row = r.to_dict()
 
-    print("⚙️  Reconstruindo estrutura hierárquica...")
+        bias = norm(row.get(c_bias)) if c_bias else ""
+        target = norm(row.get(c_target)) if c_target else ""
+        target_pt = norm(row.get(c_target_pt)) if c_target_pt else ""
+        context_pt = norm(row.get(c_ctx_pt)) if c_ctx_pt else ""
 
-    for _, row in df.iterrows():
-        tarefa = row['tarefa']
+        s_en, s_pt, gls = [], [], []
         
-        # Estrutura base do exemplo
-        exemplo = {
-            "id": row['id'],
-            "bias_type": row['dominio_vies'],
-            "target": "Generic", # O target original muitas vezes não está no excel simplificado, mas o ID mantém a referência
-            "context": str(row['CONTEXTO_PT']).strip(),
+        # 4. Extração das frases usando as colunas já mapeadas
+        for c_lab, c_en, c_pt in sent_cols:
+            gl = normalize_gold_label(row.get(c_lab)) if c_lab else ""
+            en = norm(row.get(c_en)) if c_en else ""
+            pt = norm(row.get(c_pt)) if c_pt else ""
+            
+            gls.append(gl)
+            s_en.append(en)
+            s_pt.append(pt)
+
+        # 5. Validações originais (mantidas intactas)
+        if not (bias and target and context_pt):
+            continue
+        if any(g not in ALLOWED_GOLD for g in gls):
+            continue
+        if any(not t for t in s_pt):
+            continue
+
+        # 6. Busca no Gold JSON original
+        key = (bias, target, tuple(sorted([norm_key(x) for x in s_en])))
+        gold_ex = gold_intra_by_key.get(key)
+
+        ex_id = gold_ex.get("id") if gold_ex and gold_ex.get("id") else stable_id(
+            "intrasentence", bias, target, context_pt, "||".join(sorted(s_pt))
+        )
+
+        # 7. Construção do objeto principal
+        ex_obj = {
+            "id": ex_id,
+            "bias_type": bias,
+            "target": target,
+            "Target_PT": target_pt,
+            "context": context_pt,
             "sentences": []
         }
 
-        # Reconstrói as 3 frases (Alvos)
-        for i in range(1, 4):
-            texto_frase = row[f'Alvo_{i}_PT']
-            label = row[f'Label_{i}'] # stereotype, anti-stereotype, unrelated
+        # 8. Popula as 3 sentenças no objeto final
+        for i in range(3):
+            gl = gls[i]
+            pt = s_pt[i]
             
-            # Pula se estiver vazio (caso raro de erro no Excel)
-            if not texto_frase:
-                continue
+            gold_sent = find_sentence_in_gold(gold_ex, gl) if gold_ex else None
+            sent_id = gold_sent.get("id") if gold_sent else stable_id(ex_id, f"{i+1}", gl, pt)
+            
+            labels = gold_sent.get("labels", []) if gold_sent else []
+            labels = ensure_nonempty_labels(labels, gl)
 
-            sentenca_obj = {
-                "id": f"{row['id']}_{i}", # ID único para a sentença
-                "sentence": str(texto_frase).strip(),
-                "gold_label": label,
-                # Recriamos a lista 'labels' vazia ou com dados mínimos para compatibilidade
-                # O script de avaliação oficial usa 'gold_label', mas a estrutura exige a chave 'labels'
-                "labels": [] 
-            }
-            exemplo['sentences'].append(sentenca_obj)
+            ex_obj["sentences"].append({
+                "id": sent_id,
+                "sentence": pt,
+                "labels": labels,
+                "gold_label": gl
+            })
 
-        # Adiciona na lista correta (intra ou inter)
-        if tarefa in dados_json['data']:
-            dados_json['data'][tarefa].append(exemplo)
+        out.append(ex_obj)
 
-    # Salva o arquivo
-    with open(ARQUIVO_JSON_SAIDA, 'w', encoding='utf-8') as f:
-        json.dump(dados_json, f, ensure_ascii=False, indent=2)
-
-    print(f"✅ Conversão concluída! Arquivo salvo em: {ARQUIVO_JSON_SAIDA}")
-
-if __name__ == "__main__":
-    converter_excel_para_json()
+    return out
