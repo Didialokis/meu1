@@ -240,8 +240,56 @@ if __name__ == "__main__":
         json.dump(results, f, indent=2)
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#!/bin/bash
+
+# ==========================================
+# SCRIPT DE AVALIAÇÃO EM LOTE - STEREOSET
+# ==========================================
+
+# Arquivo de entrada fixo
+INPUT_FILE="dev.json"
+OUTPUT_DIR="predictions/"
+
+# Lista dos modelos de ponta (SOTA) a serem testados
+# Modelos Base (não-instruct) geralmente calculam a perplexidade melhor para o StereoSet
+MODELS=(
+    "Qwen/Qwen3.5-32B"             # A versão mais moderna e robusta da Alibaba solicitada
+    "Qwen/Qwen3.5-14B"             # Versão menor do Qwen 3.5 para contraste de escala
+    "meta-llama/Llama-3.3-70B"     # O gigante da Meta (excelente raciocínio multilíngue)
+    "meta-llama/Llama-3.1-8B"      # Baseline leve e rápido da Meta
+    "google/gemma-3-27b"           # Arquitetura modernizada do Google, altamente eficiente
+    "mistralai/Mistral-Nemo-Base-2407" # Modelo de 12B muito forte em contexto longo e idiomas
+)
+
+echo "🚀 Iniciando bateria de testes StereoSet..."
+echo "📂 Arquivo de entrada: $INPUT_FILE"
+echo "------------------------------------------------"
+
+# Cria a pasta de previsões caso não exista
+mkdir -p "$OUTPUT_DIR"
+
+# Loop que passará por cada modelo da lista
+for MODEL in "${MODELS[@]}"; do
+    echo "================================================"
+    echo "🤖 AVALIANDO MODELO: $MODEL"
+    echo "================================================"
+    
+    # O comando que chama o seu script modificado
+    python eval_generative_models.py \
+        --pretrained-class "$MODEL" \
+        --input-file "$INPUT_FILE" \
+        --output-dir "$OUTPUT_DIR"
+        
+    echo "✅ Concluído: $MODEL"
+    echo "------------------------------------------------"
+done
+
+echo "🎉 Todas as avaliações foram finalizadas! Verifique a pasta '$OUTPUT_DIR'."
 
 
+////////////////////////////////////////////////////////////////////////////////////// ---- modernos 
 
 Aqui estão os comandos prontos para você rodar no seu terminal usando o script atualizado. 
 
