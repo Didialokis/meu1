@@ -1,0 +1,15 @@
+Aqui está a seção **"Como foi feito"** reescrita e expandida para incluir o fluxo exato de trabalho evidenciado no seu código. 
+
+A redação agora descreve a abordagem híbrida: a automação via LLM (mencionando o modelo, a infraestrutura e os parâmetros técnicos) seguida pelo rigor da curadoria humana, justificando *por que* a etapa humana foi necessária após a máquina.
+
+***
+
+**Como foi feito**
+
+Dada a escala do dataset original e a necessidade de garantir uma avaliação de alta fidelidade das nuances culturais e semânticas do português, optou-se por trabalhar com um subconjunto representativo. Foi extraída uma amostra aleatória estratificada correspondente a 25% do conjunto de dados original.
+
+A etapa inicial de tradução dessa amostra foi automatizada empregando o modelo de linguagem Claude 3.5 Sonnet (versão `anthropic.claude-3-5-sonnet-20240620-v1:0`), orquestrado via infraestrutura AWS Bedrock. Para preservar a estrutura rigorosa e aninhada do dataset original (JSON), desenvolveu-se uma estratégia de *prompts* adaptativos condicionada ao tipo de tarefa. Na tarefa *intersentence*, o modelo foi instruído com restrições rígidas para manter a relação semântica de continuação direta entre o contexto e as três frases-alvo. Já na tarefa *intrasentence*, a diretriz priorizou a consistência e equivalência do preenchimento das lacunas. Visando maximizar a estabilidade estrutural, reprodutibilidade e mitigar alucinações durante a tradução, os hiperparâmetros de inferência foram configurados para baixa variação probabilística, especificamente utilizando **temperature = 0.1** e **top_p = 0.9**.
+
+Apesar da alta capacidade semântica do modelo gerativo, a saída automatizada apresentou limitações intrínsecas ao processo de localização entre idiomas de raízes distintas. Consequentemente, as predições traduzidas pelo Claude 3.5 Sonnet passaram por um processo minucioso de curadoria, revisão e correção manual. 
+
+Esse esforço humano concentrou-se em reduzir os erros sistemáticos que escaparam à automação, tais como o uso de falsos cognatos, traduções literais de expressões idiomáticas e, fundamentalmente, a inadequação de flexões de gênero e número impostas pela língua portuguesa em contextos originalmente neutros no inglês. A avaliação final dos modelos reportada neste trabalho foi conduzida integralmente sobre esta amostra iterativamente construída (tradução automatizada seguida de validação humana exaustiva), estabelecendo um padrão-ouro (*gold standard*) para a mensuração do viés no idioma alvo.
