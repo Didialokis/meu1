@@ -1,8 +1,33 @@
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-from langchain_huggingface import HuggingFacePipeline, ChatHuggingFace
+from langchain_core.language_models.llms import LLM as LangChainLLM
+from pydantic import PrivateAttr
+from typing import Any, List, Optional
 from crewai import Agent, Task, Crew, Process
+
+# ==========================================
+# 0. CLASSE WRAPPER (A Solução do Erro)
+# ==========================================
+class CustomLocalLLM(LangChainLLM):
+    """
+    Wrapper customizado para ignorar os conflitos de validação do Pydantic no CrewAI.
+    Herdamos diretamente do BaseLLM do LangChain.
+    """
+    _pipeline_func: Any = PrivateAttr()
+
+    def __init__(self, pipeline_func, **kwargs):
+        super().__init__(**kwargs)
+        self._pipeline_func = pipeline_func
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
+        # O HuggingFace pipeline com return_full_text=False já devolve apenas a resposta gerada
+        resposta = self._pipeline_func(prompt)
+        return resposta[0]["generated_text"]
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom_local_llama"
 
 # ==========================================
 # 1. CONFIGURAÇÃO DO MODELO LOCAL (AWS)
@@ -12,37 +37,34 @@ model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 print("Carregando o modelo na GPU...")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-# Configuração de quantização para as versões mais recentes do transformers
+# Nova forma de configurar a quantização para as GPUs da AWS
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4", # Formato otimizado para a família Llama
+    bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True
 )
 
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
     device_map="auto",
-    quantization_config=quant_config, # Usando a nova configuração de quantização
+    quantization_config=quant_config,
 )
 
-# [CORREÇÃO 1] Evita o warning do pad_token_id
 model.config.pad_token_id = tokenizer.eos_token_id
 
-# [CORREÇÃO 2] Removemos a temperature conflitante, do_sample=False já garante determinismo
 text_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
     max_new_tokens=1024,
-    do_sample=False,
+    do_sample=False, # Garante determinismo sem conflitar com temperature
     return_full_text=False,
     pad_token_id=tokenizer.eos_token_id
 )
 
-# [CORREÇÃO 3] Envelopando o pipeline para ser reconhecido pelo CrewAI
-base_llm = HuggingFacePipeline(pipeline=text_pipeline)
-chat_llm = ChatHuggingFace(llm=base_llm)
+# Instanciando o nosso LLM customizado em vez do ChatHuggingFace problemático
+local_llm = CustomLocalLLM(pipeline_func=text_pipeline)
 
 # ==========================================
 # 2. DEFINIÇÃO DA TAREFA DE NEGÓCIOS
@@ -63,19 +85,18 @@ start_time_mono = time.time()
 
 prompt_monolitico = f"Você é um analista sênior de operações. Resolva a seguinte tarefa: {business_task}"
 
-# Usando o chat_llm para garantir o mesmo formato
-resposta_mono = chat_llm.invoke(prompt_monolitico)
+# Chamada direta usando o nosso LLM customizado
+resposta_mono = local_llm.invoke(prompt_monolitico)
 
 end_time_mono = time.time()
 latencia_mono = end_time_mono - start_time_mono
 
-# Contagem de tokens
+# Contagem de tokens (o invoke de LangChainLLM devolve a string diretamente)
 tokens_in_mono = len(tokenizer.encode(prompt_monolitico))
-tokens_out_mono = len(tokenizer.encode(resposta_mono.content))
+tokens_out_mono = len(tokenizer.encode(resposta_mono))
 total_tokens_mono = tokens_in_mono + tokens_out_mono
 
 print(f"Resultado Monolítico gerado com sucesso.")
-
 
 # ==========================================
 # 4. TESTE 2: ARQUITETURA MULTI-AGENTE (CrewAI)
@@ -83,12 +104,12 @@ print(f"Resultado Monolítico gerado com sucesso.")
 print("\n--- INICIANDO TESTE MULTI-AGENTE ---")
 start_time_multi = time.time()
 
-# Agentes agora recebem o chat_llm envelopado corretamente
+# Agentes agora recebem o local_llm envelopado corretamente
 logistics_agent = Agent(
     role='Especialista em Logística Internacional',
     goal='Analisar rotas de importação e riscos de transporte de hardware',
     backstory='Você é especialista em gerenciar o trânsito de eletrônicos sensíveis entre a Europa e o Brasil.',
-    llm=chat_llm, 
+    llm=local_llm, 
     verbose=False,
     allow_delegation=False
 )
@@ -97,7 +118,7 @@ financial_agent = Agent(
     role='Auditor de Viabilidade Financeira',
     goal='Avaliar o parecer logístico e emitir a recomendação final de viabilidade',
     backstory='Você é um auditor rigoroso que só aprova operações com risco mitigado e alta margem de retorno.',
-    llm=chat_llm,
+    llm=local_llm,
     verbose=False,
     allow_delegation=False
 )
@@ -141,5 +162,5 @@ print(f"Tokens Consumidos (estimado): {total_tokens_mono}")
 
 print("\n[ARQUITETURA MULTI-AGENTE]")
 print(f"Latência: {latencia_multi:.2f} segundos")
-print(f"Tokens Consumidos (estimado): > {total_tokens_multi} (devido ao loop)")
+print(f"Tokens Consumidos (estimado): > {total_tokens_multi}")
 print("==========================================")
