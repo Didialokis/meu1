@@ -1,68 +1,32 @@
-Excelente diagnóstico rodando o `nvidia-smi`! A sua máquina é uma verdadeira Ferrari (driver novíssimo 550.x e CUDA 12.6), mas o Python instalou um "motor de fusca".
+pip install langchain-aws crewai
 
-O que está acontecendo é um desencontro clássico: a biblioteca PyTorch instalada no seu ambiente virtual (provavelmente via um simples `pip install torch`) não possui os binários compilados para conversar com o seu CUDA 12.6. Como o PyTorch fica "cego" e não consegue achar a GPU, ele entra em modo de segurança e joga toda a carga para a CPU.
 
-A melhor notícia é que, como você está em uma **g5.12xlarge** (que possui 4 GPUs de 24GB cada, totalizando 96GB de VRAM), nós **não precisamos da quantização de 4-bits (`bitsandbytes`)** para um modelo de 8 bilhões de parâmetros. O modelo inteiro em 16-bits puros pesa apenas cerca de 16GB, ou seja, cabe folgadamente na sua máquina. Remover o `bitsandbytes` elimina 90% das chances de conflito de drivers.
 
-Vamos resolver isso definitivamente em dois passos:
 
-### Passo 1: Forçar o PyTorch a enxergar a GPU
 
-No terminal da AWS, rode este comando para forçar a reinstalação do PyTorch com os binários corretos para GPU (a versão compilada para CUDA 12.1 é a mais estável na AWS e é 100% retrocompatível com o seu driver 12.6):
 
-```bash
-pip install torch torchvision torchaudio --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu121
 
-```
 
-### Passo 2: O Script Otimizado (Sem Gargalos de Driver)
 
-Atualizei o seu script. Adicionei uma trava de segurança no topo que vai abortar a execução imediatamente se a GPU não for detectada (para você não perder tempo esperando a CPU processar). Também removi a configuração do `bitsandbytes`, permitindo que o modelo carregue em sua glória total de 16-bits.
 
-Substitua o `poc_benchmark.py` por isto:
-
-```python
-import sys
 import time
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import boto3
+from langchain_aws import ChatBedrock
+from crewai import Agent, Task, Crew, Process
 
 # ==========================================
-# 0. TRAVA DE SEGURANÇA (VERIFICAÇÃO DE GPU)
+# 1. CONEXÃO COM O AWS BEDROCK (LLAMA 3)
 # ==========================================
-if not torch.cuda.is_available():
-    print("ERRO CRÍTICO: O PyTorch ainda não está enxergando a GPU. Ele está na CPU.")
-    print("Execute o comando de instalação do PyTorch com suporte a CUDA 12.1.")
-    sys.exit(1)
+print("Conectando ao Llama 3 via AWS Bedrock...")
 
-num_gpus = torch.cuda.device_count()
-print(f"Sucesso! PyTorch detectou {num_gpus} GPU(s).")
-for i in range(num_gpus):
-    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+# Usando o Llama 3 8B nativo da AWS. 
+# Se preferir o 70B, troque para: 'meta.llama3-70b-instruct-v1:0'
+bedrock_client = boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
 
-# ==========================================
-# 1. CARREGAMENTO NATIVO DO MODELO (16-bits puros)
-# ==========================================
-model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-
-print("\nCarregando o modelo nativamente na GPU (sem quantização)...")
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-# Carregamento limpo, aproveitando a VRAM imensa da g5.12xlarge
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    device_map="auto",
-    torch_dtype=torch.float16, # 16-bits puro, altíssimo desempenho
-)
-
-text_pipeline = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=1024,
-    do_sample=False, 
-    return_full_text=False,
-    pad_token_id=tokenizer.eos_token_id
+llm_bedrock = ChatBedrock(
+    client=bedrock_client,
+    model_id="meta.llama3-8b-instruct-v1:0",
+    model_kwargs={"temperature": 0.0} # Mantém o determinismo
 )
 
 # ==========================================
@@ -76,62 +40,85 @@ e o risco de avarias em componentes sensíveis como chips BGA durante o transpor
 Forneça um parecer final de recomendação (Aprovado ou Reprovado) com 3 justificativas.
 """
 
-def formatar_prompt(sistema, usuario):
-    messages = [
-        {"role": "system", "content": sistema},
-        {"role": "user", "content": usuario}
-    ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
 # ==========================================
 # 3. TESTE 1: ARQUITETURA MONOLÍTICA
 # ==========================================
 print("\n--- INICIANDO TESTE MONOLÍTICO ---")
 start_time_mono = time.time()
 
-sistema_mono = "Você é um analista sênior de operações corporativas. Resolva problemas complexos de ponta a ponta com raciocínio lógico."
-prompt_mono = formatar_prompt(sistema_mono, f"Resolva a seguinte tarefa: {business_task}")
+mono_agent = Agent(
+    role='Analista Sênior de Operações',
+    goal='Resolver o problema logístico e financeiro de ponta a ponta',
+    backstory='Você é um especialista generalista capaz de analisar operações complexas.',
+    llm=llm_bedrock,
+    verbose=False,
+    allow_delegation=False
+)
 
-saida_mono = text_pipeline(prompt_mono)[0]["generated_text"]
+mono_task = Task(
+    description=f'Resolva a seguinte tarefa: {business_task}',
+    expected_output='Parecer final (Aprovado/Reprovado) com 3 justificativas.',
+    agent=mono_agent
+)
+
+mono_crew = Crew(agents=[mono_agent], tasks=[mono_task])
+
+# Executa e captura o uso de tokens nativo do CrewAI/LangChain
+resultado_mono = mono_crew.kickoff()
 
 end_time_mono = time.time()
 latencia_mono = end_time_mono - start_time_mono
+usage_mono = resultado_mono.token_usage
 
-tokens_in_mono = len(tokenizer.encode(prompt_mono))
-tokens_out_mono = len(tokenizer.encode(saida_mono))
-total_tokens_mono = tokens_in_mono + tokens_out_mono
-
-print("Resultado Monolítico gerado com sucesso.")
+print("Resultado Monolítico gerado.")
 
 # ==========================================
-# 4. TESTE 2: ARQUITETURA MULTI-AGENTE (Orquestração Nativa)
+# 4. TESTE 2: ARQUITETURA MULTI-AGENTE
 # ==========================================
 print("\n--- INICIANDO TESTE MULTI-AGENTE ---")
 start_time_multi = time.time()
 
-# Agente 1: Logística
-sistema_agente1 = "Você é um Engenheiro Especialista em Logística Internacional."
-tarefa_agente1 = f"Analise EXCLUSIVAMENTE os riscos logísticos operacionais e estimativa de avarias do seguinte cenário: {business_task}"
+logistics_agent = Agent(
+    role='Especialista em Logística Internacional',
+    goal='Analisar rotas de importação e riscos de transporte de hardware sensível',
+    backstory='Você é um engenheiro especialista em gerenciar o trânsito de eletrônicos entre a Europa e o Brasil.',
+    llm=llm_bedrock, 
+    verbose=False,
+    allow_delegation=False
+)
 
-prompt_agente1 = formatar_prompt(sistema_agente1, tarefa_agente1)
-saida_agente1 = text_pipeline(prompt_agente1)[0]["generated_text"]
+financial_agent = Agent(
+    role='Auditor de Viabilidade Financeira',
+    goal='Avaliar o parecer logístico e emitir a recomendação final de viabilidade',
+    backstory='Você é um auditor financeiro rigoroso que só aprova operações com risco mitigado.',
+    llm=llm_bedrock,
+    verbose=False,
+    allow_delegation=False
+)
 
-# Agente 2: Finanças 
-sistema_agente2 = "Você é um Auditor de Viabilidade Financeira. Você só aprova operações com base em relatórios logísticos."
-tarefa_agente2 = f"""Com base no Relatório Logístico abaixo, emita o parecer final financeiro (Aprovado/Reprovado) com 3 justificativas.
-Relatório Logístico Recebido:
-{saida_agente1}
-"""
+task_1 = Task(
+    description=f'Analise os riscos logísticos do seguinte cenário: {business_task}',
+    expected_output='Um relatório de riscos operacionais e estimativa de avarias de hardware.',
+    agent=logistics_agent
+)
 
-prompt_agente2 = formatar_prompt(sistema_agente2, tarefa_agente2)
-saida_agente2 = text_pipeline(prompt_agente2)[0]["generated_text"]
+task_2 = Task(
+    description='Com base no relatório logístico, emita o parecer final (Aprovado/Reprovado) com 3 justificativas.',
+    expected_output='Parecer final de negócios estruturado em tópicos.',
+    agent=financial_agent
+)
+
+multi_crew = Crew(
+    agents=[logistics_agent, financial_agent],
+    tasks=[task_1, task_2],
+    process=Process.sequential
+)
+
+resultado_multi = multi_crew.kickoff()
 
 end_time_multi = time.time()
 latencia_multi = end_time_multi - start_time_multi
-
-tokens_in_multi = len(tokenizer.encode(prompt_agente1)) + len(tokenizer.encode(prompt_agente2))
-tokens_out_multi = len(tokenizer.encode(saida_agente1)) + len(tokenizer.encode(saida_agente2))
-total_tokens_multi = tokens_in_multi + tokens_out_multi
+usage_multi = resultado_multi.token_usage
 
 # ==========================================
 # 5. RESULTADOS DO BENCHMARK
@@ -139,140 +126,14 @@ total_tokens_multi = tokens_in_multi + tokens_out_multi
 print("\n==========================================")
 print(" RESULTADOS PRELIMINARES DO EXPERIMENTO")
 print("==========================================")
+
 print("\n[ARQUITETURA MONOLÍTICA]")
 print(f"Latência: {latencia_mono:.2f} segundos")
-print(f"Tokens Consumidos: {total_tokens_mono}")
+if usage_mono:
+    print(f"Tokens Totais: {usage_mono.total_tokens} (Prompt: {usage_mono.prompt_tokens}, Completion: {usage_mono.completion_tokens})")
 
 print("\n[ARQUITETURA MULTI-AGENTE]")
 print(f"Latência: {latencia_multi:.2f} segundos")
-print(f"Tokens Consumidos: {total_tokens_multi}")
-print("==========================================")
-
-```
-
-Rode o comando de instalação do PyTorch no terminal e, logo após, chame o `python poc_benchmark.py`. O console imprimirá `Sucesso! PyTorch detectou X GPU(s)` no primeiro segundo, confirmando que ultrapassamos o gargalo tecnológico!
-
-
-
-
-////////////////////////////////
-import time
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-
-# ==========================================
-# 1. CARREGAMENTO NATIVO DO MODELO (Sem CrewAI/LangChain)
-# ==========================================
-model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-
-print("Carregando o modelo na GPU (Transformers nativo)...")
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True
-)
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    device_map="auto",
-    quantization_config=quant_config,
-)
-
-text_pipeline = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=1024,
-    do_sample=False, # Determinístico
-    return_full_text=False,
-    pad_token_id=tokenizer.eos_token_id
-)
-
-# ==========================================
-# 2. DEFINIÇÃO DA TAREFA DE NEGÓCIOS
-# ==========================================
-business_task = """
-Analise a viabilidade logística e financeira de importar lotes de notebooks refurbhished 
-(com defeitos de placa-mãe para reparo) através de um hub logístico em Madri, Espanha, 
-para distribuição no Brasil. Considere os custos de frete, tempo de trânsito alfandegário 
-e o risco de avarias em componentes sensíveis como chips BGA durante o transporte.
-Forneça um parecer final de recomendação (Aprovado ou Reprovado) com 3 justificativas.
-"""
-
-# Função auxiliar para formatar os prompts para o Llama 3.1
-def formatar_prompt(sistema, usuario):
-    messages = [
-        {"role": "system", "content": sistema},
-        {"role": "user", "content": usuario}
-    ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-# ==========================================
-# 3. TESTE 1: ARQUITETURA MONOLÍTICA
-# ==========================================
-print("\n--- INICIANDO TESTE MONOLÍTICO ---")
-start_time_mono = time.time()
-
-sistema_mono = "Você é um analista sênior de operações corporativas. Resolva problemas complexos de ponta a ponta com raciocínio lógico."
-prompt_mono = formatar_prompt(sistema_mono, f"Resolva a seguinte tarefa: {business_task}")
-
-# Inferência
-saida_mono = text_pipeline(prompt_mono)[0]["generated_text"]
-
-end_time_mono = time.time()
-latencia_mono = end_time_mono - start_time_mono
-
-tokens_in_mono = len(tokenizer.encode(prompt_mono))
-tokens_out_mono = len(tokenizer.encode(saida_mono))
-total_tokens_mono = tokens_in_mono + tokens_out_mono
-
-print("Resultado Monolítico gerado com sucesso.")
-
-# ==========================================
-# 4. TESTE 2: ARQUITETURA MULTI-AGENTE (Orquestração Nativa)
-# ==========================================
-print("\n--- INICIANDO TESTE MULTI-AGENTE ---")
-start_time_multi = time.time()
-
-# --- Agente 1: Logística ---
-sistema_agente1 = "Você é um Engenheiro Especialista em Logística Internacional."
-tarefa_agente1 = f"Analise EXCLUSIVAMENTE os riscos logísticos operacionais e estimativa de avarias do seguinte cenário: {business_task}"
-
-prompt_agente1 = formatar_prompt(sistema_agente1, tarefa_agente1)
-saida_agente1 = text_pipeline(prompt_agente1)[0]["generated_text"]
-
-# --- Agente 2: Finanças (Recebe o output do Agente 1) ---
-sistema_agente2 = "Você é um Auditor de Viabilidade Financeira. Você só aprova operações com base em relatórios logísticos."
-tarefa_agente2 = f"""Com base no Relatório Logístico abaixo, emita o parecer final financeiro (Aprovado/Reprovado) com 3 justificativas.
-Relatório Logístico Recebido:
-{saida_agente1}
-"""
-
-prompt_agente2 = formatar_prompt(sistema_agente2, tarefa_agente2)
-saida_agente2 = text_pipeline(prompt_agente2)[0]["generated_text"]
-
-end_time_multi = time.time()
-latencia_multi = end_time_multi - start_time_multi
-
-# Cálculo preciso de tokens na arquitetura Multi-Agente
-tokens_in_multi = len(tokenizer.encode(prompt_agente1)) + len(tokenizer.encode(prompt_agente2))
-tokens_out_multi = len(tokenizer.encode(saida_agente1)) + len(tokenizer.encode(saida_agente2))
-total_tokens_multi = tokens_in_multi + tokens_out_multi
-
-# ==========================================
-# 5. RESULTADOS DO BENCHMARK
-# ==========================================
-print("\n==========================================")
-print(" RESULTADOS PRELIMINARES DO EXPERIMENTO")
-print("==========================================")
-print("\n[ARQUITETURA MONOLÍTICA]")
-print(f"Latência: {latencia_mono:.2f} segundos")
-print(f"Tokens Consumidos: {total_tokens_mono}")
-
-print("\n[ARQUITETURA MULTI-AGENTE]")
-print(f"Latência: {latencia_multi:.2f} segundos")
-print(f"Tokens Consumidos: {total_tokens_multi}")
+if usage_multi:
+    print(f"Tokens Totais: {usage_multi.total_tokens} (Prompt: {usage_multi.prompt_tokens}, Completion: {usage_multi.completion_tokens})")
 print("==========================================")
