@@ -1,54 +1,31 @@
-Excelente passo. Sair da teoria e executar uma Prova de Conceito (PoC) no terminal da AWS vai te dar os dados exatos que a banca exigiu.
-
-Como você vai executar isso diretamente no terminal do SageMaker via script Python (sem subir um servidor dedicado como o vLLM ou Ollama), a melhor estratégia é utilizar a biblioteca `transformers` nativa do Hugging Face integrada ao `CrewAI`.
-
-**Um aviso importante de realidade técnica:** O modelo Llama-3-70B é massivo. Para rodá-lo localmente via script, mesmo com quantização (compressão), sua instância no SageMaker precisará de GPUs parrudas (como uma `g5.12xlarge` ou `p4d`). No script abaixo, configurei o carregamento em **4-bits** para otimizar o uso da memória de vídeo (VRAM) e evitar erros de *Out of Memory* (OOM). Se a sua instância atual for menor (como uma `g4dn.xlarge`), recomendo trocar a variável do modelo no código para o `Llama-3-8B-Instruct` apenas para gerar esses resultados preliminares.
-
-Aqui está o passo a passo e o código completo.
-
-### 1. Preparação do Ambiente no Terminal
-
-No terminal do seu JupyterLab na AWS, instale as dependências necessárias. O `bitsandbytes` é fundamental para a quantização em 4-bits.
-
-```bash
-pip install crewai langchain-huggingface transformers accelerate bitsandbytes
-
-```
-
-Como a família Llama 3 é um modelo "gated" (fechado), você precisará estar autenticado no Hugging Face. No terminal, rode:
-
-```bash
-huggingface-cli login
-
-```
-
-*(Cole o seu token de acesso gerado no site do Hugging Face. Ele não aparecerá na tela enquanto você digita).*
-
-### 2. O Código do Experimento (`poc_benchmark.py`)
-
-Crie um arquivo chamado `poc_benchmark.py` no SageMaker.
-
-Este script faz exatamente o que definimos na metodologia: injeta um problema complexo de negócios (logística de eletrônicos), resolve de forma monolítica, resolve via multi-agente, cronometra a latência de ambos e conta os tokens utilizados.
-
-```python
 import time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 from langchain_huggingface import HuggingFacePipeline
 from crewai import Agent, Task, Crew, Process
 
 # ==========================================
 # 1. CONFIGURAÇÃO DO MODELO LOCAL (AWS)
 # ==========================================
-model_id = "meta-llama/Meta-Llama-3-8B-Instruct" # Troque para 70B se sua AWS tiver +40GB de VRAM
+# Se quiser testar o 70B, basta trocar o ID abaixo para "meta-llama/Meta-Llama-3-70B-Instruct"
+model_id = "meta-llama/Meta-Llama-3-8B-Instruct" 
 
-print("Carregando o modelo em 4-bits na GPU... Isso pode levar alguns minutos.")
+print("Configurando a quantização BitsAndBytes...")
+# Configuração moderna exigida pelas novas versões do Transformers
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4", # nf4 é a melhor compressão para a arquitetura do Llama 3
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+print(f"Carregando o modelo {model_id} nas GPUs... Isso pode levar alguns minutos.")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
+
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    device_map="auto",
-    load_in_4bit=True, # Quantização para caber na GPU
-    torch_dtype=torch.float16,
+    device_map="auto", # Na sua g5.12xlarge, isso distribuirá o peso perfeitamente entre as 4 GPUs
+    quantization_config=bnb_config,
 )
 
 # Pipeline do HuggingFace otimizado para lógica (Temperature = 0.0)
@@ -63,6 +40,8 @@ text_pipeline = pipeline(
 )
 
 llm = HuggingFacePipeline(pipeline=text_pipeline)
+
+# ... [O restante do código a partir do Bloco 2 continua exatamente igual] ...
 
 # ==========================================
 # 2. DEFINIÇÃO DA TAREFA DE NEGÓCIOS
