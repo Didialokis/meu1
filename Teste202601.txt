@@ -1,3 +1,85 @@
+Isso é um reflexo direto daquele alerta que recebemos na tentativa anterior: *"The NVIDIA driver on your system is too old (found version 12060)"*.
+
+O que aconteceu foi que a biblioteca PyTorch, ao não conseguir se comunicar com o driver da NVIDIA da sua máquina AWS por causa da diferença de versões, entrou em "modo de sobrevivência" e transferiu todo o peso silenciosamente para a CPU. O problema é que rodar um modelo de 8 bilhões de parâmetros na CPU pode fazer o script demorar horas para gerar uma única frase.
+
+Para resolver isso definitivamente na sua instância SageMaker, precisamos "rebaixar" (downgrade) a versão do seu PyTorch para uma que seja compatível com o driver 12.0 da AWS. A versão compilada para CUDA 11.8 é a mais segura e perfeitamente compatível com a sua infraestrutura.
+
+Aqui está o passo a passo para colocar as suas 4 GPUs A10G para trabalhar:
+
+### Passo 1: Corrigir a biblioteca PyTorch
+
+No seu terminal da AWS, cancele a execução atual (Ctrl+C) e rode o seguinte comando para forçar a instalação do PyTorch compatível com a sua placa:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --force-reinstall
+
+```
+
+### Passo 2: Validar a conexão com a GPU
+
+Para ter certeza de que funcionou, rode este comando rápido de uma linha no terminal:
+
+```bash
+python -c "import torch; print('GPU ATIVA:', torch.cuda.is_available())"
+
+```
+
+Se a resposta for `GPU ATIVA: True`, a comunicação foi restabelecida com sucesso.
+
+### Passo 3: Forçar o Script a usar a GPU
+
+Para garantir que o código nunca mais rode na CPU por acidente, adicionei uma trava de segurança e forcei o mapeamento no pipeline. Atualize o **Bloco 1** do seu arquivo `poc_benchmark.py` para ficar assim:
+
+```python
+import time
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+
+# TRAVA DE SEGURANÇA: Impede que o script rode na CPU se a GPU falhar
+assert torch.cuda.is_available(), "ERRO CRÍTICO: A GPU não foi detectada. O PyTorch está rodando na CPU."
+
+# ==========================================
+# 1. CARREGAMENTO NATIVO DO MODELO
+# ==========================================
+model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+print("Carregando o modelo diretamente na GPU...")
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    device_map="cuda", # Força explicitamente o envio para a GPU primária
+    quantization_config=quant_config,
+)
+
+text_pipeline = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=1024,
+    do_sample=False, 
+    return_full_text=False,
+    pad_token_id=tokenizer.eos_token_id,
+    device_map="cuda" # Força o pipeline a operar apenas na GPU
+)
+
+```
+
+O restante do código (definição da tarefa, teste monolítico e multi-agente) permanece exatamente igual.
+
+Com a reinstalação do PyTorch para a versão `cu118` e a alteração do `device_map="cuda"`, o script assumirá o controle da GPU da AWS. O tempo de resposta que antes levaria dezenas de minutos na CPU cairá para alguns segundos.
+
+
+
+
+////////////////////////////////
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
