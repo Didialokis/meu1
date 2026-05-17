@@ -1,62 +1,58 @@
-Isso é um reflexo direto daquele alerta que recebemos na tentativa anterior: *"The NVIDIA driver on your system is too old (found version 12060)"*.
+Excelente diagnóstico rodando o `nvidia-smi`! A sua máquina é uma verdadeira Ferrari (driver novíssimo 550.x e CUDA 12.6), mas o Python instalou um "motor de fusca".
 
-O que aconteceu foi que a biblioteca PyTorch, ao não conseguir se comunicar com o driver da NVIDIA da sua máquina AWS por causa da diferença de versões, entrou em "modo de sobrevivência" e transferiu todo o peso silenciosamente para a CPU. O problema é que rodar um modelo de 8 bilhões de parâmetros na CPU pode fazer o script demorar horas para gerar uma única frase.
+O que está acontecendo é um desencontro clássico: a biblioteca PyTorch instalada no seu ambiente virtual (provavelmente via um simples `pip install torch`) não possui os binários compilados para conversar com o seu CUDA 12.6. Como o PyTorch fica "cego" e não consegue achar a GPU, ele entra em modo de segurança e joga toda a carga para a CPU.
 
-Para resolver isso definitivamente na sua instância SageMaker, precisamos "rebaixar" (downgrade) a versão do seu PyTorch para uma que seja compatível com o driver 12.0 da AWS. A versão compilada para CUDA 11.8 é a mais segura e perfeitamente compatível com a sua infraestrutura.
+A melhor notícia é que, como você está em uma **g5.12xlarge** (que possui 4 GPUs de 24GB cada, totalizando 96GB de VRAM), nós **não precisamos da quantização de 4-bits (`bitsandbytes`)** para um modelo de 8 bilhões de parâmetros. O modelo inteiro em 16-bits puros pesa apenas cerca de 16GB, ou seja, cabe folgadamente na sua máquina. Remover o `bitsandbytes` elimina 90% das chances de conflito de drivers.
 
-Aqui está o passo a passo para colocar as suas 4 GPUs A10G para trabalhar:
+Vamos resolver isso definitivamente em dois passos:
 
-### Passo 1: Corrigir a biblioteca PyTorch
+### Passo 1: Forçar o PyTorch a enxergar a GPU
 
-No seu terminal da AWS, cancele a execução atual (Ctrl+C) e rode o seguinte comando para forçar a instalação do PyTorch compatível com a sua placa:
+No terminal da AWS, rode este comando para forçar a reinstalação do PyTorch com os binários corretos para GPU (a versão compilada para CUDA 12.1 é a mais estável na AWS e é 100% retrocompatível com o seu driver 12.6):
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --force-reinstall
+pip install torch torchvision torchaudio --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu121
 
 ```
 
-### Passo 2: Validar a conexão com a GPU
+### Passo 2: O Script Otimizado (Sem Gargalos de Driver)
 
-Para ter certeza de que funcionou, rode este comando rápido de uma linha no terminal:
+Atualizei o seu script. Adicionei uma trava de segurança no topo que vai abortar a execução imediatamente se a GPU não for detectada (para você não perder tempo esperando a CPU processar). Também removi a configuração do `bitsandbytes`, permitindo que o modelo carregue em sua glória total de 16-bits.
 
-```bash
-python -c "import torch; print('GPU ATIVA:', torch.cuda.is_available())"
-
-```
-
-Se a resposta for `GPU ATIVA: True`, a comunicação foi restabelecida com sucesso.
-
-### Passo 3: Forçar o Script a usar a GPU
-
-Para garantir que o código nunca mais rode na CPU por acidente, adicionei uma trava de segurança e forcei o mapeamento no pipeline. Atualize o **Bloco 1** do seu arquivo `poc_benchmark.py` para ficar assim:
+Substitua o `poc_benchmark.py` por isto:
 
 ```python
+import sys
 import time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-
-# TRAVA DE SEGURANÇA: Impede que o script rode na CPU se a GPU falhar
-assert torch.cuda.is_available(), "ERRO CRÍTICO: A GPU não foi detectada. O PyTorch está rodando na CPU."
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 # ==========================================
-# 1. CARREGAMENTO NATIVO DO MODELO
+# 0. TRAVA DE SEGURANÇA (VERIFICAÇÃO DE GPU)
+# ==========================================
+if not torch.cuda.is_available():
+    print("ERRO CRÍTICO: O PyTorch ainda não está enxergando a GPU. Ele está na CPU.")
+    print("Execute o comando de instalação do PyTorch com suporte a CUDA 12.1.")
+    sys.exit(1)
+
+num_gpus = torch.cuda.device_count()
+print(f"Sucesso! PyTorch detectou {num_gpus} GPU(s).")
+for i in range(num_gpus):
+    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+
+# ==========================================
+# 1. CARREGAMENTO NATIVO DO MODELO (16-bits puros)
 # ==========================================
 model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
-print("Carregando o modelo diretamente na GPU...")
+print("\nCarregando o modelo nativamente na GPU (sem quantização)...")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True
-)
-
+# Carregamento limpo, aproveitando a VRAM imensa da g5.12xlarge
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    device_map="cuda", # Força explicitamente o envio para a GPU primária
-    quantization_config=quant_config,
+    device_map="auto",
+    torch_dtype=torch.float16, # 16-bits puro, altíssimo desempenho
 )
 
 text_pipeline = pipeline(
@@ -66,15 +62,95 @@ text_pipeline = pipeline(
     max_new_tokens=1024,
     do_sample=False, 
     return_full_text=False,
-    pad_token_id=tokenizer.eos_token_id,
-    device_map="cuda" # Força o pipeline a operar apenas na GPU
+    pad_token_id=tokenizer.eos_token_id
 )
+
+# ==========================================
+# 2. DEFINIÇÃO DA TAREFA DE NEGÓCIOS
+# ==========================================
+business_task = """
+Analise a viabilidade logística e financeira de importar lotes de notebooks refurbhished 
+(com defeitos de placa-mãe para reparo) através de um hub logístico em Madri, Espanha, 
+para distribuição no Brasil. Considere os custos de frete, tempo de trânsito alfandegário 
+e o risco de avarias em componentes sensíveis como chips BGA durante o transporte.
+Forneça um parecer final de recomendação (Aprovado ou Reprovado) com 3 justificativas.
+"""
+
+def formatar_prompt(sistema, usuario):
+    messages = [
+        {"role": "system", "content": sistema},
+        {"role": "user", "content": usuario}
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+# ==========================================
+# 3. TESTE 1: ARQUITETURA MONOLÍTICA
+# ==========================================
+print("\n--- INICIANDO TESTE MONOLÍTICO ---")
+start_time_mono = time.time()
+
+sistema_mono = "Você é um analista sênior de operações corporativas. Resolva problemas complexos de ponta a ponta com raciocínio lógico."
+prompt_mono = formatar_prompt(sistema_mono, f"Resolva a seguinte tarefa: {business_task}")
+
+saida_mono = text_pipeline(prompt_mono)[0]["generated_text"]
+
+end_time_mono = time.time()
+latencia_mono = end_time_mono - start_time_mono
+
+tokens_in_mono = len(tokenizer.encode(prompt_mono))
+tokens_out_mono = len(tokenizer.encode(saida_mono))
+total_tokens_mono = tokens_in_mono + tokens_out_mono
+
+print("Resultado Monolítico gerado com sucesso.")
+
+# ==========================================
+# 4. TESTE 2: ARQUITETURA MULTI-AGENTE (Orquestração Nativa)
+# ==========================================
+print("\n--- INICIANDO TESTE MULTI-AGENTE ---")
+start_time_multi = time.time()
+
+# Agente 1: Logística
+sistema_agente1 = "Você é um Engenheiro Especialista em Logística Internacional."
+tarefa_agente1 = f"Analise EXCLUSIVAMENTE os riscos logísticos operacionais e estimativa de avarias do seguinte cenário: {business_task}"
+
+prompt_agente1 = formatar_prompt(sistema_agente1, tarefa_agente1)
+saida_agente1 = text_pipeline(prompt_agente1)[0]["generated_text"]
+
+# Agente 2: Finanças 
+sistema_agente2 = "Você é um Auditor de Viabilidade Financeira. Você só aprova operações com base em relatórios logísticos."
+tarefa_agente2 = f"""Com base no Relatório Logístico abaixo, emita o parecer final financeiro (Aprovado/Reprovado) com 3 justificativas.
+Relatório Logístico Recebido:
+{saida_agente1}
+"""
+
+prompt_agente2 = formatar_prompt(sistema_agente2, tarefa_agente2)
+saida_agente2 = text_pipeline(prompt_agente2)[0]["generated_text"]
+
+end_time_multi = time.time()
+latencia_multi = end_time_multi - start_time_multi
+
+tokens_in_multi = len(tokenizer.encode(prompt_agente1)) + len(tokenizer.encode(prompt_agente2))
+tokens_out_multi = len(tokenizer.encode(saida_agente1)) + len(tokenizer.encode(saida_agente2))
+total_tokens_multi = tokens_in_multi + tokens_out_multi
+
+# ==========================================
+# 5. RESULTADOS DO BENCHMARK
+# ==========================================
+print("\n==========================================")
+print(" RESULTADOS PRELIMINARES DO EXPERIMENTO")
+print("==========================================")
+print("\n[ARQUITETURA MONOLÍTICA]")
+print(f"Latência: {latencia_mono:.2f} segundos")
+print(f"Tokens Consumidos: {total_tokens_mono}")
+
+print("\n[ARQUITETURA MULTI-AGENTE]")
+print(f"Latência: {latencia_multi:.2f} segundos")
+print(f"Tokens Consumidos: {total_tokens_multi}")
+print("==========================================")
 
 ```
 
-O restante do código (definição da tarefa, teste monolítico e multi-agente) permanece exatamente igual.
-
-Com a reinstalação do PyTorch para a versão `cu118` e a alteração do `device_map="cuda"`, o script assumirá o controle da GPU da AWS. O tempo de resposta que antes levaria dezenas de minutos na CPU cairá para alguns segundos.
+Rode o comando de instalação do PyTorch no terminal e, logo após, chame o `python poc_benchmark.py`. O console imprimirá `Sucesso! PyTorch detectou X GPU(s)` no primeiro segundo, confirmando que ultrapassamos o gargalo tecnológico!
 
 
 
