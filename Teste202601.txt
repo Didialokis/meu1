@@ -1,52 +1,45 @@
 import time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-from langchain_huggingface import HuggingFacePipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain_huggingface import HuggingFacePipeline, ChatHuggingFace
 from crewai import Agent, Task, Crew, Process
 
 # ==========================================
 # 1. CONFIGURAÇÃO DO MODELO LOCAL (AWS)
 # ==========================================
-# Se quiser testar o 70B, basta trocar o ID abaixo para "meta-llama/Meta-Llama-3-70B-Instruct"
-model_id = "meta-llama/Meta-Llama-3-8B-Instruct" 
+model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
-print("Configurando a quantização BitsAndBytes...")
-# Configuração moderna exigida pelas novas versões do Transformers
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4", # nf4 é a melhor compressão para a arquitetura do Llama 3
-    bnb_4bit_compute_dtype=torch.float16
-)
-
-print(f"Carregando o modelo {model_id} nas GPUs... Isso pode levar alguns minutos.")
+print("Carregando o modelo na GPU...")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    device_map="auto", # Na sua g5.12xlarge, isso distribuirá o peso perfeitamente entre as 4 GPUs
-    quantization_config=bnb_config,
+    device_map="auto",
+    load_in_4bit=True,
+    torch_dtype=torch.float16,
 )
 
-# Pipeline do HuggingFace otimizado para lógica (Temperature = 0.0)
+# [CORREÇÃO 1] Evita o warning do pad_token_id
+model.config.pad_token_id = tokenizer.eos_token_id
+
+# [CORREÇÃO 2] Removemos a temperature conflitante, do_sample=False já garante determinismo
 text_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
     max_new_tokens=1024,
-    temperature=0.0, 
     do_sample=False,
-    return_full_text=False
+    return_full_text=False,
+    pad_token_id=tokenizer.eos_token_id
 )
 
-llm = HuggingFacePipeline(pipeline=text_pipeline)
-
-# ... [O restante do código a partir do Bloco 2 continua exatamente igual] ...
+# [CORREÇÃO 3] Envelopando o pipeline para ser reconhecido pelo CrewAI
+base_llm = HuggingFacePipeline(pipeline=text_pipeline)
+chat_llm = ChatHuggingFace(llm=base_llm)
 
 # ==========================================
 # 2. DEFINIÇÃO DA TAREFA DE NEGÓCIOS
 # ==========================================
-# Um cenário complexo exigindo raciocínio logístico e financeiro
 business_task = """
 Analise a viabilidade logística e financeira de importar lotes de notebooks refurbhished 
 (com defeitos de placa-mãe para reparo) através de um hub logístico em Madri, Espanha, 
@@ -62,15 +55,19 @@ print("\n--- INICIANDO TESTE MONOLÍTICO ---")
 start_time_mono = time.time()
 
 prompt_monolitico = f"Você é um analista sênior de operações. Resolva a seguinte tarefa: {business_task}"
-resposta_mono = llm.invoke(prompt_monolitico)
+
+# Usando o chat_llm para garantir o mesmo formato
+resposta_mono = chat_llm.invoke(prompt_monolitico)
 
 end_time_mono = time.time()
 latencia_mono = end_time_mono - start_time_mono
 
-# Contagem de tokens (Entrada + Saída)
+# Contagem de tokens
 tokens_in_mono = len(tokenizer.encode(prompt_monolitico))
-tokens_out_mono = len(tokenizer.encode(resposta_mono))
+tokens_out_mono = len(tokenizer.encode(resposta_mono.content))
 total_tokens_mono = tokens_in_mono + tokens_out_mono
+
+print(f"Resultado Monolítico gerado com sucesso.")
 
 
 # ==========================================
@@ -79,34 +76,31 @@ total_tokens_mono = tokens_in_mono + tokens_out_mono
 print("\n--- INICIANDO TESTE MULTI-AGENTE ---")
 start_time_multi = time.time()
 
-# Agente 1: Pesquisador Logístico
+# Agentes agora recebem o chat_llm envelopado corretamente
 logistics_agent = Agent(
     role='Especialista em Logística Internacional',
     goal='Analisar rotas de importação e riscos de transporte de hardware',
     backstory='Você é especialista em gerenciar o trânsito de eletrônicos sensíveis entre a Europa e o Brasil.',
-    llm=llm,
+    llm=chat_llm, 
     verbose=False,
     allow_delegation=False
 )
 
-# Agente 2: Analista Financeiro
 financial_agent = Agent(
     role='Auditor de Viabilidade Financeira',
     goal='Avaliar o parecer logístico e emitir a recomendação final de viabilidade',
     backstory='Você é um auditor rigoroso que só aprova operações com risco mitigado e alta margem de retorno.',
-    llm=llm,
+    llm=chat_llm,
     verbose=False,
     allow_delegation=False
 )
 
-# Tarefa 1 (Para o Agente 1)
 task_1 = Task(
     description=f'Analise os riscos logísticos do seguinte cenário: {business_task}',
     expected_output='Um relatório de riscos operacionais e estimativa de avarias.',
     agent=logistics_agent
 )
 
-# Tarefa 2 (Para o Agente 2)
 task_2 = Task(
     description='Com base no relatório logístico, emita o parecer final (Aprovado/Reprovado) com 3 justificativas.',
     expected_output='Parecer final estruturado em tópicos.',
@@ -124,8 +118,7 @@ resposta_multi = crew.kickoff()
 end_time_multi = time.time()
 latencia_multi = end_time_multi - start_time_multi
 
-# A contagem de tokens no Multi-Agente é estimativa, pois há trânsito de contexto entre os agentes
-tokens_in_multi = len(tokenizer.encode(business_task)) * 3 # Contexto replicado para agentes
+tokens_in_multi = len(tokenizer.encode(business_task)) * 3 
 tokens_out_multi = len(tokenizer.encode(resposta_multi.raw))
 total_tokens_multi = tokens_in_multi + tokens_out_multi
 
@@ -138,28 +131,8 @@ print("==========================================")
 print("\n[ARQUITETURA MONOLÍTICA]")
 print(f"Latência: {latencia_mono:.2f} segundos")
 print(f"Tokens Consumidos (estimado): {total_tokens_mono}")
-print("Linhas de Código de Implementação: ~2 linhas (chamada direta)")
 
 print("\n[ARQUITETURA MULTI-AGENTE]")
 print(f"Latência: {latencia_multi:.2f} segundos")
-print(f"Tokens Consumidos (estimado): > {total_tokens_multi} (devido ao loop do framework)")
-print("Linhas de Código de Implementação: ~30 linhas (orquestração)")
-
-print("\nAs saídas geradas foram salvas internamente para avaliação de qualidade (LLM-as-a-Judge).")
-
-```
-
-### 3. Executando e Extraindo os Dados
-
-No terminal, simplesmente rode o script:
-
-```bash
-python poc_benchmark.py
-
-```
-
-Você verá a saída direta no console contendo os números de **Latência** e **Consumo de Tokens**. Para o documento de Resultados Preliminares, basta pegar esses números gerados, formatá-los em uma tabela simples no Word comparando as duas arquiteturas, e escrever um parágrafo abaixo dizendo algo como:
-
-> *"Os testes iniciais demonstraram que a arquitetura monolítica apresentou uma latência consideravelmente menor de [X] segundos contra [Y] segundos do sistema multi-agente. No entanto, observou-se qualitativamente que o fluxo multi-agente exigiu maior esforço de implementação (cerca de 30 linhas de código adicionais para orquestração), confirmando a hipótese preliminar de aumento do custo transacional..."*
-
-A estrutura AWS atual está equipada com qual instância (ex: `g4dn`, `g5`)? Se precisar ajustar o uso da GPU ou alterar a biblioteca para contornar algum limite de hardware da máquina atual, me avise que otimizamos o código.
+print(f"Tokens Consumidos (estimado): > {total_tokens_multi} (devido ao loop)")
+print("==========================================")
