@@ -1,0 +1,29 @@
+Aqui está a síntese executiva da arquitetura do projeto de engenharia de dados até o momento, estruturada conforme os princípios mapeados na literatura atual.
+
+### Resumo Executivo do Projeto de Corpus Multi-Domínio
+
+**1. Os Pilares de Conhecimento**
+O projeto irá pesquisar, raspar e curar dados ancorados em três pilares generalistas:
+
+* **Eixo STEM:** Visão Computacional, Infraestrutura e Automação de Servidores.
+* **Eixo de Negócios:** Valuation, Mobile Marketing e Ecossistema de Fintechs.
+* **Eixo de Humanidades/Ética:** Mitigação de viés semântico e cultural via adaptação do benchmark StereoSet PT.
+
+**2. Os Métodos Aplicados**
+O pipeline abandonou a geração monolítica em favor de uma arquitetura sequencial híbrida, aplicando três métodos específicos em cascata: **M1 (Curadoria Humana e Templating)** -> **M3 (Evolução de Complexidade - Evol-Instruct)** -> **M4/M5 (Bootstrapping de Raciocínio com Verificação PRM)**.
+
+**3. A Justificativa Bibliográfica (Por que esses métodos e não outros?)**
+A literatura de fronteira (2025-2026, como as análises do DeepSeek-R1 e leis de escala PRM) demonstra que para desenvolver capacidades de raciocínio profundo (Sistema 2), deve-se evitar a geração puramente livre.
+
+* *Por que os métodos escolhidos:* O **M1** garante "sementes" precisas, livres de *translationese* e validadas por gabaritos rigorosos. O **M3** é necessário porque as sementes puras não ativam o raciocínio profundo; ele introduz restrições técnicas e variáveis ocultas nos prompts. O **M4/M5** extrai o "como pensar" (Chain-of-Thought) de um LLM professor e implementa uma barreira de verificação: a trajetória lógica só entra no corpus se a resposta final passar por um filtro determinístico (compiladores, regras matemáticas ou cruzamento com gabaritos-ouro).
+* *Por que descartamos os concorrentes:* O **M2 (Self-Instruct Puro)** ensina o modelo apenas a conversar superficialmente (estilo Alpaca), quebrando o rigor estatístico. O **M5 isolado (Retrotradução da Web)** introduziria ruído não estruturado em bases que exigem precisão matemática ou semântica exata.
+
+**4. Objetivo e Metodologia de Execução (A Forma)**
+O objetivo é construir o primeiro corpus generalista nativo em português focado estritamente em raciocínio analítico multi-domínio. Isso será atingido na prática através da montagem de um pipeline automatizado que irá:
+
+1. Coletar e padronizar arquivos técnicos (ex: LaTeX acadêmico, bases numéricas, metadados JSON do StereoSet).
+2. Forçar um modelo professor a encadear deduções complexas (CoT) sobre essas bases.
+3. Descartar sumariamente qualquer geração que contenha alucinações lógicas através da etapa de verificação.
+
+**5. Resultados Esperados**
+É esperado que esse pipeline resulte em um dataset de fine-tuning estruturado em três blocos (Instrução Desafiadora + Explicação Lógica Validada + Resposta Exata). Ao treinar um LLM aberto com esse corpus, projeta-se obter um modelo imune à memorização superficial, capaz de documentar etapas matemáticas, estruturar lógicas de negócios complexas e justificar desvios culturais no idioma antes de gerar qualquer veredito final.
