@@ -1,0 +1,11 @@
+abordagem:
+
+Pipeline entre o Método 1 (Curadoria e Templating Humano) e Método 4 (Bootstrapping de Raciocínio), tomando como insumo base os dados curados do StereoSet PT.
+
+
+adequação do Método 1 (Curadoria e Templating Humano): A abordagem de templating determinístico pega as variáveis exatas do JSON e as insere em prompts. Isso garante que toda a estrutura original de teste e o balanceamento de categorias demográficas sejam mantidos intactos durante a transição para o formato conversacional. Não há perda de dados ou diluição estatística.
+
+adequação do Método 4 (Bootstrapping de Raciocínio (STaR)): Modelos de linguagem, ao tentarem explicar conceitos complexos como viés, são propensos a alucinar o filtro STaR (Self-Taught Reasoner) do Método 4 resolve esse problema pois a explicação gerada pelo modelo professor só é incorporada ao corpus se a conclusão dela bater exatamente com o gabarito do JSON. Se o modelo alucinar e chegar à conclusão errada, a amostra é descartada
+Inadequação do Método 2 (Self-Instruct): Permitir que um LLM gere livremente novos tópicos rompe o balanceamento do benchmark e diminui o controle sobre as variáveis demográficas no português.
+Inadequação do Método 3 (Evol-Instruct): Tornar o prompt sintaticamente complexo introduz ruído em vez de aprofundar a capacidade de raciocínio crítico sobre o viés.
+Inadequação do Método 5 (Retrotradução):  Reinserir no pipeline dados web ruidosos e não controlados, comprometendo o rigor e filtragem feitos até agora.
