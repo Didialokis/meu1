@@ -1,145 +1,83 @@
-Sub GerarFluxogramasCorporaHorizontais()
-    Dim ws As Worksheet
-    Dim metodos(1 To 5) As String
-    Dim numEtapas(1 To 5) As Integer
-    Dim etapas(1 To 5, 1 To 6) As String
-    Dim i As Integer, j As Integer
-    Dim shp As Shape
-    Dim conn As Shape
-    Dim topo As Single, esquerda As Single, largura As Single, altura As Single
-    Dim espacamento As Single
-    
-    ' ==========================================
-    ' DADOS DOS FLUXOGRAMAS (MAPEAMENTO MERMAID)
-    ' ==========================================
-    
-    ' Método 1: M1. Curadoria e Templating Humano
-    metodos(1) = "M1_Curadoria_Manual"
-    numEtapas(1) = 5
-    etapas(1, 1) = "A: Bases de Dados Acadêmicas / Textos Brutos"
-    etapas(1, 2) = "B: Curadoria Humana Especializada"
-    etapas(1, 3) = "C: Aplicação de Templates Determinísticos de Prompt/Resposta"
-    etapas(1, 4) = "D: Filtro de Qualidade e Balanceamento"
-    etapas(1, 5) = "E: Corpus de Instrução Validado e Preciso"
-    
-    ' Método 2: M2. Self-Instruct
-    metodos(2) = "M2_Self_Instruct"
-    numEtapas(2) = 5
-    etapas(2, 1) = "A: Pequeno Conjunto de Tarefas Semente Manuais"
-    etapas(2, 2) = "B: LLM Professor: Geração Recursiva de Novas Instruções"
-    etapas(2, 3) = "C/D: Filtro de Similaridade ROUGE/Embeddings (Descarte se muito similar)"
-    etapas(2, 4) = "E: LLM Professor: Geração de Resposta para a Instrução (Se Nova/Diversa)"
-    etapas(2, 5) = "F: Corpus Sintético Focado em Volume"
-    
-    ' Método 3: M3. Evolução de Complexidade
-    metodos(3) = "M3_Evol_Instruct"
-    numEtapas(3) = 6
-    etapas(3, 1) = "A: Instrução Inicial Simples"
-    etapas(3, 2) = "B: LLM Professor: Prompt de Mutação"
-    etapas(3, 3) = "C: Operadores: Adição de Restrições / Aprofundamento Lógico"
-    etapas(3, 4) = "D/E: LLM Avaliador: Ficou mais complexa? (Descarte se Não)"
-    etapas(3, 5) = "F: LLM Professor: Resolução da Nova Tarefa Complexa (Se Sim)"
-    etapas(3, 6) = "G: Corpus Focado em Dificuldade Extrema"
-    
-    ' Método 4: M4. Bootstrapping de Raciocínio (STaR)
-    metodos(4) = "M4_STaR_Destilacao"
-    numEtapas(4) = 6
-    etapas(4, 1) = "A: Dataset de Problemas com Gabarito Conhecido"
-    etapas(4, 2) = "B: LLM Professor: Geração do Chain-of-Thought (CoT)"
-    etapas(4, 3) = "C: LLM Professor: Emissão da Resposta Final"
-    etapas(4, 4) = "D/E: Verificador Automático: Gabarito == Resposta? (Descarte se Incorreta)"
-    etapas(4, 5) = "F: Extração e Salvamento do Raciocínio CoT (Se Correta)"
-    etapas(4, 6) = "G: Corpus de Raciocínio Lógico Verificado"
-    
-    ' Método 5
-    metodos(5) = "M5_Retrotraducao"
-    numEtapas(5) = 6
-    etapas(5, 1) = "1. AQUISIÇÃO INICIAL:" & vbCrLf & "Coleta massiva de textos humanos de alta qualidade na web (documentações, artigos)."
-    etapas(5, 2) = "2. TRATAMENTO DE TEXTO BRUTO:" & vbCrLf & "Limpeza de HTML, deduplicação e remoção de conteúdos de baixa entropia."
-    etapas(5, 3) = "3. INFERÊNCIA INVERSA:" & vbCrLf & "LLM lê o texto alvo e tenta deduzir: 'Qual instrução o usuário deveria ter dado para eu gerar isso?'."
-    etapas(5, 4) = "4. FILTRAGEM SEMÂNTICA:" & vbCrLf & "Remoção de instruções genéricas que falham em capturar a especificidade do texto base."
-    etapas(5, 5) = "5. AVALIAÇÃO (LLM-as-a-Judge):" & vbCrLf & "Segundo modelo pontua a aderência instrução/texto. O loop iterativo refina a geração."
-    etapas(5, 6) = "6. RESULTADO FINAL:" & vbCrLf & "Corpus sintético que espelha respostas orgânicas e complexas redigidas por humanos."
+Etapa A: Bases de Dados Acadêmicas / Textos Brutos
 
-    ' ==========================================
-    ' MOTOR DE GERAÇÃO GRÁFICA NO EXCEL (MODERNO)
-    ' ==========================================
-    Application.ScreenUpdating = False
-    
-    For i = 1 To 5
-        ' Cria nova aba no final
-        Set ws = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        ws.Name = metodos(i)
-        
-        ' Remove linhas de grade para visual mais limpo
-        ws.Activate
-        ActiveWindow.DisplayGridlines = False
-        
-        ' Adiciona o Título da Página
-        ws.Cells(2, 2).Value = "Fluxograma Metodológico: " & Replace(metodos(i), "_", " ")
-        ws.Cells(2, 2).Font.Size = 16
-        ws.Cells(2, 2).Font.Bold = True
-        ws.Cells(2, 2).Font.Color = RGB(31, 73, 125)
-        
-        ' Configurações iniciais de tamanho e layout
-        topo = 80
-        esquerda = 30
-        largura = 190    ' Dimensionado para caber 6 etapas
-        altura = 110
-        espacamento = 40 
-        
-        For j = 1 To numEtapas(i)
-            ' Adiciona caixa com cantos arredondados
-            Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, esquerda, topo, largura, altura)
-            shp.Adjustments.Item(1) = 0.15 ' Define a curvatura
-            
-            ' Aplica sombreamento suave
-            shp.Shadow.Visible = msoTrue
-            shp.Shadow.Type = msoShadow21
-            shp.Shadow.Transparency = 0.6
-            shp.Shadow.Size = 100
-            shp.Shadow.Blur = 8
-            shp.Shadow.OffsetX = 2
-            shp.Shadow.OffsetY = 2
-            
-            ' Configurações de Texto
-            With shp.TextFrame2
-                .TextRange.Text = etapas(i, j)
-                .VerticalAnchor = msoAnchorMiddle
-                .TextRange.ParagraphFormat.Alignment = msoAlignCenter
-                .TextRange.Font.Size = 10
-                .TextRange.Font.Name = "Segoe UI"
-                .TextRange.Font.Bold = True
-                .TextRange.Font.Fill.ForeColor.RGB = RGB(255, 255, 255)
-            End With
-            
-            ' Configurações de Cores das Fases
-            If j = 1 Then
-                shp.Fill.ForeColor.RGB = RGB(46, 117, 182) ' Azul Corporativo (Início)
-            ElseIf j = numEtapas(i) Then
-                shp.Fill.ForeColor.RGB = RGB(67, 160, 71) ' Verde Vivo (Final)
-            Else
-                shp.Fill.ForeColor.RGB = RGB(96, 125, 139) ' Cinza-Azulado Metálico (Meio)
-            End If
-            
-            ' Remove borda
-            shp.Line.Visible = msoFalse
-            
-            ' Adiciona conector para a próxima caixa
-            If j < numEtapas(i) Then
-                Set conn = ws.Shapes.AddConnector(msoConnectorStraight, esquerda + largura, topo + (altura / 2), esquerda + largura + espacamento, topo + (altura / 2))
-                conn.Line.EndArrowheadStyle = msoArrowheadTriangle
-                conn.Line.EndArrowheadWidth = msoArrowheadWidthMedium
-                conn.Line.EndArrowheadLength = msoArrowheadLengthMedium
-                conn.Line.Weight = 2.5
-                conn.Line.ForeColor.RGB = RGB(176, 190, 197) ' Cinza claro da seta
-            End If
-            
-            ' Incrementa o eixo X
-            esquerda = esquerda + largura + espacamento
-        Next j
-    Next i
-    
-    Application.ScreenUpdating = True
-    MsgBox "Os fluxogramas com mapeamento de etapas (letras) foram gerados com sucesso!", vbInformation, "Engenharia de Corpora"
-End Sub
+
+
+Etapa B: Curadoria Humana Especializada
+
+
+
+Etapa C: Aplicação de Templates de Prompt/Resposta
+
+
+
+Etapa D: Filtro de Qualidade e Balanceamento
+
+
+
+Etapa E: Corpus de Instrução Validado
+
+
+
+Método 2: Self-Instruct (M2_Self_Instruct)
+
+
+
+Etapa A: Tarefas Semente Manuais
+
+Etapa B: LLM Professor: Geração de Novas Instruções
+
+Etapa C: Filtro de Similaridade ROUGE (Descarte de clones)
+
+Etapa D: LLM Professor: Geração das Respostas
+
+Etapa E: Corpus Sintético Focado em Volume
+
+
+
+Método 3: Evolução de Complexidade (M3_Evol_Instruct)
+
+Etapa A: Instrução Inicial Simples
+
+Etapa B: LLM Professor: Prompt de Mutação
+
+Etapa C: Injeção de Restrições / Aprofundamento
+
+Etapa D: LLM Avaliador: Validação de Complexidade
+
+Etapa E: LLM Professor: Resolução da Tarefa Evoluída
+
+Etapa F: Corpus de Dificuldade Extrema
+
+
+
+Método 4: Bootstrapping de Raciocínio / STaR (M4_STaR_Destilacao)
+
+Etapa A: Problemas com Gabarito Conhecido
+
+Etapa B: LLM Professor: Raciocínio Passo-a-Passo (CoT)
+
+Etapa C: LLM Professor: Emissão da Resposta Final
+
+Etapa D: Verificação: Resposta Bate com Gabarito?
+
+Etapa E: Retenção de Trajetórias Corretas e Descarte de Alucinações
+
+Etapa F: Corpus Lógico Verificado
+
+
+
+Método 5: Retrotradução (M5_Retrotraducao)
+
+
+
+Etapa A: Coleta Massiva de Textos Brutos da Web
+
+Etapa B: Limpeza e Remoção de Baixa Entropia
+
+Etapa C: LLM Inferência Inversa (Deduzir a Instrução)
+
+Etapa D: Filtragem Semântica do Prompt Deduzido
+
+Etapa E: LLM Juiz: Atribuição de Score para Aderência Texto/Prompt
+
+Etapa F: Corpus Sintético de Base Orgânica 
