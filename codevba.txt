@@ -51,15 +51,15 @@ Sub GerarFluxogramasCorporaHorizontais()
     etapas(4, 5) = "F: Extração e Salvamento do Raciocínio CoT (Se Correta)"
     etapas(4, 6) = "G: Corpus de Raciocínio Lógico Verificado"
     
-    ' Método 5: M5. Aprendizado por Reforço Baseado em Processo
-    metodos(5) = "M5_PRM_GRPO"
+    ' Método 5
+    metodos(5) = "M5_Retrotraducao"
     numEtapas(5) = 6
-    etapas(5, 1) = "A: Problema Inserido no Ambiente de Treino"
-    etapas(5, 2) = "B: Modelo Aluno: Gera Múltiplas Trajetórias de Solução Passo a Passo"
-    etapas(5, 3) = "C: Process Reward Model / Compilador analisa cada passo"
-    etapas(5, 4) = "D/E/F: Validação Lógica (Recompensa '-' se falha, '+' se íntegra)"
-    etapas(5, 5) = "G: Atualização Matemática dos Pesos do Modelo via RL"
-    etapas(5, 6) = "H: Emergência de Capacidade de Raciocínio Autônomo"
+    etapas(5, 1) = "1. AQUISIÇÃO INICIAL:" & vbCrLf & "Coleta massiva de textos humanos de alta qualidade na web (documentações, artigos)."
+    etapas(5, 2) = "2. TRATAMENTO DE TEXTO BRUTO:" & vbCrLf & "Limpeza de HTML, deduplicação e remoção de conteúdos de baixa entropia."
+    etapas(5, 3) = "3. INFERÊNCIA INVERSA:" & vbCrLf & "LLM lê o texto alvo e tenta deduzir: 'Qual instrução o usuário deveria ter dado para eu gerar isso?'."
+    etapas(5, 4) = "4. FILTRAGEM SEMÂNTICA:" & vbCrLf & "Remoção de instruções genéricas que falham em capturar a especificidade do texto base."
+    etapas(5, 5) = "5. AVALIAÇÃO (LLM-as-a-Judge):" & vbCrLf & "Segundo modelo pontua a aderência instrução/texto. O loop iterativo refina a geração."
+    etapas(5, 6) = "6. RESULTADO FINAL:" & vbCrLf & "Corpus sintético que espelha respostas orgânicas e complexas redigidas por humanos."
 
     ' ==========================================
     ' MOTOR DE GERAÇÃO GRÁFICA NO EXCEL (MODERNO)
