@@ -1,25 +1,45 @@
-O StereoSet-PT é um framework nativo de auditoria corporativa para identificar preconceitos em IAs no Brasil. Superando falhas de traduções literais que mascaram vieses , a solução valida uma amostra controlada de dados. Focado em garantia de qualidade, permite que as instituições certifiquem a segurança dos modelos, mitigando riscos reputacionais e poupando tempo de revisão manual antes de lançar produtos automatizados aos clientes
+Aqui estão as quatro seções revisadas, incorporando as melhorias solicitadas de forma cirúrgica e mantendo a fundamentação estrita nos dados do seu artigo.
 
-Descreva o problema que o projeto buscou resolver
-Modelos de linguagem herdam vieses discriminatórios dos dados de treino. Contudo, auditar IAs no Brasil esbarra na escassez de benchmarks nativos, concentrados no inglês. A tradução literal desses testes falha devido à riqueza morfológica do português (ex: flexão de gênero), confundindo erros sintáticos com ausência de viés. Isso impede a medição confiável de preconceitos em modelos globais e locais , dificultando a mitigação de danos éticos em aplicações de IA no contexto nacional.  
+### 1. Impacto da Inovação (Otimizado)
 
+**Alterações feitas:** Inclusão clara de "produto e processo", suavização do termo "expõe a real discriminação" e adição dos dados do ICAT Score.
 
-Descreva qual é o mercado que o projeto pretendeu ou pretende atingir
-O projeto atinge o mercado de Inteligência Artificial e Processamento de Linguagem Natural (PLN) , focando em desenvolvedores de fundação de modelos e empresas que implementam LLMs em aplicações sensíveis e de larga escala. É essencial para times de auditoria que necessitam certificar que suas soluções em português operam de forma justa e sem discriminação estrutural, evitando que erros algorítmicos afetem desproporcionalmente grupos demográficos específicos.
+> A inovação caracteriza-se simultaneamente como de **processo** (o novo pipeline de adaptação estrutural) e de **produto** (o dataset curado StereoSet-PT). O impacto prático é a eliminação do ruído técnico na auditoria de Inteligências Artificiais. A pesquisa demonstra que traduções diretas geram erros de concordância que mascaram vieses. Ao aplicar nossa correção de marcadores de gênero, conseguimos mensurar as tendências discriminatórias de forma mais fidedigna e isolar a proficiência linguística do modelo. Como evidência, o processo comprovou que modelos locais como o BERTimbau atingem um score ICAT de 73.6, preservando a semântica, enquanto modelos globais caem para 62.97 devido a falhas sintáticas no português. Com isso, as empresas ganham eficiência no controle de qualidade (QA), evitando desperdício de tempo com falsos positivos e mitigando riscos de imagem.
+> 
+> 
 
+---
 
+### 2. Competências Desenvolvidas (Otimizado)
 
-1. ORIGINALIDADE DA INOVAÇÃO
-A originalidade do projeto está na criação de uma metodologia nativa de auditoria para identificar preconceitos e discriminações em Inteligências Artificiais no cenário brasileiro, superando as graves falhas técnicas das traduções literais. O grande diferencial é a capacidade de isolar se o modelo errou por falta de domínio da língua ou por carregar um viés discriminatório real. No ambiente corporativo e financeiro, onde sistemas atendem diretamente o cliente, essa solução é única porque garante uma avaliação justa e segura de produtos automatizados, protegendo as instituições contra perdas financeiras e sérios riscos de reputação antes que o produto chegue ao público.  
+**Alterações feitas:** Foco no trabalho prático realizado (prompting, tensores, refatoração e curadoria).
 
-2. IMPACTO DA INOVAÇÃO
-O impacto prático do projeto é a introdução de uma metodologia que elimina o ruído técnico e estrutural na auditoria de Inteligências Artificiais no Brasil. A pesquisa demonstra que adaptações diretas de testes estrangeiros geram erros de concordância e degradação sintática. Isso faz com que os sistemas penalizem as frases por falhas gramaticais e não pelo viés, mascarando preconceitos ocultos. Ao aplicar nosso pipeline de ajuste estrutural e correção dos marcadores de gênero da língua portuguesa, conseguimos expor a real discriminação contida nos modelos. Com esse processo validado, as empresas e instituições financeiras podem deixar de gastar muito tempo e recursos manualmente conferindo esses aspectos dos modelos antes de apresentá-los ao público. O impacto direto é a eficiência operacional no controle de qualidade, mitigando riscos de imagem e acelerando a oferta segura de produtos de atendimento automatizados ao consumidor 
+> O projeto desenvolveu competências críticas ao executar, na prática, a adaptação do framework StereoSet para o português. A equipe internalizou habilidades de engenharia focadas na estruturação de *prompts* condicionados (com temperatura 0.1) para tradução automatizada via LLMs. Além disso, a equipe refatorou a infraestrutura do teste utilizando a API dinâmica moderna (AutoModelForCausalLM), desenvolvendo a competência técnica de manipular tensores e extrair probabilidades condicionais (logits) sem causar gargalos de memória. Houve também o avanço na capacidade analítica de calcular e balancear métricas complexas, como o Idealized Context Association Test (ICAT). No mercado, essa proficiência em orquestrar testes técnicos e tratar a rica morfologia do português  é vital para certificar modelos antes de sua integração em canais de atendimento.
+> 
+> 
 
-3. COMPETÊNCIAS DESENVOLVIDAS
-O projeto desenvolveu competências críticas em governança algorítmica e auditoria técnica de Processamento de Linguagem Natural (PLN) aplicadas ao mercado de IA. A equipe internalizou a capacidade de orquestrar testes em larga escala utilizando arquiteturas modernas e modelos de linguagem robustos . O grande avanço técnico foi dominar metodologias para balancear o desempenho de comunicação do modelo com a segurança ética das respostas. No setor empresarial e bancário, a capacidade de avaliar e certificar a segurança de modelos focados no português brasileiro é uma habilidade estratégica escassa, essencial para mitigar riscos operacionais antes da integração de IAs em canais sensíveis de atendimento direta ao cliente.  
+---
 
-4. GESTÃO DO PROJETO
-A condução do projeto priorizou o cumprimento rigoroso do cronograma e a eficiência na alocação de recursos, resultando na conclusão de todas as etapas dentro do prazo previsto. O desenvolvimento foi inteiramente executado utilizando a infraestrutura corporativa em nuvem da AWS. Como estratégia de mitigação de riscos e viabilização de uma prova de conceito robusta, foi selecionada uma amostra controlada da base de dados total para garantir o melhor controle de qualidade e uma gestão previsível de recursos computacionais. O fluxo envolveu tradução automatizada inicial de alta precisão seguida por um ciclo minucioso de revisão e curadoria humana, eliminando falhas técnicas estruturais com total previsibilidade técnica e orçamentária.  
+### 3. Gestão do Projeto (Otimizado)
 
-5. ESCALABILIDADE
-O framework apresenta alta escalabilidade tecnológica e operacional para o mercado corporativo. Por utilizar estruturas de software dinâmicas, o pipeline funciona de maneira modular, sendo capaz de auditar qualquer novo modelo de IA do mercado sem demandar reengenharia complexa. Corporativamente, a solução pode ser escalada com custo marginal mínimo para certificar ferramentas em diferentes áreas, desde chatbots de atendimento ao cliente até sistemas internos de análise de crédito e prospecção. Como próximos passos para expandir a escala do projeto, está previsto realizar um tratamento na base de dados para que ela seja totalmente localizada e adaptada à realidade cultural brasileira, aumentando ainda mais a qualidade, o compliance e a eficiência da ferramenta em ambiente de produção.
+**Alterações feitas:** Etapas enumeradas claramente e os desafios de execução detalhados com suas respectivas soluções.
+
+> O gerenciamento seguiu etapas bem definidas: 1) Extração de uma amostra estratificada de 25% da base; 2) Tradução automatizada em nuvem AWS; 3) Curadoria humana focada na correção morfológica; 4) Refatoração da infraestrutura de software; 5) Execução e aferição de resultados. Durante a execução, enfrentamos desafios críticos, como a falha silenciosa dos scripts originais que perdiam o *token* âncora ("BLANK") durante a tradução, além de erros de concordância nominal que corrompiam os testes. Para contornar essas barreiras, implementamos uma coluna dedicada no dataset para isolar os *tokens-alvo*, garantindo o alinhamento exato das strings na etapa manual. Outro desafio técnico foi o esgotamento de memória (OOM), resolvido ajustando as chamadas de tensores. Essa gestão garantiu o rigor metodológico e a previsibilidade orçamentária.
+> 
+> 
+
+---
+
+### 4. Escalabilidade (Otimizado)
+
+**Alterações feitas:** Separação clara entre a escalabilidade do *produto* (altíssima) e a do *processo* (limitada devido à necessidade de curadoria), eliminando a confusão.
+
+> A escalabilidade do projeto atua em duas frentes distintas: o produto gerado e o seu processo de construção. O **artefato gerado (o dataset StereoSet-PT)** apresenta altíssima escalabilidade. Ele atua como um recurso *plug-and-play*, podendo ser reutilizado na avaliação de múltiplos modelos de linguagem corporativos sem custo incremental. Por outro lado, o **processo metodológico** possui escalabilidade moderada. Devido à exigência gramatical do português (como a flexão de gênero), a etapa de curadoria manual é indispensável para evitar a corrupção das métricas por erros sintáticos. Isso torna o *pipeline* de criação de novos dados menos automatizável e mais dependente de esforço humano. No entanto, o dataset atual já viabiliza a aplicação imediata em sistemas de atendimento ao cliente, entregando um ativo altamente escalável construído a partir de um processo criterioso.
+> 
+> 
+
+---
+
+Essas edições resolvem especificamente os pontos de feedback que você recebeu, ancorando cada afirmação no documento acadêmico. As contagens de caracteres estão controladas para caberem confortavelmente nos campos do formulário.
+
+Você gostaria de revisar a consistência geral do formulário inteiro ou focar em refinar o resumo executivo agora que o corpo principal está mais técnico e delineado?
